@@ -1,0 +1,12 @@
+Minimal MCP server over HTTP (Streamable HTTP transport, JSON-RPC 2.0).
+
+Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job.
+Tools (conditional):
+  - preview          enabled only if `cloudflared` is on PATH
+  - remember, forget, recall  enabled only with --enable-memory
+
+Flags:
+  --port <n>         listen port (default: 7777, or $PORT)
+  --token <s>        require ?token=<s> on every request (default: no auth)
+  --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
+  --public           expose via a Cloudflare quick tunnel (requires cloudflared)
