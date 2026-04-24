@@ -1,0 +1,596 @@
+#!/usr/bin/env bun
+// Minimal MCP server over HTTP (Streamable HTTP transport, JSON-RPC 2.0).
+//
+// Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job.
+// Tools (conditional):
+//   - preview          enabled only if `cloudflared` is on PATH
+//   - remember, forget, recall  enabled only with --enable-memory
+//
+// Flags:
+//   --port <n>         listen port (default: 7777, or $PORT)
+//   --token <s>        require ?token=<s> on every request (default: no auth)
+//   --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
+//   --public           expose via a Cloudflare quick tunnel (requires cloudflared)
+
+import { spawn, spawnSync, file, write } from "bun";
+import { readdirSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import { parseArgs } from "util";
+
+type Json = any;
+type Tool = {
+  description: string;
+  inputSchema: Json;
+  handler: (args: Json) => Promise<Json> | Json;
+};
+
+// ---------- jobs ----------
+type Job = {
+  id: string;
+  command: string;
+  proc: ReturnType<typeof spawn>;
+  output: string;
+  status: "running" | "exited";
+  exitCode?: number;
+  startedAt: number;
+};
+const jobs = new Map<string, Job>();
+let jobSeq = 0;
+
+// Detect optional external binaries once at startup.
+const hasRg = spawnSync({ cmd: ["sh", "-c", "command -v rg"] }).exitCode === 0;
+const hasCloudflared = spawnSync({ cmd: ["sh", "-c", "command -v cloudflared"] }).exitCode === 0;
+
+// ---------- args ----------
+const USAGE = `Usage: bun code-mcp.ts [options]
+
+Options:
+  --port <n>         Listen port (default: 7777, or $PORT)
+  --token <s>        Require ?token=<s> on every request (default: no auth)
+  --enable-memory    Enable remember/forget/recall tools ({cwd}/.memo.jsonl)
+  --public           Expose via a Cloudflare quick tunnel (requires cloudflared)
+  -h, --help         Show this help and exit`;
+
+let args!: Record<string, any>;
+try {
+  ({ values: args } = parseArgs({
+    args: Bun.argv.slice(2),
+    options: {
+      port: { type: "string" },
+      token: { type: "string" },
+      "enable-memory": { type: "boolean" },
+      public: { type: "boolean" },
+      help: { type: "boolean", short: "h" },
+    },
+    strict: true,
+    allowPositionals: false,
+  }));
+} catch (e: any) {
+  console.error(`error: ${e?.message ?? e}\n`);
+  console.error(USAGE);
+  process.exit(2);
+}
+if (args.help) {
+  console.log(USAGE);
+  process.exit(0);
+}
+const port = Number(args.port ?? Bun.env.PORT ?? 7777);
+const token = args.token;
+const memoryEnabled = args["enable-memory"] === true;
+const makePublic = args.public === true;
+
+function startJob(command: string, cwd: string): Job {
+  const id = `j${++jobSeq}`;
+  const proc = spawn({
+    cmd: ["sh", "-c", command],
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+  });
+  const job: Job = { id, command, proc, output: "", status: "running", startedAt: Date.now() };
+  jobs.set(id, job);
+
+  const pump = async (stream: ReadableStream<Uint8Array> | null) => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      job.output += dec.decode(value);
+      if (job.output.length > 1_000_000) job.output = job.output.slice(-500_000);
+    }
+  };
+  pump(proc.stdout as any);
+  pump(proc.stderr as any);
+  proc.exited.then((code) => {
+    job.status = "exited";
+    job.exitCode = code;
+  });
+  return job;
+}
+
+// ---------- memos ----------
+type Memo = { id: number; ts: number; memo: string; tags?: string[] };
+
+async function readMemos(cwd: string): Promise<Memo[]> {
+  const f = file(resolve(cwd, ".memo.jsonl"));
+  if (!(await f.exists())) return [];
+  const text = await f.text();
+  return text
+    .split("\n")
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l) as Memo);
+}
+
+async function writeMemos(cwd: string, memos: Memo[]): Promise<void> {
+  const text = memos.map((m) => JSON.stringify(m)).join("\n") + (memos.length ? "\n" : "");
+  await write(resolve(cwd, ".memo.jsonl"), text);
+}
+
+// ---------- tools ----------
+const tools: Record<string, Tool> = {
+  read: {
+    description: "Read a file. Optional line range [start,end] (1-indexed, inclusive).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        path: { type: "string" },
+        range: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 },
+      },
+      required: ["cwd", "path"],
+    },
+    handler: async ({ cwd, path, range }) => {
+      const text = await file(resolve(cwd, path)).text();
+      if (!range) return text;
+      const lines = text.split("\n");
+      const [s, e] = range;
+      return lines.slice(Math.max(0, s - 1), e).join("\n");
+    },
+  },
+
+  write: {
+    description: "Write/overwrite a file with the given content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        path: { type: "string" },
+        content: { type: "string" },
+      },
+      required: ["cwd", "path", "content"],
+    },
+    handler: async ({ cwd, path, content }) => {
+      const bytes = await write(resolve(cwd, path), content);
+      return `wrote ${bytes} bytes to ${path}`;
+    },
+  },
+
+  edit: {
+    description: "Replace old_str with new_str in a file. old_str must occur exactly once.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        path: { type: "string" },
+        old_str: { type: "string" },
+        new_str: { type: "string" },
+      },
+      required: ["cwd", "path", "old_str", "new_str"],
+    },
+    handler: async ({ cwd, path, old_str, new_str }) => {
+      const p = resolve(cwd, path);
+      const text = await file(p).text();
+      const first = text.indexOf(old_str);
+      if (first === -1) throw new Error("old_str not found");
+      if (text.indexOf(old_str, first + 1) !== -1) throw new Error("old_str not unique");
+      await write(p, text.slice(0, first) + new_str + text.slice(first + old_str.length));
+      return "ok";
+    },
+  },
+
+  multi_edit: {
+    description: "Apply multiple edits atomically across one or more files. Validates every edit first; if any fails, nothing is written. Edits to the same file are applied in order.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        edits: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              old_str: { type: "string" },
+              new_str: { type: "string" },
+            },
+            required: ["path", "old_str", "new_str"],
+          },
+        },
+      },
+      required: ["cwd", "edits"],
+    },
+    handler: async ({ cwd, edits }) => {
+      // Load each file once; apply edits sequentially to in-memory text.
+      // Any failure throws before a single write hits disk.
+      const texts = new Map<string, string>();
+      const touched = new Map<string, number>(); // path -> edit count
+
+      for (let i = 0; i < edits.length; i++) {
+        const { path, old_str, new_str } = edits[i];
+        const p = resolve(cwd, path);
+        if (!texts.has(p)) texts.set(p, await file(p).text());
+        const current = texts.get(p)!;
+        const first = current.indexOf(old_str);
+        if (first === -1) throw new Error(`edit #${i + 1} (${path}): old_str not found`);
+        if (current.indexOf(old_str, first + 1) !== -1) {
+          throw new Error(`edit #${i + 1} (${path}): old_str not unique`);
+        }
+        texts.set(p, current.slice(0, first) + new_str + current.slice(first + old_str.length));
+        touched.set(p, (touched.get(p) ?? 0) + 1);
+      }
+
+      // All edits validated — flush.
+      for (const [p, text] of texts) await write(p, text);
+      const summary = [...touched].map(([p, n]) => `${p} (${n} edit${n > 1 ? "s" : ""})`).join(", ");
+      return `applied ${edits.length} edit(s) across ${touched.size} file(s): ${summary}`;
+    },
+  },
+
+  bash: {
+    description: "Run a shell command, block until exit, return combined stdout+stderr.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        command: { type: "string" },
+        timeout_ms: { type: "number" },
+      },
+      required: ["cwd", "command"],
+    },
+    handler: ({ command, cwd, timeout_ms }) => {
+      const r = spawnSync({
+        cmd: ["sh", "-c", command],
+        cwd,
+        timeout: timeout_ms,
+      });
+      const out = new TextDecoder().decode(r.stdout) + new TextDecoder().decode(r.stderr);
+      return `exit=${r.exitCode}\n${out}`;
+    },
+  },
+
+  grep: {
+    description: "Search files by regex. Uses ripgrep if available, else POSIX grep.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        pattern: { type: "string" },
+        path: { type: "string" },
+        glob: { type: "string" },
+      },
+      required: ["cwd", "pattern"],
+    },
+    handler: ({ cwd, pattern, path = ".", glob }) => {
+      const cmd = hasRg
+        ? ["rg", "--line-number", "--no-heading", "--color=never",
+           ...(glob ? ["--glob", glob] : []), pattern, path]
+        : ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, path];
+      const r = spawnSync({ cmd, cwd });
+      const out = new TextDecoder().decode(r.stdout);
+      if (out) return out;
+      if (r.exitCode === 1) return "(no matches)";
+      return `ERROR (exit=${r.exitCode}): ${new TextDecoder().decode(r.stderr)}`;
+    },
+  },
+
+  find: {
+    description: "Find files by glob pattern. Supports ** for recursive. Bare patterns like '*.ts' match at any depth.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        pattern: { type: "string" },
+        path: { type: "string" },
+      },
+      required: ["cwd", "pattern"],
+    },
+    handler: async ({ cwd, pattern, path = "." }) => {
+      const pat = pattern.includes("/") ? pattern : `**/${pattern}`;
+      const glob = new Bun.Glob(pat);
+      const results: string[] = [];
+      for await (const f of glob.scan({ cwd: resolve(cwd, path), onlyFiles: false })) {
+        results.push(f);
+        if (results.length >= 10_000) break;
+      }
+      return results.length ? results.join("\n") : "(none)";
+    },
+  },
+
+  ls: {
+    description: "List directory entries with type and size.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        path: { type: "string" },
+      },
+      required: ["cwd"],
+    },
+    handler: ({ cwd, path = "." }) => {
+      const p = resolve(cwd, path);
+      return readdirSync(p)
+        .map((name) => {
+          try {
+            const s = statSync(`${p}/${name}`);
+            return `${s.isDirectory() ? "d" : "-"} ${String(s.size).padStart(10)} ${name}`;
+          } catch {
+            return `? ${name}`;
+          }
+        })
+        .join("\n");
+    },
+  },
+
+  job: {
+    description: "Manage background jobs. mode: list|view|start|stop. command required for start; id (passed as command) required for view/stop. cwd used only for start.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        mode: { type: "string", enum: ["list", "view", "start", "stop"] },
+        command: { type: "string" },
+      },
+      required: ["cwd", "mode"],
+    },
+    handler: ({ cwd, mode, command }) => {
+      if (mode === "list") {
+        if (jobs.size === 0) return "(no jobs)";
+        return [...jobs.values()]
+          .map((j) => `${j.id} [${j.status}${j.exitCode != null ? ` ${j.exitCode}` : ""}] ${j.command}`)
+          .join("\n");
+      }
+      if (mode === "start") {
+        if (!command) throw new Error("command required");
+        const j = startJob(command, cwd);
+        return `started ${j.id}`;
+      }
+      if (!command) throw new Error("job id required (pass as command)");
+      const j = jobs.get(command);
+      if (!j) throw new Error(`no such job: ${command}`);
+      if (mode === "view") return `[${j.status}${j.exitCode != null ? ` ${j.exitCode}` : ""}]\n${j.output}`;
+      if (mode === "stop") {
+        if (j.status === "running") j.proc.kill();
+        return `stopped ${j.id}`;
+      }
+      throw new Error(`bad mode: ${mode}`);
+    },
+  },
+
+  preview: {
+    description: "Start a Cloudflare quick tunnel to the given local URL and return the public URL.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+      },
+      required: ["url"],
+    },
+    handler: async ({ url }) => {
+      const j = startJob(`cloudflared tunnel --url ${url} --no-autoupdate 2>&1`, process.cwd());
+      const deadline = Date.now() + 20_000;
+      const re = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+      while (Date.now() < deadline) {
+        const m = j.output.match(re);
+        if (m) return `${m[0]} (job ${j.id})`;
+        if (j.status === "exited") throw new Error(`cloudflared exited: ${j.output.slice(-500)}`);
+        await Bun.sleep(250);
+      }
+      throw new Error(`timeout waiting for tunnel URL. output:\n${j.output.slice(-500)}`);
+    },
+  },
+
+  remember: {
+    description: "Append a memo to {cwd}/.memo.jsonl. Returns the assigned id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        memo: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+      },
+      required: ["cwd", "memo"],
+    },
+    handler: async ({ cwd, memo, tags }) => {
+      const memos = await readMemos(cwd);
+      const id = memos.reduce((m, x) => Math.max(m, x.id), 0) + 1;
+      const entry: Memo = { id, ts: Date.now(), memo, ...(tags?.length ? { tags } : {}) };
+      // Append instead of rewrite — JSONL is designed for this.
+      const line = JSON.stringify(entry) + "\n";
+      const path = resolve(cwd, ".memo.jsonl");
+      const existing = (await file(path).exists()) ? await file(path).text() : "";
+      await write(path, existing + line);
+      return `remembered #${id}`;
+    },
+  },
+
+  forget: {
+    description: "Remove a memo by id from {cwd}/.memo.jsonl.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        memo_id: { type: "number" },
+      },
+      required: ["cwd", "memo_id"],
+    },
+    handler: async ({ cwd, memo_id }) => {
+      const memos = await readMemos(cwd);
+      const before = memos.length;
+      const kept = memos.filter((m) => m.id !== memo_id);
+      if (kept.length === before) throw new Error(`no memo with id ${memo_id}`);
+      await writeMemos(cwd, kept);
+      return `forgot #${memo_id}`;
+    },
+  },
+
+  recall: {
+    description: "Search memos in {cwd}/.memo.jsonl by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        query: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+        limit: { type: "number" },
+        offset: { type: "number" },
+      },
+      required: ["cwd"],
+    },
+    handler: async ({ cwd, query, tags, limit = 20, offset = 0 }) => {
+      const memos = await readMemos(cwd);
+      const q = query?.toLowerCase();
+      const filtered = memos.filter((m) => {
+        if (q && !m.memo.toLowerCase().includes(q)) return false;
+        if (tags?.length && !tags.every((t: string) => m.tags?.includes(t))) return false;
+        return true;
+      });
+      filtered.sort((a, b) => b.id - a.id);
+      const total = filtered.length;
+      if (!total) return "(no matches)";
+      const page = filtered.slice(offset, offset + limit);
+      const lines = page.map((m) => {
+        const ts = new Date(m.ts).toISOString();
+        const tagStr = m.tags?.length ? ` [${m.tags.join(",")}]` : "";
+        return `#${m.id} ${ts}${tagStr} ${m.memo}`;
+      });
+      const end = offset + page.length;
+      const footer = `-- ${offset + 1}-${end} of ${total}${end < total ? ` (next: offset=${end})` : ""}`;
+      return lines.join("\n") + "\n" + footer;
+    },
+  },
+};
+
+// Prune tools based on startup flags and binary availability.
+if (!hasCloudflared) delete tools.preview;
+if (!memoryEnabled) {
+  delete tools.remember;
+  delete tools.forget;
+  delete tools.recall;
+}
+
+// ---------- JSON-RPC dispatch ----------
+async function handle(msg: Json): Promise<Json | null> {
+  const { id, method, params } = msg;
+  const ok = (result: Json) => ({ jsonrpc: "2.0", id, result });
+  const err = (code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
+
+  try {
+    if (method === "initialize") {
+      return ok({
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "code-mcp", version: "0.1.0" },
+      });
+    }
+    if (method === "notifications/initialized") return null; // notification
+    if (method === "ping") return ok({});
+    if (method === "tools/list") {
+      return ok({
+        tools: Object.entries(tools).map(([name, t]) => ({
+          name,
+          description: t.description,
+          inputSchema: t.inputSchema,
+        })),
+      });
+    }
+    if (method === "tools/call") {
+      const { name, arguments: args } = params ?? {};
+      const t = tools[name];
+      if (!t) return err(-32601, `unknown tool: ${name}`);
+      const result = await t.handler(args ?? {});
+      return ok({ content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] });
+    }
+    return err(-32601, `unknown method: ${method}`);
+  } catch (e: any) {
+    return ok({ content: [{ type: "text", text: `ERROR: ${e?.message ?? e}` }], isError: true });
+  }
+}
+
+// ---------- server ----------
+Bun.serve({
+  port,
+  async fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname !== "/mcp") return new Response("not found", { status: 404 });
+    if (req.method !== "POST") return new Response("POST /mcp", { status: 405 });
+    if (token && url.searchParams.get("token") !== token) {
+      return new Response("unauthorized", { status: 401 });
+    }
+    const body = await req.json();
+    const resp = await handle(body);
+    if (resp === null) return new Response(null, { status: 202 });
+    return Response.json(resp);
+  },
+});
+
+console.error(
+  `code-mcp listening on http://localhost:${port}/mcp` +
+  `${token ? " (auth: ?token=...)" : " (no auth)"}` +
+  ` — tools: ${Object.keys(tools).join(", ")}`
+);
+
+// ---------- public tunnel ----------
+// If --public is set, open a Cloudflare quick tunnel to our own port.
+// The tunnel is tracked as a background job so the shutdown hook kills it.
+if (makePublic) {
+  if (!hasCloudflared) {
+    console.error("warning: --public given but `cloudflared` not found on PATH; skipping tunnel");
+  } else {
+    const j = startJob(`cloudflared tunnel --url http://localhost:${port} --no-autoupdate 2>&1`, process.cwd());
+    const re = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+    const deadline = Date.now() + 20_000;
+    (async () => {
+      while (Date.now() < deadline) {
+        const m = j.output.match(re);
+        if (m) {
+          console.error(`public URL: ${m[0]}/mcp${token ? `?token=${token}` : ""}`);
+          return;
+        }
+        if (j.status === "exited") {
+          console.error(`warning: cloudflared exited before printing URL:\n${j.output.slice(-500)}`);
+          return;
+        }
+        await Bun.sleep(250);
+      }
+      console.error("warning: cloudflared did not print a URL within 20s");
+    })();
+  }
+}
+
+// ---------- shutdown ----------
+let shuttingDown = false;
+function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`\n[${signal}] stopping ${jobs.size} job(s)...`);
+  for (const j of jobs.values()) {
+    if (j.status === "running") {
+      try { j.proc.kill("SIGTERM"); } catch {}
+    }
+  }
+  // Give jobs a moment to exit cleanly, then hard-kill.
+  setTimeout(() => {
+    for (const j of jobs.values()) {
+      if (j.status === "running") {
+        try { j.proc.kill("SIGKILL"); } catch {}
+      }
+    }
+    process.exit(0);
+  }, 500);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
