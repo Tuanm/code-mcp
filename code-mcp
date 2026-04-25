@@ -3,18 +3,22 @@
 //
 // Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job.
 // Tools (conditional):
-//   - preview          enabled only if `cloudflared` is on PATH
+//   - preview              enabled only if `cloudflared` is on PATH
 //   - remember, forget, recall  enabled only with --enable-memory
+//   - get_upload_link      enabled only with --public or --domain
 //
 // Flags:
 //   --port <n>         listen port (default: 7777, or $PORT)
 //   --token <s>        require ?token=<s> on every request (default: no auth)
 //   --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
 //   --public           expose via a Cloudflare quick tunnel (requires cloudflared)
+//   --domain <host>    use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
 
 import { spawn, spawnSync, file, write } from "bun";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { parseArgs } from "util";
 
 type Json = any;
@@ -49,6 +53,7 @@ Options:
   --token <s>        Require ?token=<s> on every request (default: no auth)
   --enable-memory    Enable remember/forget/recall tools ({cwd}/.memo.jsonl)
   --public           Expose via a Cloudflare quick tunnel (requires cloudflared)
+  --domain <host>    Use the given public hostname (tunnel must already route it here). Mutex with --public.
   -h, --help         Show this help and exit`;
 
 let args!: Record<string, any>;
@@ -60,6 +65,7 @@ try {
       token: { type: "string" },
       "enable-memory": { type: "boolean" },
       public: { type: "boolean" },
+      domain: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: true,
@@ -75,9 +81,73 @@ if (args.help) {
   process.exit(0);
 }
 const port = Number(args.port ?? Bun.env.PORT ?? 7777);
-const token = args.token;
+const token: string | undefined = args.token;
 const memoryEnabled = args["enable-memory"] === true;
 const makePublic = args.public === true;
+const domain: string | undefined = args.domain;
+
+if (makePublic && domain) {
+  console.error("error: --public and --domain are mutually exclusive\n");
+  console.error(USAGE);
+  process.exit(2);
+}
+
+// publicBaseUrl is set either synchronously (from --domain) or asynchronously
+// after the cloudflared quick tunnel prints its URL. Tools that need it must
+// check for `null` at call time.
+let publicBaseUrl: string | null = domain ? `https://${domain}` : null;
+
+// Upload root: /private/tmp on macOS (canonical path; /tmp is a symlink there),
+// /tmp on Linux, else whatever Node says. Detected once at startup.
+const UPLOAD_ROOT =
+  process.platform === "darwin" ? "/private/tmp" :
+  process.platform === "linux" ? "/tmp" :
+  tmpdir();
+
+// ---------- upload session HMAC ----------
+// session_id = base64url(payload).base64url(HMAC-SHA256(token, payload))
+// payload = `${exp_unix_ms}.${nonce_hex}`. TTL = 10 minutes.
+const UPLOAD_TTL_MS = 10 * 60 * 1000;
+
+function b64url(buf: Buffer | string): string {
+  return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s: string): Buffer {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Buffer.from(s, "base64");
+}
+
+function mintUploadSessionId(): string {
+  if (!token) throw new Error("--token is required to mint upload sessions");
+  const exp = Date.now() + UPLOAD_TTL_MS;
+  const nonce = randomBytes(8).toString("hex");
+  const payload = `${exp}.${nonce}`;
+  const sig = createHmac("sha256", token).update(payload).digest();
+  return `${b64url(payload)}.${b64url(sig)}`;
+}
+
+function verifyUploadSessionId(id: string): { ok: true } | { ok: false; reason: string } {
+  if (!token) return { ok: false, reason: "server has no token configured" };
+  const parts = id.split(".");
+  if (parts.length !== 2) return { ok: false, reason: "malformed" };
+  let payload: string;
+  let sig: Buffer;
+  try {
+    payload = b64urlDecode(parts[0]).toString("utf8");
+    sig = b64urlDecode(parts[1]);
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+  const expected = createHmac("sha256", token).update(payload).digest();
+  if (sig.length !== expected.length || !timingSafeEqual(sig, expected)) {
+    return { ok: false, reason: "bad signature" };
+  }
+  const [expStr] = payload.split(".");
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || Date.now() > exp) return { ok: false, reason: "expired" };
+  return { ok: true };
+}
 
 function startJob(command: string, cwd: string): Job {
   const id = `j${++jobSeq}`;
@@ -127,6 +197,448 @@ async function readMemos(cwd: string): Promise<Memo[]> {
 async function writeMemos(cwd: string, memos: Memo[]): Promise<void> {
   const text = memos.map((m) => JSON.stringify(m)).join("\n") + (memos.length ? "\n" : "");
   await write(resolve(cwd, ".memo.jsonl"), text);
+}
+
+// ---------- upload page ----------
+// Full HTML page served at GET /upload/<session_id>. The page embeds a drop
+// zone that POSTs back to the same URL. Auth lives in the URL path.
+const UPLOAD_PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Upload to local machine</title>
+<style>
+  :root {
+    --bg: #faf9f5;
+    --surface: #ffffff;
+    --text-primary: #181818;
+    --text-secondary: #6b6b63;
+    --text-tertiary: #96958b;
+    --text-info: #2d5fb3;
+    --text-success: #0f6e56;
+    --text-warning: #854f0b;
+    --text-danger: #a32d2d;
+    --border-tertiary: rgba(24, 24, 24, 0.08);
+    --border-secondary: rgba(24, 24, 24, 0.16);
+    --border-info: rgba(45, 95, 179, 0.3);
+    --bg-info: rgba(45, 95, 179, 0.06);
+    --bg-tertiary: #f1efe8;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1rem;
+  }
+  .container {
+    width: 100%;
+    max-width: 560px;
+  }
+  .dropzone {
+    display: block;
+    background: transparent;
+    border: 0.5px dashed var(--border-secondary);
+    border-radius: var(--radius-lg);
+    padding: 2rem 1.25rem;
+    text-align: center;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .dropzone:hover {
+    background: var(--bg-info);
+    border-color: var(--border-info);
+  }
+  .dropzone.hover {
+    background: var(--bg-info);
+    border-color: var(--border-info);
+  }
+  .dropzone.disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .dropzone .icon { display: flex; justify-content: center; margin-bottom: 12px; color: var(--text-secondary); }
+  .dropzone .title { margin: 0; font-size: 14px; color: var(--text-primary); }
+  .dropzone .browse { color: var(--text-info); text-decoration: underline; }
+  .file-list { margin-top: 0.75rem; display: none; flex-direction: column; gap: 6px; }
+  .file-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--surface);
+    border: 0.5px solid var(--border-tertiary);
+    border-radius: var(--radius-md);
+  }
+  .file-row .info { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1; }
+  .file-row .name { font-size: 13px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-row .size { font-size: 12px; color: var(--text-tertiary); flex-shrink: 0; }
+  .file-row button {
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-tertiary);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .file-row button:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+  .file-row button:disabled { cursor: not-allowed; opacity: 0.4; }
+  .progress-wrap { margin-top: 0.75rem; display: none; }
+  .progress-track {
+    background: var(--bg-tertiary);
+    border-radius: 999px;
+    height: 4px;
+    overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    background: var(--text-info);
+    transition: width 120ms ease;
+  }
+  .progress-message { margin: 8px 0 0; font-size: 12px; color: var(--text-secondary); }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 0.75rem; }
+  .actions button {
+    font-family: inherit;
+    font-size: 14px;
+    padding: 8px 16px;
+    background: transparent;
+    color: var(--text-primary);
+    border: 0.5px solid var(--border-secondary);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background 100ms ease, transform 100ms ease;
+  }
+  .actions button:hover:not(:disabled) { background: var(--bg-tertiary); }
+  .actions button:active:not(:disabled) { transform: scale(0.98); }
+  .actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <div class="container">
+    <input type="file" id="file-input" multiple style="position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0;" />
+    <label id="dropzone" class="dropzone" for="file-input">
+      <div class="icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </div>
+      <p class="title">Drop files here, or <span class="browse">browse</span></p>
+    </label>
+
+    <div id="file-list" class="file-list"></div>
+
+    <div id="progress-wrap" class="progress-wrap">
+      <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+      <p id="progress-message" class="progress-message"></p>
+    </div>
+
+    <div class="actions">
+      <button id="cancel-btn">Cancel</button>
+      <button id="upload-btn" disabled>Upload</button>
+    </div>
+  </div>
+
+<script data-cfasync="false">
+(function () {
+  var dropzone = document.getElementById('dropzone');
+  var fileInput = document.getElementById('file-input');
+  var fileList = document.getElementById('file-list');
+  var progressWrap = document.getElementById('progress-wrap');
+  var progressBar = document.getElementById('progress-bar');
+  var progressMessage = document.getElementById('progress-message');
+  var uploadBtn = document.getElementById('upload-btn');
+  var cancelBtn = document.getElementById('cancel-btn');
+
+  var UPLOAD_URL = window.location.href;
+
+  var queue = [];
+  var uploading = false;
+  var cancelled = false;
+  var currentXhr = null;
+  var finished = false;
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  }
+
+  function setBtn(btn, enabled) {
+    btn.disabled = !enabled;
+  }
+
+  function refreshButtons() {
+    if (finished) {
+      setBtn(uploadBtn, false);
+      setBtn(cancelBtn, false);
+      return;
+    }
+    setBtn(uploadBtn, !uploading && queue.length > 0);
+    setBtn(cancelBtn, true);
+  }
+
+  function renderList() {
+    if (queue.length === 0) {
+      fileList.style.display = 'none';
+      fileList.innerHTML = '';
+      refreshButtons();
+      return;
+    }
+    fileList.style.display = 'flex';
+    fileList.innerHTML = '';
+    queue.forEach(function (file, idx) {
+      var row = document.createElement('div');
+      row.className = 'file-row';
+
+      var info = document.createElement('div');
+      info.className = 'info';
+      var name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = file.name;
+      var size = document.createElement('span');
+      size.className = 'size';
+      size.textContent = fmtBytes(file.size);
+      info.appendChild(name);
+      info.appendChild(size);
+
+      var remove = document.createElement('button');
+      remove.setAttribute('aria-label', 'Remove ' + file.name);
+      remove.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      remove.disabled = uploading || finished;
+      remove.addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (uploading || finished) return;
+        queue.splice(idx, 1);
+        renderList();
+      });
+
+      row.appendChild(info);
+      row.appendChild(remove);
+      fileList.appendChild(row);
+    });
+    refreshButtons();
+  }
+
+  function addFiles(files) {
+    if (uploading || finished) return;
+    for (var i = 0; i < files.length; i++) queue.push(files[i]);
+    renderList();
+  }
+
+  function uploadOne(file, onProgress) {
+    return new Promise(function (resolve) {
+      var xhr = new XMLHttpRequest();
+      currentXhr = xhr;
+      var form = new FormData();
+      form.append('file', file);
+
+      xhr.upload.addEventListener('progress', function (e) {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      });
+      xhr.addEventListener('load', function () {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          var body = {};
+          try { body = JSON.parse(xhr.responseText); } catch (e) {}
+          resolve({ ok: true, path: body.path || file.name, file: file });
+        } else {
+          resolve({ ok: false, status: xhr.status, file: file });
+        }
+      });
+      xhr.addEventListener('error', function () {
+        resolve({ ok: false, networkError: true, file: file });
+      });
+      xhr.addEventListener('abort', function () {
+        resolve({ ok: false, aborted: true, file: file });
+      });
+      xhr.open('POST', UPLOAD_URL);
+      xhr.send(form);
+    });
+  }
+
+  function disableAll() {
+    finished = true;
+    dropzone.classList.add('disabled');
+    fileInput.disabled = true;
+    refreshButtons();
+    // re-render list so the remove buttons get disabled
+    renderList();
+  }
+
+  function runUpload() {
+    if (uploading || queue.length === 0) return;
+    uploading = true;
+    cancelled = false;
+    refreshButtons();
+    progressWrap.style.display = 'block';
+    progressBar.style.background = 'var(--text-info)';
+    progressBar.style.width = '0%';
+    progressMessage.style.color = 'var(--text-secondary)';
+
+    var files = queue.slice();
+    var totalBytes = files.reduce(function (s, f) { return s + f.size; }, 0);
+    var completedBytes = 0;
+    var results = [];
+
+    function next(i) {
+      if (cancelled || i >= files.length) return finish(results, files, i);
+      var f = files[i];
+      progressMessage.textContent = 'Uploading ' + f.name + ' (' + (i + 1) + '/' + files.length + ')';
+      uploadOne(f, function (loaded) {
+        var pct = totalBytes === 0 ? 0 : ((completedBytes + loaded) / totalBytes) * 100;
+        progressBar.style.width = pct + '%';
+      }).then(function (res) {
+        completedBytes += f.size;
+        results.push(res);
+        next(i + 1);
+      });
+    }
+
+    function finish(results, allFiles, stoppedAt) {
+      uploading = false;
+      currentXhr = null;
+      var ok = results.filter(function (r) { return r.ok; });
+      var failed = results.filter(function (r) { return !r.ok && !r.aborted; });
+
+      progressBar.style.width = '100%';
+
+      if (cancelled) {
+        progressBar.style.background = 'var(--text-warning)';
+        progressMessage.textContent = 'Cancelled — ' + ok.length + ' uploaded before stop';
+        progressMessage.style.color = 'var(--text-warning)';
+      } else if (failed.length === 0) {
+        progressBar.style.background = 'var(--text-success)';
+        progressMessage.textContent = 'Uploaded ' + ok.length + ' file' + (ok.length === 1 ? '' : 's') + '. Tell Claude where they landed:';
+        progressMessage.style.color = 'var(--text-success)';
+      } else {
+        progressBar.style.background = 'var(--text-danger)';
+        progressMessage.textContent = ok.length + ' uploaded, ' + failed.length + ' failed';
+        progressMessage.style.color = 'var(--text-danger)';
+      }
+
+      if (ok.length > 0) {
+        var summaryWrap = document.createElement('div');
+        summaryWrap.style.cssText = 'position: relative; margin-top: 12px;';
+        var summary = document.createElement('pre');
+        summary.style.cssText = 'margin: 0; padding: 12px 40px 12px 12px; background: var(--bg-tertiary); border-radius: var(--radius-md); font-size: 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere;';
+        var text = ok.map(function (r) { return r.path; }).join('\\n');
+        summary.textContent = text;
+        var copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.setAttribute('aria-label', 'Copy paths');
+        copyBtn.style.cssText = 'position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; color: var(--text-tertiary); background: transparent; border: none; cursor: pointer; border-radius: 4px;';
+        copyBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+        copyBtn.addEventListener('mouseenter', function () { copyBtn.style.background = 'var(--surface)'; copyBtn.style.color = 'var(--text-primary)'; });
+        copyBtn.addEventListener('mouseleave', function () { copyBtn.style.background = 'transparent'; copyBtn.style.color = 'var(--text-tertiary)'; });
+        copyBtn.addEventListener('click', function () {
+          var done = function () {
+            var prev = copyBtn.innerHTML;
+            copyBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+            copyBtn.style.color = 'var(--text-success)';
+            setTimeout(function () { copyBtn.innerHTML = prev; copyBtn.style.color = 'var(--text-tertiary)'; }, 1500);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done).catch(function () {});
+          } else {
+            // fallback for older browsers / non-secure contexts
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position: fixed; left: -9999px;';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); } catch (err) {}
+            document.body.removeChild(ta);
+          }
+        });
+        summaryWrap.appendChild(summary);
+        summaryWrap.appendChild(copyBtn);
+        progressWrap.appendChild(summaryWrap);
+      }
+
+      // clear queue, disable the page
+      queue = [];
+      fileList.style.display = 'none';
+      fileList.innerHTML = '';
+      disableAll();
+    }
+
+    next(0);
+  }
+
+  function runCancel() {
+    if (uploading) {
+      cancelled = true;
+      if (currentXhr) try { currentXhr.abort(); } catch (e) {}
+    } else {
+      queue = [];
+      progressWrap.style.display = 'none';
+      renderList();
+      progressMessage.textContent = 'Upload cancelled.';
+      progressMessage.style.color = 'var(--text-warning)';
+      progressWrap.style.display = 'block';
+      progressBar.style.background = 'var(--text-warning)';
+      progressBar.style.width = '100%';
+      disableAll();
+    }
+  }
+
+  dropzone.addEventListener('click', function (e) {
+    // <label for="file-input"> handles the click natively. JS click() is
+    // unreliable on mobile browsers — we let the label do its job.
+    if (uploading || finished) e.preventDefault();
+  });
+  fileInput.addEventListener('change', function (e) {
+    var files = e.target.files || fileInput.files;
+    if (files && files.length) {
+      // copy FileList to array — some mobile browsers invalidate it after value reset
+      var arr = [];
+      for (var i = 0; i < files.length; i++) arr.push(files[i]);
+      addFiles(arr);
+    }
+    fileInput.value = '';
+  });
+  dropzone.addEventListener('dragover', function (e) { e.preventDefault(); if (!uploading && !finished) dropzone.classList.add('hover'); });
+  dropzone.addEventListener('dragleave', function () { dropzone.classList.remove('hover'); });
+  dropzone.addEventListener('drop', function (e) {
+    e.preventDefault();
+    dropzone.classList.remove('hover');
+    if (uploading || finished) return;
+    if (e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  });
+
+  uploadBtn.addEventListener('click', runUpload);
+  cancelBtn.addEventListener('click', runCancel);
+})();
+</script>
+</body>
+</html>
+`;
+
+function renderUploadPage(): string {
+  return UPLOAD_PAGE_HTML;
 }
 
 // ---------- tools ----------
@@ -251,14 +763,24 @@ const tools: Record<string, Tool> = {
       },
       required: ["cwd", "command"],
     },
-    handler: ({ command, cwd, timeout_ms }) => {
-      const r = spawnSync({
+    handler: async ({ command, cwd, timeout_ms }) => {
+      const ctrl = new AbortController();
+      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
+      const proc = spawn({
         cmd: ["sh", "-c", command],
         cwd,
-        timeout: timeout_ms,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        signal: ctrl.signal,
       });
-      const out = new TextDecoder().decode(r.stdout) + new TextDecoder().decode(r.stderr);
-      return `exit=${r.exitCode}\n${out}`;
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout as any).text(),
+        new Response(proc.stderr as any).text(),
+        proc.exited,
+      ]);
+      if (t) clearTimeout(t);
+      return `exit=${exitCode}\n${stdout}${stderr}`;
     },
   },
 
@@ -274,16 +796,26 @@ const tools: Record<string, Tool> = {
       },
       required: ["cwd", "pattern"],
     },
-    handler: ({ cwd, pattern, path = ".", glob }) => {
+    handler: async ({ cwd, pattern, path = ".", glob }) => {
       const cmd = hasRg
         ? ["rg", "--line-number", "--no-heading", "--color=never",
            ...(glob ? ["--glob", glob] : []), pattern, path]
         : ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, path];
-      const r = spawnSync({ cmd, cwd });
-      const out = new TextDecoder().decode(r.stdout);
-      if (out) return out;
-      if (r.exitCode === 1) return "(no matches)";
-      return `ERROR (exit=${r.exitCode}): ${new TextDecoder().decode(r.stderr)}`;
+      const proc = spawn({
+        cmd,
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout as any).text(),
+        new Response(proc.stderr as any).text(),
+        proc.exited,
+      ]);
+      if (stdout) return stdout;
+      if (exitCode === 1) return "(no matches)";
+      return `ERROR (exit=${exitCode}): ${stderr}`;
     },
   },
 
@@ -472,6 +1004,30 @@ const tools: Record<string, Tool> = {
       return lines.join("\n") + "\n" + footer;
     },
   },
+
+  get_upload_link: {
+    description:
+      "Return a URL the user can open in their browser to upload files to Tuan's local machine. " +
+      "Files are saved to `${UPLOAD_ROOT}/<session_id>/`. Session is valid for 10 minutes. " +
+      "Present the returned URL to the user as a clickable link.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    handler: () => {
+      if (!publicBaseUrl) {
+        throw new Error(
+          "get_upload_link requires --public or --domain; the server has no public base URL."
+        );
+      }
+      if (!token) {
+        throw new Error("get_upload_link requires --token to sign upload sessions.");
+      }
+      const sessionId = mintUploadSessionId();
+      return `${publicBaseUrl}/upload/${sessionId}`;
+    },
+  },
 };
 
 // Prune tools based on startup flags and binary availability.
@@ -480,6 +1036,10 @@ if (!memoryEnabled) {
   delete tools.remember;
   delete tools.forget;
   delete tools.recall;
+}
+if (!publicBaseUrl && !makePublic) {
+  // No public URL now and none coming. Drop the tool from tools/list.
+  delete (tools as any).get_upload_link;
 }
 
 // ---------- JSON-RPC dispatch ----------
@@ -521,10 +1081,125 @@ async function handle(msg: Json): Promise<Json | null> {
 }
 
 // ---------- server ----------
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Max-Age": "86400",
+};
+
+// Hard cap per file to avoid memory blowup on a single upload.
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100 MB
+
+async function handleUpload(req: Request, sessionId: string): Promise<Response> {
+  const check = verifyUploadSessionId(sessionId);
+  if (!check.ok) {
+    return new Response(JSON.stringify({ error: check.reason }), {
+      status: 401,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch (e: any) {
+    return new Response(JSON.stringify({ error: `bad form: ${e?.message ?? e}` }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+  const f = form.get("file");
+  if (!(f instanceof File)) {
+    return new Response(JSON.stringify({ error: "missing 'file' field" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+  if (f.size > MAX_UPLOAD_BYTES) {
+    return new Response(JSON.stringify({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }), {
+      status: 413,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+
+  // Sanitise: strip directory components, reject empty names.
+  const raw = f.name || "upload.bin";
+  const base = raw.split(/[\\/]/).pop() || "upload.bin";
+  const safe = base.replace(/[\x00-\x1f]/g, "_");
+  if (!safe) {
+    return new Response(JSON.stringify({ error: "empty filename" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+
+  const destDir = resolve(UPLOAD_ROOT, sessionId);
+  try {
+    mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  } catch (e: any) {
+    return new Response(JSON.stringify({ error: `mkdir failed: ${e?.message ?? e}` }), {
+      status: 500,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+  const path = resolve(destDir, safe);
+  try {
+    const buf = await f.arrayBuffer();
+    await write(path, buf);
+    const hash = new Bun.CryptoHasher("sha256");
+    hash.update(buf);
+    const sha256 = hash.digest("hex");
+    return new Response(
+      JSON.stringify({ path, size: f.size, sha256, mime: f.type || null }),
+      { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
+    );
+  } catch (e: any) {
+    return new Response(JSON.stringify({ error: `write failed: ${e?.message ?? e}` }), {
+      status: 500,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+}
+
 Bun.serve({
   port,
   async fetch(req) {
     const url = new URL(req.url);
+
+    // CORS preflight for upload endpoint
+    if (req.method === "OPTIONS" && url.pathname.startsWith("/upload/")) {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // Upload endpoint: /upload/<session_id>
+    // GET → HTML page with drop zone. POST → accept file upload.
+    // Both methods validate the session_id (HMAC + TTL).
+    if (url.pathname.startsWith("/upload/")) {
+      const sessionId = url.pathname.slice("/upload/".length);
+      if (!sessionId) return new Response("missing session_id", { status: 400, headers: CORS_HEADERS });
+
+      if (req.method === "GET") {
+        const check = verifyUploadSessionId(sessionId);
+        if (!check.ok) {
+          return new Response(`Upload session ${check.reason}.`, {
+            status: 401,
+            headers: { "Content-Type": "text/plain; charset=utf-8" },
+          });
+        }
+        return new Response(renderUploadPage(), {
+          status: 200,
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            // Tell Cloudflare not to inject Rocket Loader / minifiers / etc.
+            "Cache-Control": "no-transform",
+          },
+        });
+      }
+      if (req.method === "POST") return handleUpload(req, sessionId);
+      return new Response("GET or POST /upload/<session_id>", { status: 405, headers: CORS_HEADERS });
+    }
+
+    // MCP JSON-RPC endpoint
     if (url.pathname !== "/mcp") return new Response("not found", { status: 404 });
     if (req.method !== "POST") return new Response("POST /mcp", { status: 405 });
     if (token && url.searchParams.get("token") !== token) {
@@ -542,10 +1217,14 @@ console.error(
   `${token ? " (auth: ?token=...)" : " (no auth)"}` +
   ` — tools: ${Object.keys(tools).join(", ")}`
 );
+if (publicBaseUrl) {
+  console.error(`public base: ${publicBaseUrl} — upload saves to ${UPLOAD_ROOT}/<session_id>/`);
+}
 
 // ---------- public tunnel ----------
 // If --public is set, open a Cloudflare quick tunnel to our own port.
 // The tunnel is tracked as a background job so the shutdown hook kills it.
+// Sets publicBaseUrl once the URL is known so get_upload_link becomes usable.
 if (makePublic) {
   if (!hasCloudflared) {
     console.error("warning: --public given but `cloudflared` not found on PATH; skipping tunnel");
@@ -557,6 +1236,7 @@ if (makePublic) {
       while (Date.now() < deadline) {
         const m = j.output.match(re);
         if (m) {
+          publicBaseUrl = m[0];
           console.error(`public URL: ${m[0]}/mcp${token ? `?token=${token}` : ""}`);
           return;
         }
