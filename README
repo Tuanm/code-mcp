@@ -12,4 +12,7 @@ Flags:
   --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
   --public           expose via a Cloudflare quick tunnel (requires cloudflared)
   --domain <host>    use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
+  --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
+                     Tools from each server are exposed with a "<namespace>__" prefix.
+                     Per-server "idleTimeoutMs" (default 600000) controls when idle subprocesses are stopped.
 

@@ -13,6 +13,7 @@
 //   --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
 //   --public           expose via a Cloudflare quick tunnel (requires cloudflared)
 //   --domain <host>    use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
+//   --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
 
 import { spawn, spawnSync, file, write } from "bun";
 import { readdirSync, statSync, mkdirSync } from "node:fs";
@@ -40,6 +41,7 @@ type Job = {
 };
 const jobs = new Map<string, Job>();
 let jobSeq = 0;
+let shuttingDown = false;
 
 // Detect optional external binaries once at startup.
 const hasRg = spawnSync({ cmd: ["sh", "-c", "command -v rg"] }).exitCode === 0;
@@ -54,6 +56,7 @@ Options:
   --enable-memory    Enable remember/forget/recall tools ({cwd}/.memo.jsonl)
   --public           Expose via a Cloudflare quick tunnel (requires cloudflared)
   --domain <host>    Use the given public hostname (tunnel must already route it here). Mutex with --public.
+  --mcp <path>       Aggregate tools from external MCP servers defined in the given JSON config.
   -h, --help         Show this help and exit`;
 
 let args!: Record<string, any>;
@@ -66,6 +69,7 @@ try {
       "enable-memory": { type: "boolean" },
       public: { type: "boolean" },
       domain: { type: "string" },
+      mcp: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: true,
@@ -85,6 +89,7 @@ const token: string | undefined = args.token;
 const memoryEnabled = args["enable-memory"] === true;
 const makePublic = args.public === true;
 const domain: string | undefined = args.domain;
+const mcpConfigPath: string | undefined = args.mcp;
 
 if (makePublic && domain) {
   console.error("error: --public and --domain are mutually exclusive\n");
@@ -641,6 +646,348 @@ function renderUploadPage(): string {
   return UPLOAD_PAGE_HTML;
 }
 
+// ---------- mcp aggregator ----------
+// Spawn external MCP servers (stdio transport) and forward tool calls to them.
+// Tools are exposed to clients with a "<namespace>__" prefix to avoid collisions
+// (Anthropic's tool name regex disallows ":", so we use double underscore).
+// Lazy spawn + per-server idle timeout. Tool list is probed once at startup
+// and cached (so tools/list works without keeping every subprocess alive).
+
+type McpServerConfig = {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  // Custom extension (not in Claude Desktop spec): per-server idle timeout in ms.
+  // Default 600_000 (10 minutes). Set to 0 to disable (always-on once spawned).
+  idleTimeoutMs?: number;
+};
+
+type AggregatedTool = {
+  namespace: string;
+  originalName: string;
+  description: string;
+  inputSchema: Json;
+};
+
+type ServerState = {
+  config: McpServerConfig;
+  proc: ReturnType<typeof spawn> | null;
+  stdoutBuf: string;
+  pending: Map<number, { resolve: (v: Json) => void; reject: (e: Error) => void }>;
+  nextId: number;
+  initialized: boolean;
+  initPromise: Promise<void> | null;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  consecutiveSpawnFails: number;
+  stderrLogPath: string;
+  isProbe: boolean;
+};
+
+const NAMESPACE_RE = /^[a-z][a-z0-9-]*$/;
+const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+const SUBPROCESS_CALL_TIMEOUT_MS = 90_000;
+const MAX_CONSECUTIVE_SPAWN_FAILS = 3;
+
+const aggregatorServers = new Map<string, ServerState>();
+const aggregatedTools = new Map<string, AggregatedTool>(); // prefixed name -> info
+
+function aggregatorLogDir(): string {
+  const dir = resolve(Bun.env.HOME ?? process.cwd(), ".code-mcp", "logs");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function readJsonRpcLines(state: ServerState, chunk: string): Json[] {
+  state.stdoutBuf += chunk;
+  const out: Json[] = [];
+  let nl: number;
+  while ((nl = state.stdoutBuf.indexOf("\n")) !== -1) {
+    const line = state.stdoutBuf.slice(0, nl).trim();
+    state.stdoutBuf = state.stdoutBuf.slice(nl + 1);
+    if (!line) continue;
+    try { out.push(JSON.parse(line)); } catch { /* ignore non-JSON noise */ }
+  }
+  return out;
+}
+
+function attachServerIO(ns: string, state: ServerState) {
+  const proc = state.proc!;
+  // Stdout: parse JSON-RPC responses, route to pending requests.
+  (async () => {
+    const reader = proc.stdout.getReader();
+    const dec = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        for (const msg of readJsonRpcLines(state, dec.decode(value))) {
+          // Server-initiated request: respond minimally so the subprocess
+          // doesn't block. MCP servers may request roots/list, sampling, etc.
+          if (msg.method && msg.id != null) {
+            let result: Json;
+            if (msg.method === "roots/list") result = { roots: [] };
+            else result = {};
+            const reply = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n";
+            try {
+              state.proc!.stdin.write(reply);
+              state.proc!.stdin.flush();
+            } catch { /* subprocess may be exiting */ }
+            continue;
+          }
+          // Server notification: ignore.
+          if (msg.method && msg.id == null) continue;
+          // Response to our request.
+          if (msg.id != null && state.pending.has(msg.id)) {
+            const p = state.pending.get(msg.id)!;
+            state.pending.delete(msg.id);
+            if (msg.error) p.reject(new Error(msg.error.message ?? "rpc error"));
+            else p.resolve(msg.result);
+          }
+        }
+      }
+    } catch { /* reader closed on shutdown */ }
+  })();
+  // Stderr: append to log file.
+  (async () => {
+    const reader = proc.stderr.getReader();
+    const dec = new TextDecoder();
+    const sink = Bun.file(state.stderrLogPath).writer();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sink.write(dec.decode(value));
+        sink.flush();
+      }
+    } catch { /* reader closed on shutdown */ }
+    finally { sink.end(); }
+  })();
+  // Exit: reject all pending, mark dead.
+  (async () => {
+    const code = await proc.exited;
+    for (const p of state.pending.values()) p.reject(new Error(`subprocess exited (code=${code})`));
+    state.pending.clear();
+    state.proc = null;
+    state.initialized = false;
+    state.initPromise = null;
+    if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+    if (code !== 0 && code != null && !shuttingDown && !state.isProbe) {
+      console.error(`[mcp:${ns}] subprocess exited code=${code}; see ${state.stderrLogPath}`);
+    }
+  })();
+}
+
+async function spawnServer(ns: string, state: ServerState): Promise<void> {
+  const { command, args: cmdArgs = [], env = {} } = state.config;
+  const proc = spawn({
+    cmd: [command, ...cmdArgs],
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, ...env },
+  });
+  state.proc = proc;
+  state.stdoutBuf = "";
+  state.pending = new Map();
+  state.nextId = 1;
+  state.initialized = false;
+  attachServerIO(ns, state);
+
+  // MCP handshake: initialize + notifications/initialized.
+  await rpcCall(state, "initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "code-mcp-aggregator", version: "0.1.0" },
+  });
+  await rpcNotify(state, "notifications/initialized", {});
+  state.initialized = true;
+  state.consecutiveSpawnFails = 0;
+}
+
+async function ensureSpawned(ns: string, state: ServerState): Promise<void> {
+  if (state.proc && state.initialized) return;
+  if (state.initPromise) return state.initPromise;
+  if (state.consecutiveSpawnFails >= MAX_CONSECUTIVE_SPAWN_FAILS) {
+    throw new Error(`server '${ns}' marked broken after ${MAX_CONSECUTIVE_SPAWN_FAILS} consecutive spawn failures`);
+  }
+  state.initPromise = (async () => {
+    try {
+      await spawnServer(ns, state);
+    } catch (e) {
+      state.consecutiveSpawnFails++;
+      try { state.proc?.kill("SIGKILL"); } catch {}
+      state.proc = null;
+      state.initialized = false;
+      throw e;
+    } finally {
+      state.initPromise = null;
+    }
+  })();
+  return state.initPromise;
+}
+
+function rpcNotify(state: ServerState, method: string, params: Json): Promise<void> {
+  if (!state.proc) return Promise.reject(new Error("subprocess not running"));
+  const msg = JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n";
+  state.proc.stdin.write(msg);
+  state.proc.stdin.flush();
+  return Promise.resolve();
+}
+
+function rpcCall(state: ServerState, method: string, params: Json): Promise<Json> {
+  if (!state.proc) return Promise.reject(new Error("subprocess not running"));
+  const id = state.nextId++;
+  const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (state.pending.has(id)) {
+        state.pending.delete(id);
+        reject(new Error(`rpc timeout after ${SUBPROCESS_CALL_TIMEOUT_MS}ms: ${method}`));
+      }
+    }, SUBPROCESS_CALL_TIMEOUT_MS);
+    state.pending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
+    try {
+      state.proc!.stdin.write(msg);
+      state.proc!.stdin.flush();
+    } catch (e: any) {
+      clearTimeout(timer);
+      state.pending.delete(id);
+      reject(e);
+    }
+  });
+}
+
+function resetIdleTimer(ns: string, state: ServerState) {
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+  const ttl = state.config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+  if (ttl <= 0) return;
+  state.idleTimer = setTimeout(async () => {
+    if (!state.proc) return;
+    console.error(`[mcp:${ns}] idle for ${ttl}ms; shutting down subprocess`);
+    try {
+      // Best-effort graceful shutdown via stdin close, then SIGTERM.
+      state.proc.stdin.end();
+    } catch {}
+    setTimeout(() => {
+      try { state.proc?.kill("SIGTERM"); } catch {}
+    }, 500);
+  }, ttl);
+}
+
+async function probeServer(ns: string, config: McpServerConfig): Promise<AggregatedTool[]> {
+  const state: ServerState = {
+    config,
+    proc: null,
+    stdoutBuf: "",
+    pending: new Map(),
+    nextId: 1,
+    initialized: false,
+    initPromise: null,
+    idleTimer: null,
+    consecutiveSpawnFails: 0,
+    stderrLogPath: resolve(aggregatorLogDir(), `${ns}.stderr.log`),
+    isProbe: true,
+  };
+  try {
+    await spawnServer(ns, state);
+    const result = await rpcCall(state, "tools/list", {});
+    const list: AggregatedTool[] = (result?.tools ?? []).map((t: any) => ({
+      namespace: ns,
+      originalName: t.name,
+      description: t.description ?? "",
+      inputSchema: t.inputSchema ?? { type: "object" },
+    }));
+    return list;
+  } finally {
+    // Always kill probe subprocess.
+    try { state.proc?.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { state.proc?.kill("SIGKILL"); } catch {} }, 500);
+  }
+}
+
+async function loadAggregator(configPath: string): Promise<void> {
+  let raw: string;
+  try {
+    raw = await file(configPath).text();
+  } catch (e: any) {
+    console.error(`[mcp] failed to read config ${configPath}: ${e?.message ?? e}`);
+    return;
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e: any) {
+    console.error(`[mcp] config is not valid JSON: ${e?.message ?? e}`);
+    return;
+  }
+  const servers = parsed?.mcpServers;
+  if (!servers || typeof servers !== "object") {
+    console.error(`[mcp] config has no 'mcpServers' object; aggregation disabled`);
+    return;
+  }
+
+  for (const [ns, cfg] of Object.entries(servers as Record<string, McpServerConfig>)) {
+    if (!NAMESPACE_RE.test(ns)) {
+      console.error(`[mcp] skipping invalid namespace '${ns}' (must match ${NAMESPACE_RE})`);
+      continue;
+    }
+    if (!cfg || typeof cfg.command !== "string") {
+      console.error(`[mcp] skipping '${ns}': missing 'command'`);
+      continue;
+    }
+    try {
+      const list = await probeServer(ns, cfg);
+      const state: ServerState = {
+        config: cfg,
+        proc: null,
+        stdoutBuf: "",
+        pending: new Map(),
+        nextId: 1,
+        initialized: false,
+        initPromise: null,
+        idleTimer: null,
+        consecutiveSpawnFails: 0,
+        stderrLogPath: resolve(aggregatorLogDir(), `${ns}.stderr.log`),
+        isProbe: false,
+      };
+      aggregatorServers.set(ns, state);
+      for (const tool of list) {
+        const prefixed = `${ns}__${tool.originalName}`;
+        aggregatedTools.set(prefixed, tool);
+      }
+      console.error(`[mcp] probed '${ns}': ${list.length} tool(s) cached`);
+    } catch (e: any) {
+      console.error(`[mcp] probe '${ns}' failed: ${e?.message ?? e}`);
+    }
+  }
+}
+
+async function callAggregated(prefixed: string, args: Json): Promise<Json> {
+  const tool = aggregatedTools.get(prefixed);
+  if (!tool) throw new Error(`unknown aggregated tool: ${prefixed}`);
+  const state = aggregatorServers.get(tool.namespace);
+  if (!state) throw new Error(`no server state for namespace '${tool.namespace}'`);
+  await ensureSpawned(tool.namespace, state);
+  resetIdleTimer(tool.namespace, state);
+  const result = await rpcCall(state, "tools/call", {
+    name: tool.originalName,
+    arguments: args,
+  });
+  return result;
+}
+
+function shutdownAggregator() {
+  for (const [ns, state] of aggregatorServers) {
+    if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+    if (state.proc) {
+      try { state.proc.kill("SIGTERM"); } catch {}
+    }
+  }
+}
+
 // ---------- tools ----------
 const tools: Record<string, Tool> = {
   read: {
@@ -1042,6 +1389,11 @@ if (!publicBaseUrl && !makePublic) {
   delete (tools as any).get_upload_link;
 }
 
+// Load external MCP aggregation config if --mcp was given.
+if (mcpConfigPath) {
+  await loadAggregator(resolve(process.cwd(), mcpConfigPath));
+}
+
 // ---------- JSON-RPC dispatch ----------
 async function handle(msg: Json): Promise<Json | null> {
   const { id, method, params } = msg;
@@ -1059,16 +1411,25 @@ async function handle(msg: Json): Promise<Json | null> {
     if (method === "notifications/initialized") return null; // notification
     if (method === "ping") return ok({});
     if (method === "tools/list") {
-      return ok({
-        tools: Object.entries(tools).map(([name, t]) => ({
-          name,
-          description: t.description,
-          inputSchema: t.inputSchema,
-        })),
-      });
+      const builtin = Object.entries(tools).map(([name, t]) => ({
+        name,
+        description: t.description,
+        inputSchema: t.inputSchema,
+      }));
+      const aggregated = [...aggregatedTools.entries()].map(([name, info]) => ({
+        name,
+        description: info.description,
+        inputSchema: info.inputSchema,
+      }));
+      return ok({ tools: [...builtin, ...aggregated] });
     }
     if (method === "tools/call") {
       const { name, arguments: args } = params ?? {};
+      // Aggregated tool: forward to subprocess, return its content blocks as-is.
+      if (aggregatedTools.has(name)) {
+        const result = await callAggregated(name, args ?? {});
+        return ok(result);
+      }
       const t = tools[name];
       if (!t) return err(-32601, `unknown tool: ${name}`);
       const result = await t.handler(args ?? {});
@@ -1252,10 +1613,10 @@ if (makePublic) {
 }
 
 // ---------- shutdown ----------
-let shuttingDown = false;
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
+  shutdownAggregator();
   console.error(`\n[${signal}] stopping ${jobs.size} job(s)...`);
   for (const j of jobs.values()) {
     if (j.status === "running") {
