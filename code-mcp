@@ -1354,9 +1354,14 @@ const tools: Record<string, Tool> = {
 
   get_upload_link: {
     description:
-      "Return a URL the user can open in their browser to upload files to Tuan's local machine. " +
+      "Return an upload link the user can open to upload files to Tuan's local machine. " +
       "Files are saved to `${UPLOAD_ROOT}/<session_id>/`. Session is valid for 10 minutes. " +
-      "Present the returned URL to the user as a clickable link.",
+      "Returns a JSON object with: `url` (the upload URL), `expiresInMinutes` (10), " +
+      "`widget` (an HTML button matching the upload page style), and `hint`. " +
+      "When responding to the user, render the `widget` HTML by calling the " +
+      "`visualize:show_widget` tool (or equivalent) so the user sees a clickable button " +
+      "instead of a raw URL. Also include the URL as a markdown link in your response " +
+      "as a fallback for clients that don't render widgets.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -1372,7 +1377,75 @@ const tools: Record<string, Tool> = {
         throw new Error("get_upload_link requires --token to sign upload sessions.");
       }
       const sessionId = mintUploadSessionId();
-      return `${publicBaseUrl}/upload/${sessionId}`;
+      const url = `${publicBaseUrl}/upload/${sessionId}`;
+      const widget =
+        // Outer wrapper: stack code-block + button vertically
+        `<div style="display: flex; flex-direction: column; gap: 12px; max-width: 560px;">` +
+          // Code block with copy icon (matches upload page summary style)
+          `<div style="position: relative;">` +
+            `<pre style="margin: 0; padding: 12px 40px 12px 12px; ` +
+              `background: var(--color-background-secondary); ` +
+              `border-radius: var(--border-radius-md); ` +
+              `font-size: 12px; font-family: var(--font-mono); ` +
+              `color: var(--color-text-primary); ` +
+              `white-space: pre-wrap; overflow-wrap: anywhere;">` +
+              url +
+            `</pre>` +
+            `<button type="button" aria-label="Copy URL" ` +
+              `data-url="${url}" ` +
+              `style="position: absolute; top: 8px; right: 8px; ` +
+                `width: 28px; height: 28px; padding: 0; ` +
+                `display: inline-flex; align-items: center; justify-content: center; ` +
+                `color: var(--color-text-tertiary); background: transparent; ` +
+                `border: none; cursor: pointer; border-radius: 4px;" ` +
+              `onmouseover="this.style.background='var(--color-background-primary)'; ` +
+                `this.style.color='var(--color-text-primary)';" ` +
+              `onmouseout="this.style.background='transparent'; ` +
+                `this.style.color='var(--color-text-tertiary)';" ` +
+              `onclick="(function(b){` +
+                `var u=b.getAttribute('data-url');` +
+                `var prev=b.innerHTML;` +
+                `var done=function(){` +
+                  `b.innerHTML='<svg width=\\'14\\' height=\\'14\\' viewBox=\\'0 0 24 24\\' fill=\\'none\\' stroke=\\'currentColor\\' stroke-width=\\'2\\' stroke-linecap=\\'round\\' stroke-linejoin=\\'round\\'><polyline points=\\'20 6 9 17 4 12\\'/></svg>';` +
+                  `b.style.color='var(--color-text-success)';` +
+                  `setTimeout(function(){b.innerHTML=prev;b.style.color='var(--color-text-tertiary)';},1500);` +
+                `};` +
+                `if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(u).then(done).catch(function(){});}` +
+                `else{var ta=document.createElement('textarea');ta.value=u;ta.style.cssText='position:fixed;left:-9999px;';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(e){}document.body.removeChild(ta);}` +
+              `})(this)">` +
+              `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" ` +
+                `stroke="currentColor" stroke-width="2" stroke-linecap="round" ` +
+                `stroke-linejoin="round" aria-hidden="true">` +
+                `<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>` +
+                `<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>` +
+              `</svg>` +
+            `</button>` +
+          `</div>` +
+          // Open button (matches upload page .actions button style)
+          `<a href="${url}" target="_blank" rel="noopener" style="` +
+            `display: inline-block; align-self: flex-start; ` +
+            `font-family: var(--font-sans); font-size: 14px; ` +
+            `padding: 8px 16px; ` +
+            `background: transparent; color: var(--color-text-primary); ` +
+            `border: 0.5px solid var(--color-border-secondary); ` +
+            `border-radius: var(--border-radius-md); ` +
+            `text-decoration: none; cursor: pointer; ` +
+            `transition: background 100ms ease, transform 100ms ease;" ` +
+            `onmouseover="this.style.background='var(--color-background-secondary)'" ` +
+            `onmouseout="this.style.background='transparent'" ` +
+            `onmousedown="this.style.transform='scale(0.98)'" ` +
+            `onmouseup="this.style.transform='scale(1)'">` +
+            `Open` +
+          `</a>` +
+        `</div>`;
+      return JSON.stringify({
+        url,
+        expiresInMinutes: 10,
+        widget,
+        hint:
+          "Render the `widget` HTML by calling visualize:show_widget. " +
+          "Also show the `url` as a markdown link as fallback.",
+      });
     },
   },
 };
