@@ -653,14 +653,23 @@ function renderUploadPage(): string {
 // Lazy spawn + per-server idle timeout. Tool list is probed once at startup
 // and cached (so tools/list works without keeping every subprocess alive).
 
-type McpServerConfig = {
+type StdioServerConfig = {
+  type?: "stdio"; // default
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  // Custom extension (not in Claude Desktop spec): per-server idle timeout in ms.
-  // Default 600_000 (10 minutes). Set to 0 to disable (always-on once spawned).
   idleTimeoutMs?: number;
 };
+
+type HttpServerConfig = {
+  type: "http";
+  url: string;
+  headers?: Record<string, string>;
+  // idleTimeoutMs is accepted but ignored for HTTP (no subprocess to stop).
+  idleTimeoutMs?: number;
+};
+
+type McpServerConfig = StdioServerConfig | HttpServerConfig;
 
 type AggregatedTool = {
   namespace: string;
@@ -669,19 +678,32 @@ type AggregatedTool = {
   inputSchema: Json;
 };
 
-type ServerState = {
-  config: McpServerConfig;
-  proc: ReturnType<typeof spawn> | null;
-  stdoutBuf: string;
+// Common fields for both transports.
+type BaseServerState = {
   pending: Map<number, { resolve: (v: Json) => void; reject: (e: Error) => void }>;
   nextId: number;
   initialized: boolean;
   initPromise: Promise<void> | null;
-  idleTimer: ReturnType<typeof setTimeout> | null;
   consecutiveSpawnFails: number;
-  stderrLogPath: string;
   isProbe: boolean;
 };
+
+type StdioServerState = BaseServerState & {
+  transport: "stdio";
+  config: StdioServerConfig;
+  proc: ReturnType<typeof spawn> | null;
+  stdoutBuf: string;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  stderrLogPath: string;
+};
+
+type HttpServerState = BaseServerState & {
+  transport: "http";
+  config: HttpServerConfig;
+  sessionId: string | null; // Mcp-Session-Id assigned by server after initialize
+};
+
+type ServerState = StdioServerState | HttpServerState;
 
 const NAMESPACE_RE = /^[a-z][a-z0-9-]*$/;
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -697,7 +719,7 @@ function aggregatorLogDir(): string {
   return dir;
 }
 
-function readJsonRpcLines(state: ServerState, chunk: string): Json[] {
+function readJsonRpcLines(state: StdioServerState, chunk: string): Json[] {
   state.stdoutBuf += chunk;
   const out: Json[] = [];
   let nl: number;
@@ -710,7 +732,14 @@ function readJsonRpcLines(state: ServerState, chunk: string): Json[] {
   return out;
 }
 
-function attachServerIO(ns: string, state: ServerState) {
+// Handle a server-initiated request from a downstream MCP server. Returns a
+// reply payload to send back. Used by both transports.
+function handleServerRequest(msg: any): Json {
+  if (msg.method === "roots/list") return { roots: [] };
+  return {};
+}
+
+function attachStdioIO(ns: string, state: StdioServerState) {
   const proc = state.proc!;
   // Stdout: parse JSON-RPC responses, route to pending requests.
   (async () => {
@@ -724,10 +753,7 @@ function attachServerIO(ns: string, state: ServerState) {
           // Server-initiated request: respond minimally so the subprocess
           // doesn't block. MCP servers may request roots/list, sampling, etc.
           if (msg.method && msg.id != null) {
-            let result: Json;
-            if (msg.method === "roots/list") result = { roots: [] };
-            else result = {};
-            const reply = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n";
+            const reply = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: handleServerRequest(msg) }) + "\n";
             try {
               state.proc!.stdin.write(reply);
               state.proc!.stdin.flush();
@@ -777,7 +803,7 @@ function attachServerIO(ns: string, state: ServerState) {
   })();
 }
 
-async function spawnServer(ns: string, state: ServerState): Promise<void> {
+async function spawnStdioServer(ns: string, state: StdioServerState): Promise<void> {
   const { command, args: cmdArgs = [], env = {} } = state.config;
   const proc = spawn({
     cmd: [command, ...cmdArgs],
@@ -791,7 +817,7 @@ async function spawnServer(ns: string, state: ServerState): Promise<void> {
   state.pending = new Map();
   state.nextId = 1;
   state.initialized = false;
-  attachServerIO(ns, state);
+  attachStdioIO(ns, state);
 
   // MCP handshake: initialize + notifications/initialized.
   await rpcCall(state, "initialize", {
@@ -812,11 +838,19 @@ async function ensureSpawned(ns: string, state: ServerState): Promise<void> {
   }
   state.initPromise = (async () => {
     try {
-      await spawnServer(ns, state);
+      if (state.transport === "stdio") {
+        await spawnStdioServer(ns, state);
+      } else {
+        await initHttpServer(ns, state);
+      }
     } catch (e) {
       state.consecutiveSpawnFails++;
-      try { state.proc?.kill("SIGKILL"); } catch {}
-      state.proc = null;
+      if (state.transport === "stdio") {
+        try { state.proc?.kill("SIGKILL"); } catch {}
+        state.proc = null;
+      } else {
+        state.sessionId = null;
+      }
       state.initialized = false;
       throw e;
     } finally {
@@ -827,40 +861,154 @@ async function ensureSpawned(ns: string, state: ServerState): Promise<void> {
 }
 
 function rpcNotify(state: ServerState, method: string, params: Json): Promise<void> {
-  if (!state.proc) return Promise.reject(new Error("subprocess not running"));
-  const msg = JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n";
-  state.proc.stdin.write(msg);
-  state.proc.stdin.flush();
-  return Promise.resolve();
+  if (state.transport === "stdio") {
+    if (!state.proc) return Promise.reject(new Error("subprocess not running"));
+    const msg = JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n";
+    state.proc.stdin.write(msg);
+    state.proc.stdin.flush();
+    return Promise.resolve();
+  }
+  // HTTP transport: notifications are POSTs without expecting a response body.
+  return httpSend(state, { jsonrpc: "2.0", method, params }).then(() => {});
 }
 
 function rpcCall(state: ServerState, method: string, params: Json): Promise<Json> {
-  if (!state.proc) return Promise.reject(new Error("subprocess not running"));
-  const id = state.nextId++;
-  const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (state.pending.has(id)) {
+  if (state.transport === "stdio") {
+    if (!state.proc) return Promise.reject(new Error("subprocess not running"));
+    const id = state.nextId++;
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (state.pending.has(id)) {
+          state.pending.delete(id);
+          reject(new Error(`rpc timeout after ${SUBPROCESS_CALL_TIMEOUT_MS}ms: ${method}`));
+        }
+      }, SUBPROCESS_CALL_TIMEOUT_MS);
+      state.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      try {
+        state.proc!.stdin.write(msg);
+        state.proc!.stdin.flush();
+      } catch (e: any) {
+        clearTimeout(timer);
         state.pending.delete(id);
-        reject(new Error(`rpc timeout after ${SUBPROCESS_CALL_TIMEOUT_MS}ms: ${method}`));
+        reject(e);
       }
-    }, SUBPROCESS_CALL_TIMEOUT_MS);
-    state.pending.set(id, {
-      resolve: (v) => { clearTimeout(timer); resolve(v); },
-      reject: (e) => { clearTimeout(timer); reject(e); },
     });
-    try {
-      state.proc!.stdin.write(msg);
-      state.proc!.stdin.flush();
-    } catch (e: any) {
-      clearTimeout(timer);
-      state.pending.delete(id);
-      reject(e);
-    }
-  });
+  }
+  // HTTP transport
+  const id = state.nextId++;
+  return httpSend(state, { jsonrpc: "2.0", id, method, params })
+    .then((resp) => {
+      if (!resp) throw new Error(`rpc no response: ${method}`);
+      if (resp.error) throw new Error(resp.error.message ?? "rpc error");
+      return resp.result;
+    });
 }
 
+// ---- HTTP transport ----
+
+async function httpSend(state: HttpServerState, body: Json): Promise<any | null> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    ...(state.config.headers ?? {}),
+  };
+  if (state.sessionId) headers["Mcp-Session-Id"] = state.sessionId;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), SUBPROCESS_CALL_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(state.config.url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // Capture session ID assigned by server on initialize.
+  const sid = resp.headers.get("Mcp-Session-Id");
+  if (sid && !state.sessionId) state.sessionId = sid;
+
+  if (!resp.ok) {
+    throw new Error(`http ${resp.status}: ${await resp.text()}`);
+  }
+
+  // Notifications return 202 No Content (or empty 200) — no body to parse.
+  if (resp.status === 202 || resp.headers.get("content-length") === "0") return null;
+
+  const ct = resp.headers.get("content-type") ?? "";
+  if (ct.includes("text/event-stream")) {
+    return parseSseSingleResponse(resp);
+  }
+  // Plain JSON response.
+  const text = await resp.text();
+  if (!text.trim()) return null;
+  return JSON.parse(text);
+}
+
+// Parse SSE stream and return the first JSON-RPC response it contains.
+// MCP servers often return a single response then close the stream.
+async function parseSseSingleResponse(resp: Response): Promise<any | null> {
+  if (!resp.body) return null;
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      // Split on double-newline (SSE event separator).
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const event = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLines = event.split("\n").filter(l => l.startsWith("data:"));
+        if (!dataLines.length) continue;
+        const payload = dataLines.map(l => l.slice(5).trim()).join("\n");
+        try {
+          const msg = JSON.parse(payload);
+          // Take the first response (skip server-initiated requests).
+          if (msg.id != null && (msg.result !== undefined || msg.error !== undefined)) {
+            try { reader.cancel(); } catch {}
+            return msg;
+          }
+        } catch { /* ignore non-JSON */ }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  return null;
+}
+
+async function initHttpServer(ns: string, state: HttpServerState): Promise<void> {
+  state.pending = new Map();
+  state.nextId = 1;
+  state.initialized = false;
+  state.sessionId = null;
+  // MCP handshake.
+  await rpcCall(state, "initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "code-mcp-aggregator", version: "0.1.0" },
+  });
+  await rpcNotify(state, "notifications/initialized", {});
+  state.initialized = true;
+  state.consecutiveSpawnFails = 0;
+}
+
+// ---- end HTTP transport ----
+
 function resetIdleTimer(ns: string, state: ServerState) {
+  if (state.transport !== "stdio") return; // HTTP has no subprocess to expire
   if (state.idleTimer) clearTimeout(state.idleTimer);
   const ttl = state.config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   if (ttl <= 0) return;
@@ -868,7 +1016,6 @@ function resetIdleTimer(ns: string, state: ServerState) {
     if (!state.proc) return;
     console.error(`[mcp:${ns}] idle for ${ttl}ms; shutting down subprocess`);
     try {
-      // Best-effort graceful shutdown via stdin close, then SIGTERM.
       state.proc.stdin.end();
     } catch {}
     setTimeout(() => {
@@ -877,22 +1024,42 @@ function resetIdleTimer(ns: string, state: ServerState) {
   }, ttl);
 }
 
-async function probeServer(ns: string, config: McpServerConfig): Promise<AggregatedTool[]> {
-  const state: ServerState = {
-    config,
-    proc: null,
-    stdoutBuf: "",
+function makeServerState(ns: string, cfg: McpServerConfig, isProbe: boolean): ServerState {
+  const base = {
     pending: new Map(),
     nextId: 1,
     initialized: false,
     initPromise: null,
-    idleTimer: null,
     consecutiveSpawnFails: 0,
-    stderrLogPath: resolve(aggregatorLogDir(), `${ns}.stderr.log`),
-    isProbe: true,
+    isProbe,
   };
+  if (cfg.type === "http") {
+    return {
+      ...base,
+      transport: "http",
+      config: cfg,
+      sessionId: null,
+    };
+  }
+  return {
+    ...base,
+    transport: "stdio",
+    config: cfg,
+    proc: null,
+    stdoutBuf: "",
+    idleTimer: null,
+    stderrLogPath: resolve(aggregatorLogDir(), `${ns}.stderr.log`),
+  };
+}
+
+async function probeServer(ns: string, config: McpServerConfig): Promise<AggregatedTool[]> {
+  const state = makeServerState(ns, config, true);
   try {
-    await spawnServer(ns, state);
+    if (state.transport === "stdio") {
+      await spawnStdioServer(ns, state);
+    } else {
+      await initHttpServer(ns, state);
+    }
     const result = await rpcCall(state, "tools/list", {});
     const list: AggregatedTool[] = (result?.tools ?? []).map((t: any) => ({
       namespace: ns,
@@ -902,9 +1069,11 @@ async function probeServer(ns: string, config: McpServerConfig): Promise<Aggrega
     }));
     return list;
   } finally {
-    // Always kill probe subprocess.
-    try { state.proc?.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { state.proc?.kill("SIGKILL"); } catch {} }, 500);
+    if (state.transport === "stdio") {
+      try { state.proc?.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { state.proc?.kill("SIGKILL"); } catch {} }, 500);
+    }
+    // HTTP probe has no resource to clean up beyond GC.
   }
 }
 
@@ -934,31 +1103,29 @@ async function loadAggregator(configPath: string): Promise<void> {
       console.error(`[mcp] skipping invalid namespace '${ns}' (must match ${NAMESPACE_RE})`);
       continue;
     }
-    if (!cfg || typeof cfg.command !== "string") {
-      console.error(`[mcp] skipping '${ns}': missing 'command'`);
+    if (!cfg || typeof cfg !== "object") {
+      console.error(`[mcp] skipping '${ns}': not an object`);
+      continue;
+    }
+    if (cfg.type === "http") {
+      if (typeof cfg.url !== "string") {
+        console.error(`[mcp] skipping '${ns}': http server missing 'url'`);
+        continue;
+      }
+    } else if (typeof (cfg as any).command !== "string") {
+      console.error(`[mcp] skipping '${ns}': stdio server missing 'command'`);
       continue;
     }
     try {
       const list = await probeServer(ns, cfg);
-      const state: ServerState = {
-        config: cfg,
-        proc: null,
-        stdoutBuf: "",
-        pending: new Map(),
-        nextId: 1,
-        initialized: false,
-        initPromise: null,
-        idleTimer: null,
-        consecutiveSpawnFails: 0,
-        stderrLogPath: resolve(aggregatorLogDir(), `${ns}.stderr.log`),
-        isProbe: false,
-      };
+      const state = makeServerState(ns, cfg, false);
       aggregatorServers.set(ns, state);
       for (const tool of list) {
         const prefixed = `${ns}__${tool.originalName}`;
         aggregatedTools.set(prefixed, tool);
       }
-      console.error(`[mcp] probed '${ns}': ${list.length} tool(s) cached`);
+      const transport = cfg.type === "http" ? "http" : "stdio";
+      console.error(`[mcp] probed '${ns}' (${transport}): ${list.length} tool(s) cached`);
     } catch (e: any) {
       console.error(`[mcp] probe '${ns}' failed: ${e?.message ?? e}`);
     }
@@ -981,10 +1148,13 @@ async function callAggregated(prefixed: string, args: Json): Promise<Json> {
 
 function shutdownAggregator() {
   for (const [ns, state] of aggregatorServers) {
-    if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
-    if (state.proc) {
-      try { state.proc.kill("SIGTERM"); } catch {}
+    if (state.transport === "stdio") {
+      if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+      if (state.proc) {
+        try { state.proc.kill("SIGTERM"); } catch {}
+      }
     }
+    // HTTP: nothing to shut down locally.
   }
 }
 

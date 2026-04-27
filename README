@@ -14,5 +14,7 @@ Flags:
   --domain <host>    use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
   --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
                      Tools from each server are exposed with a "<namespace>__" prefix.
-                     Per-server "idleTimeoutMs" (default 600000) controls when idle subprocesses are stopped.
+                     Stdio transport (default): {"command": "...", "args": [...], "env": {...}}.
+                     HTTP transport: {"type": "http", "url": "...", "headers": {...}}.
+                     Per-server "idleTimeoutMs" (default 600000) controls when idle stdio subprocesses are stopped.
 
