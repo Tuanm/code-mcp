@@ -51,13 +51,14 @@ const hasCloudflared = spawnSync({ cmd: ["sh", "-c", "command -v cloudflared"] }
 const USAGE = `Usage: bun code-mcp.ts [options]
 
 Options:
-  --port <n>         Listen port (default: 7777, or $PORT)
-  --token <s>        Require ?token=<s> on every request (default: no auth)
-  --enable-memory    Enable remember/forget/recall tools ({cwd}/.memo.jsonl)
-  --public           Expose via a Cloudflare quick tunnel (requires cloudflared)
-  --domain <host>    Use the given public hostname (tunnel must already route it here). Mutex with --public.
-  --mcp <path>       Aggregate tools from external MCP servers defined in the given JSON config.
-  -h, --help         Show this help and exit`;
+  --port <n>             Listen port (default: 7777, or $PORT)
+  --token <s>            Require ?token=<s> on every request (default: no auth)
+  --enable-memory        Enable remember/forget/recall tools ({cwd}/.memo.jsonl)
+  --disallowed-tools     Comma-separated list of tools to disable (highest priority)
+  --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
+  --domain <host>        Use the given public hostname (tunnel must already route it here). Mutex with --public.
+  --mcp <path>           Aggregate tools from external MCP servers defined in the given JSON config.
+  -h, --help            Show this help and exit`;
 
 let args!: Record<string, any>;
 try {
@@ -67,6 +68,7 @@ try {
       port: { type: "string" },
       token: { type: "string" },
       "enable-memory": { type: "boolean" },
+      "disallowed-tools": { type: "string" },
       public: { type: "boolean" },
       domain: { type: "string" },
       mcp: { type: "string" },
@@ -87,6 +89,9 @@ if (args.help) {
 const port = Number(args.port ?? Bun.env.PORT ?? 7777);
 const token: string | undefined = args.token;
 const memoryEnabled = args["enable-memory"] === true;
+const disallowedTools: string[] = args["disallowed-tools"]
+  ? args["disallowed-tools"].split(",").map((s: string) => s.trim()).filter(Boolean)
+  : [];
 const makePublic = args.public === true;
 const domain: string | undefined = args.domain;
 const mcpConfigPath: string | undefined = args.mcp;
@@ -1621,15 +1626,22 @@ const tools: Record<string, Tool> = {
 };
 
 // Prune tools based on startup flags and binary availability.
-if (!hasCloudflared) delete tools.preview;
-if (!memoryEnabled) {
-  delete tools.remember;
-  delete tools.forget;
-  delete tools.recall;
-}
-if (!publicBaseUrl && !makePublic) {
-  // No public URL now and none coming. Drop the tool from tools/list.
-  delete (tools as any).get_upload_link;
+// --disallowed-tools has highest priority: removes tools regardless of other flags.
+if (disallowedTools.length > 0) {
+  for (const name of disallowedTools) {
+    delete tools[name];
+  }
+} else {
+  // Default behavior: only prune if --disallowed-tools was not specified
+  if (!hasCloudflared) delete tools.preview;
+  if (!memoryEnabled) {
+    delete tools.remember;
+    delete tools.forget;
+    delete tools.recall;
+  }
+  if (!publicBaseUrl && !makePublic) {
+    delete (tools as any).get_upload_link;
+  }
 }
 
 // Load external MCP aggregation config if --mcp was given.

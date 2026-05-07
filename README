@@ -7,12 +7,13 @@ Tools (conditional):
   - get_upload_link             enabled only with --public or --domain
 
 Flags:
-  --port <n>         listen port (default: 7777, or $PORT)
-  --token <s>        require ?token=<s> on every request (default: no auth)
-  --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
-  --public           expose via a Cloudflare quick tunnel (requires cloudflared)
-  --domain <host>    use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
-  --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
+  --port <n>              listen port (default: 7777, or $PORT)
+  --token <s>             require ?token=<s> on every request (default: no auth)
+  --enable-memory         enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
+  --disallowed-tools      comma-separated list of tools to disable (highest priority)
+  --public                expose via a Cloudflare quick tunnel (requires cloudflared)
+  --domain <host>         use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
+  --mcp <path>            aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
                      Tools from each server are exposed with a "<namespace>__" prefix.
                      Stdio transport (default): {"command": "...", "args": [...], "env": {...}}.
                      HTTP transport: {"type": "http", "url": "...", "headers": {...}}.
