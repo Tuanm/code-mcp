@@ -1397,10 +1397,11 @@ const tools: Record<string, Tool> = {
         cwd: { type: "string" },
         mode: { type: "string", enum: ["list", "view", "start", "stop"] },
         command: { type: "string" },
+        timeout_ms: { type: "number" },
       },
       required: ["cwd", "mode"],
     },
-    handler: ({ cwd, mode, command }) => {
+    handler: async ({ cwd, mode, command, timeout_ms = 500 }) => {
       if (mode === "list") {
         if (jobs.size === 0) return "(no jobs)";
         return [...jobs.values()]
@@ -1415,10 +1416,26 @@ const tools: Record<string, Tool> = {
       if (!command) throw new Error("job id required (pass as command)");
       const j = jobs.get(command);
       if (!j) throw new Error(`no such job: ${command}`);
-      if (mode === "view") return `[${j.status}${j.exitCode != null ? ` ${j.exitCode}` : ""}]\n${j.output}`;
+      if (mode === "view") {
+        return `[${j.id}] ${j.command}\n[${j.status}${j.exitCode != null ? ` ${j.exitCode}` : ""}]\n${j.output}`;
+      }
       if (mode === "stop") {
-        if (j.status === "running") j.proc.kill();
-        return `stopped ${j.id}`;
+        if (j.status !== "running") return `${j.id} already ${j.status}`;
+        j.proc.kill("SIGTERM");
+        await new Promise<void>((resolve) => {
+          const deadline = Date.now() + timeout_ms;
+          const check = setInterval(() => {
+            if (j.status === "exited") {
+              clearInterval(check);
+              resolve();
+            } else if (Date.now() >= deadline) {
+              clearInterval(check);
+              j.proc.kill("SIGKILL");
+              resolve();
+            }
+          }, 50);
+        });
+        return `${j.id} stopped`;
       }
       throw new Error(`bad mode: ${mode}`);
     },
