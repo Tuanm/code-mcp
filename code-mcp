@@ -44,9 +44,30 @@ const jobs = new Map<string, Job>();
 let jobSeq = 0;
 let shuttingDown = false;
 
-// Detect optional external binaries once at startup.
-const hasRg = spawnSync({ cmd: ["sh", "-c", "command -v rg"] }).exitCode === 0;
-const hasCloudflared = spawnSync({ cmd: ["sh", "-c", "command -v cloudflared"] }).exitCode === 0;
+// Wrap a shell command string in argv form for the platform's default shell.
+// POSIX: ["sh", "-c", cmd]
+// Windows: ["cmd.exe", "/d", "/s", "/c", cmd]
+//   /d disables AutoRun, /s makes quote handling parse-correctly, /c runs
+//   then exits. This matches what Node.js spawn({shell: true}) does on
+//   Windows and is the de-facto standard.
+// Shell *syntax* still differs (POSIX $VAR vs Windows %VAR%, pipes, etc.) —
+// portability of the command itself is the caller's responsibility.
+const IS_WINDOWS = process.platform === "win32";
+function shellCmd(command: string): string[] {
+  return IS_WINDOWS
+    ? ["cmd.exe", "/d", "/s", "/c", command]
+    : ["sh", "-c", command];
+}
+
+// Detect optional external binaries once at startup. Use the platform's
+// own binary-locator: `where` on Windows, `command -v` on POSIX. Both
+// exit 0 iff the binary is found.
+function hasOnPath(bin: string): boolean {
+  const probe = IS_WINDOWS ? `where ${bin}` : `command -v ${bin}`;
+  return spawnSync({ cmd: shellCmd(probe), stdout: "ignore", stderr: "ignore" }).exitCode === 0;
+}
+const hasRg = hasOnPath("rg");
+const hasCloudflared = hasOnPath("cloudflared");
 
 // ---------- args ----------
 const USAGE = `Usage: bun code-mcp.ts [options]
@@ -185,7 +206,7 @@ async function pumpCapped(stream: ReadableStream<Uint8Array> | null, sink: { tex
 function startJob(command: string, cwd: string): Job {
   const id = `j${++jobSeq}`;
   const proc = spawn({
-    cmd: ["sh", "-c", command],
+    cmd: shellCmd(command),
     cwd,
     stdout: "pipe",
     stderr: "pipe",
@@ -1393,7 +1414,7 @@ const tools: Record<string, Tool> = {
       const ctrl = new AbortController();
       const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
       const proc = spawn({
-        cmd: ["sh", "-c", command],
+        cmd: shellCmd(command),
         cwd,
         stdout: "pipe",
         stderr: "pipe",
