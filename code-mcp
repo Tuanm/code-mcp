@@ -16,11 +16,11 @@
 //   --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
 
 import { spawn, spawnSync, file, write } from "bun";
-import { readdirSync, statSync, mkdirSync } from "node:fs";
+import { readdirSync, statSync, mkdirSync, rmSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { parseArgs } from "util";
 
 type Json = any;
@@ -135,6 +135,61 @@ const UPLOAD_ROOT =
   process.platform === "darwin" ? "/private/tmp" :
   process.platform === "linux" ? "/tmp" :
   tmpdir();
+
+// ---------- result spill ----------
+// Tool results larger than RESULT_SPILL_THRESHOLD bytes are written to a file
+// under RESULT_SPILL_ROOT and replaced in the response with a head+tail
+// preview plus a pointer to the full file. This protects the agent's context
+// window even when the in-memory cap (OUTPUT_CAP_MAX = 1MB) hasn't kicked in.
+//
+// Threshold and preview sizes are intentionally hard-coded — see project
+// CLAUDE.md and the conversation that introduced this feature for the
+// rationale (avoid yet-another-flag).
+const RESULT_SPILL_ROOT = resolve(tmpdir(), "code-mcp");
+const RESULT_SPILL_THRESHOLD = 10_000; // bytes
+const RESULT_SPILL_HEAD = 3_000;
+const RESULT_SPILL_TAIL = 3_000;
+
+// Best-effort cleanup of any stale spill files from a previous run. Failure
+// is non-fatal: the spill directory may not exist yet, may belong to another
+// user, or may be on a read-only filesystem.
+try {
+  rmSync(RESULT_SPILL_ROOT, { recursive: true, force: true });
+} catch { /* ignore */ }
+try {
+  mkdirSync(RESULT_SPILL_ROOT, { recursive: true });
+} catch (e: any) {
+  console.error(`[spill] failed to prepare ${RESULT_SPILL_ROOT}: ${e?.message ?? e}`);
+}
+
+// If `text` exceeds the threshold, write it to a uuid-named file in the
+// spill directory and return a preview string with a pointer. Otherwise
+// pass through unchanged. Async so we don't block the event loop on the
+// write; the caller is already awaiting the tool response.
+async function maybeSpillText(text: string): Promise<string> {
+  // Byte length, not char length — multibyte content shouldn't slip through.
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= RESULT_SPILL_THRESHOLD) return text;
+
+  const id = randomUUID();
+  const path = resolve(RESULT_SPILL_ROOT, `${id}.txt`);
+  try {
+    await Bun.write(path, text);
+  } catch (e: any) {
+    // Failing here means we can't spill, so fall back to returning the
+    // original text. pumpCapped still bounds output at ~500KB, which is
+    // bad for context but not for the server — better than dropping data.
+    console.error(`[spill] failed to write ${path}: ${e?.message ?? e}`);
+    return text;
+  }
+
+  const head = text.slice(0, RESULT_SPILL_HEAD);
+  const tail = text.slice(-RESULT_SPILL_TAIL);
+  const marker =
+    `\n... [TRUNCATED: full output is ${bytes} bytes, saved to ${path} — ` +
+    `call the \`read\` tool with that path to see the complete content] ...\n`;
+  return head + marker + tail;
+}
 
 // ---------- upload session HMAC ----------
 // session_id = base64url(payload).base64url(HMAC-SHA256(token, payload))
@@ -1829,6 +1884,19 @@ if (mcpConfigPath) {
   await loadAggregator(resolve(process.cwd(), mcpConfigPath));
 }
 
+// Walk an MCP `content` array and spill any oversized text blocks. Non-text
+// blocks (image, resource, etc.) are passed through untouched. Used for
+// aggregated-tool responses where the content shape is opaque to us.
+async function spillContentBlocks(content: any): Promise<any> {
+  if (!Array.isArray(content)) return content;
+  return await Promise.all(content.map(async (block) => {
+    if (block && block.type === "text" && typeof block.text === "string") {
+      return { ...block, text: await maybeSpillText(block.text) };
+    }
+    return block;
+  }));
+}
+
 // ---------- JSON-RPC dispatch ----------
 async function handle(msg: Json): Promise<Json | null> {
   const { id, method, params } = msg;
@@ -1860,19 +1928,27 @@ async function handle(msg: Json): Promise<Json | null> {
     }
     if (method === "tools/call") {
       const { name, arguments: args } = params ?? {};
-      // Aggregated tool: forward to subprocess, return its content blocks as-is.
+      // Aggregated tool: forward to subprocess, spill oversized text blocks
+      // before returning so the agent's context window stays bounded.
       if (aggregatedTools.has(name)) {
         const result = await callAggregated(name, args ?? {});
+        if (result && typeof result === "object" && "content" in result) {
+          return ok({ ...result, content: await spillContentBlocks(result.content) });
+        }
         return ok(result);
       }
       const t = tools[name];
       if (!t) return err(-32601, `unknown tool: ${name}`);
       const result = await t.handler(args ?? {});
-      return ok({ content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] });
+      const text = typeof result === "string" ? result : JSON.stringify(result);
+      return ok({ content: [{ type: "text", text: await maybeSpillText(text) }] });
     }
     return err(-32601, `unknown method: ${method}`);
   } catch (e: any) {
-    return ok({ content: [{ type: "text", text: `ERROR: ${e?.message ?? e}` }], isError: true });
+    // Error messages can also blow past the threshold (e.g. a subprocess
+    // dumps a long stack trace). Spill them too.
+    const text = `ERROR: ${e?.message ?? e}`;
+    return ok({ content: [{ type: "text", text: await maybeSpillText(text) }], isError: true });
   }
 }
 
