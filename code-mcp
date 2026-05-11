@@ -725,7 +725,6 @@ type AggregatedTool = {
 
 // Common fields for both transports.
 type BaseServerState = {
-  pending: Map<number, { resolve: (v: Json) => void; reject: (e: Error) => void }>;
   nextId: number;
   initialized: boolean;
   initPromise: Promise<void> | null;
@@ -740,6 +739,10 @@ type StdioServerState = BaseServerState & {
   stdoutBuf: string;
   idleTimer: ReturnType<typeof setTimeout> | null;
   stderrLogPath: string;
+  // Outstanding RPC calls: id -> resolver. Only stdio needs this because
+  // responses arrive interleaved on a single stream. HTTP responses come
+  // back as the body of the originating fetch() and don't need routing.
+  pending: Map<number, { resolve: (v: Json) => void; reject: (e: Error) => void }>;
 };
 
 type HttpServerState = BaseServerState & {
@@ -1035,7 +1038,6 @@ async function parseSseSingleResponse(resp: Response): Promise<any | null> {
 }
 
 async function initHttpServer(ns: string, state: HttpServerState): Promise<void> {
-  state.pending = new Map();
   state.nextId = 1;
   state.initialized = false;
   state.sessionId = null;
@@ -1071,7 +1073,6 @@ function resetIdleTimer(ns: string, state: ServerState) {
 
 function makeServerState(ns: string, cfg: McpServerConfig, isProbe: boolean): ServerState {
   const base = {
-    pending: new Map(),
     nextId: 1,
     initialized: false,
     initPromise: null,
@@ -1094,6 +1095,7 @@ function makeServerState(ns: string, cfg: McpServerConfig, isProbe: boolean): Se
     stdoutBuf: "",
     idleTimer: null,
     stderrLogPath: resolve(aggregatorLogDir(), `${ns}.stderr.log`),
+    pending: new Map(),
   };
 }
 
