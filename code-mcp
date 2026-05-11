@@ -819,7 +819,14 @@ function attachStdioIO(ns: string, state: StdioServerState) {
           }
         }
       }
-    } catch { /* reader closed on shutdown */ }
+    } catch (e: any) {
+      // Reader throws when the stream is forcibly closed. The exit handler
+      // below covers normal shutdown; only surface errors that happen
+      // while the subprocess is still considered live.
+      if (!shuttingDown && !state.isProbe && state.proc) {
+        console.error(`[mcp:${ns}] stdout reader error: ${e?.message ?? e}`);
+      }
+    }
   })();
   // Stderr: append to log file.
   (async () => {
@@ -833,8 +840,11 @@ function attachStdioIO(ns: string, state: StdioServerState) {
         sink.write(dec.decode(value));
         sink.flush();
       }
-    } catch { /* reader closed on shutdown */ }
-    finally { sink.end(); }
+    } catch (e: any) {
+      if (!shuttingDown && !state.isProbe && state.proc) {
+        console.error(`[mcp:${ns}] stderr reader error: ${e?.message ?? e}`);
+      }
+    } finally { sink.end(); }
   })();
   // Exit: reject all pending, mark dead.
   (async () => {
