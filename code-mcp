@@ -1420,21 +1420,52 @@ const tools: Record<string, Tool> = {
   },
 
   find: {
-    description: "Find files by glob pattern. Supports ** for recursive. Bare patterns like '*.ts' match at any depth.",
+    description:
+      "Find files by glob pattern. Supports ** for recursive. Bare patterns like '*.ts' match at any depth. " +
+      "Skips common noise dirs (node_modules, .git, .next, dist, build, target, .venv, __pycache__) " +
+      "unless the pattern explicitly references them. Pass include_hidden=true to include dot-files.",
     inputSchema: {
       type: "object",
       properties: {
         cwd: { type: "string" },
         pattern: { type: "string" },
         path: { type: "string" },
+        include_hidden: { type: "boolean" },
       },
       required: ["cwd", "pattern"],
     },
-    handler: async ({ cwd, pattern, path = "." }) => {
-      const pat = pattern.includes("/") ? pattern : `**/${pattern}`;
+    handler: async ({ cwd, pattern, path = ".", include_hidden = false }) => {
+      const pat = pattern.includes("/") || pattern.includes("\\") ? pattern : `**/${pattern}`;
       const glob = new Bun.Glob(pat);
+
+      // Heavy directories Bun.Glob will happily traverse if we don't filter
+      // them out. ripgrep skips these by default; find didn't, which made
+      // results unusable inside any JS/Python repo.
+      const NOISE_DIRS = new Set([
+        "node_modules", ".git", ".next", ".nuxt", ".turbo", ".cache",
+        "dist", "build", "out", "target", "coverage",
+        ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+        ".idea", ".vscode",
+      ]);
+      // Honour the user's intent: if they explicitly mention a noise dir in
+      // the pattern (e.g. "node_modules/foo/index.js"), don't filter it out.
+      const patternRefs = new Set(
+        pat.split(/[\/\\]/).filter((seg) => NOISE_DIRS.has(seg))
+      );
+
       const results: string[] = [];
       for await (const f of glob.scan({ cwd: resolve(cwd, path), onlyFiles: false })) {
+        // Split on both separators so Windows paths from Bun.Glob match.
+        const segments = f.split(/[\/\\]/);
+        let skip = false;
+        for (const seg of segments) {
+          if (NOISE_DIRS.has(seg) && !patternRefs.has(seg)) { skip = true; break; }
+          if (!include_hidden && seg.startsWith(".") && seg !== "." && seg !== "..") {
+            // Allow the pattern itself to opt back in (e.g. ".env*").
+            if (!pat.includes(seg) && !pat.startsWith(".")) { skip = true; break; }
+          }
+        }
+        if (skip) continue;
         results.push(f);
         if (results.length >= 10_000) break;
       }
