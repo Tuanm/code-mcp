@@ -1531,19 +1531,20 @@ const tools: Record<string, Tool> = {
       if (mode === "stop") {
         if (j.status !== "running") return `${j.id} already ${j.status}`;
         j.proc.kill("SIGTERM");
-        await new Promise<void>((resolve) => {
-          const deadline = Date.now() + timeout_ms;
-          const check = setInterval(() => {
-            if (j.status === "exited") {
-              clearInterval(check);
-              resolve();
-            } else if (Date.now() >= deadline) {
-              clearInterval(check);
-              j.proc.kill("SIGKILL");
-              resolve();
-            }
-          }, 50);
+        // Wait for exit or timeout — no polling. SIGTERM + grace period,
+        // then SIGKILL if still alive. proc.exited is the Promise the
+        // subprocess already exposes; race it against a sleep.
+        let timedOut = false;
+        const timer = new Promise<void>((resolve) => {
+          setTimeout(() => { timedOut = true; resolve(); }, timeout_ms);
         });
+        await Promise.race([j.proc.exited, timer]);
+        if (timedOut && j.status === "running") {
+          j.proc.kill("SIGKILL");
+          // Wait for the kill to actually take effect, otherwise we'd
+          // return while the process is still being reaped.
+          await j.proc.exited;
+        }
         return `${j.id} stopped`;
       }
       throw new Error(`bad mode: ${mode}`);
