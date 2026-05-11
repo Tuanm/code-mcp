@@ -1274,29 +1274,59 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "edits"],
     },
     handler: async ({ cwd, edits }) => {
-      // Load each file once; apply edits sequentially to in-memory text.
-      // Any failure throws before a single write hits disk.
-      const texts = new Map<string, string>();
-      const touched = new Map<string, number>(); // path -> edit count
+      // Two-phase: phase 1 validates every edit against the ORIGINAL file
+      // text and records [start, end, replacement) ranges. Phase 2 applies
+      // each file's ranges in reverse order (so earlier offsets stay valid).
+      //
+      // This guarantees:
+      //  - old_str uniqueness is checked on the original text, not on the
+      //    intermediate result of preceding edits.
+      //  - overlapping edits are rejected up front instead of silently
+      //    clobbering each other.
+      //  - if any edit fails, no file on disk is touched.
+      type Range = { start: number; end: number; replacement: string; index: number };
+      const originals = new Map<string, string>();
+      const ranges = new Map<string, Range[]>();
 
       for (let i = 0; i < edits.length; i++) {
         const { path, old_str, new_str } = edits[i];
         const p = resolve(cwd, path);
-        if (!texts.has(p)) texts.set(p, await file(p).text());
-        const current = texts.get(p)!;
-        const first = current.indexOf(old_str);
+        if (!originals.has(p)) originals.set(p, await file(p).text());
+        const text = originals.get(p)!;
+        const first = text.indexOf(old_str);
         if (first === -1) throw new Error(`edit #${i + 1} (${path}): old_str not found`);
-        if (current.indexOf(old_str, first + 1) !== -1) {
+        if (text.indexOf(old_str, first + 1) !== -1) {
           throw new Error(`edit #${i + 1} (${path}): old_str not unique`);
         }
-        texts.set(p, current.slice(0, first) + new_str + current.slice(first + old_str.length));
-        touched.set(p, (touched.get(p) ?? 0) + 1);
+        const start = first;
+        const end = first + old_str.length;
+        const list = ranges.get(p) ?? [];
+        // Check overlap with edits already queued for this file.
+        for (const r of list) {
+          if (start < r.end && end > r.start) {
+            throw new Error(
+              `edit #${i + 1} (${path}): overlaps edit #${r.index + 1} ` +
+              `(both target bytes ${Math.max(start, r.start)}..${Math.min(end, r.end)})`
+            );
+          }
+        }
+        list.push({ start, end, replacement: new_str, index: i });
+        ranges.set(p, list);
       }
 
-      // All edits validated — flush.
-      for (const [p, text] of texts) await write(p, text);
-      const summary = [...touched].map(([p, n]) => `${p} (${n} edit${n > 1 ? "s" : ""})`).join(", ");
-      return `applied ${edits.length} edit(s) across ${touched.size} file(s): ${summary}`;
+      // All edits validated — apply in reverse order per file.
+      for (const [p, list] of ranges) {
+        const sorted = [...list].sort((a, b) => b.start - a.start);
+        let text = originals.get(p)!;
+        for (const r of sorted) {
+          text = text.slice(0, r.start) + r.replacement + text.slice(r.end);
+        }
+        await write(p, text);
+      }
+      const summary = [...ranges]
+        .map(([p, list]) => `${p} (${list.length} edit${list.length > 1 ? "s" : ""})`)
+        .join(", ");
+      return `applied ${edits.length} edit(s) across ${ranges.size} file(s): ${summary}`;
     },
   },
 
