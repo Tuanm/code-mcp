@@ -17,6 +17,7 @@
 
 import { spawn, spawnSync, file, write } from "bun";
 import { readdirSync, statSync, mkdirSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -207,6 +208,31 @@ async function readMemos(cwd: string): Promise<Memo[]> {
 async function writeMemos(cwd: string, memos: Memo[]): Promise<void> {
   const text = memos.map((m) => JSON.stringify(m)).join("\n") + (memos.length ? "\n" : "");
   await write(resolve(cwd, ".memo.jsonl"), text);
+}
+
+// Read the last memo id from {cwd}/.memo.jsonl without loading the whole file.
+// Reads a tail window and parses the last complete JSON line. Falls back to a
+// full scan if the tail can't be parsed (e.g. a single memo longer than the
+// tail window, or a partial write from a crash).
+const MEMO_TAIL_BYTES = 8192;
+async function lastMemoId(cwd: string): Promise<number> {
+  const f = file(resolve(cwd, ".memo.jsonl"));
+  if (!(await f.exists())) return 0;
+  const size = f.size;
+  if (size === 0) return 0;
+  const tail = await f.slice(Math.max(0, size - MEMO_TAIL_BYTES), size).text();
+  const lines = tail.split("\n").filter((l) => l.trim());
+  // Try from the last line backward — a partial last line will fail to parse.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const m = JSON.parse(lines[i]) as Memo;
+      if (typeof m.id === "number") return m.id;
+    } catch { /* try previous */ }
+  }
+  // Tail window didn't contain a complete line (single huge memo, or all
+  // corrupted). Fall back to full scan.
+  const memos = await readMemos(cwd);
+  return memos.reduce((m, x) => Math.max(m, x.id), 0);
 }
 
 // ---------- upload page ----------
@@ -1476,14 +1502,12 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "memo"],
     },
     handler: async ({ cwd, memo, tags }) => {
-      const memos = await readMemos(cwd);
-      const id = memos.reduce((m, x) => Math.max(m, x.id), 0) + 1;
+      const id = (await lastMemoId(cwd)) + 1;
       const entry: Memo = { id, ts: Date.now(), memo, ...(tags?.length ? { tags } : {}) };
-      // Append instead of rewrite — JSONL is designed for this.
       const line = JSON.stringify(entry) + "\n";
-      const path = resolve(cwd, ".memo.jsonl");
-      const existing = (await file(path).exists()) ? await file(path).text() : "";
-      await write(path, existing + line);
+      // True append — O(1) regardless of file size. node:fs/promises works on
+      // Windows/Linux/macOS and creates the file if absent.
+      await appendFile(resolve(cwd, ".memo.jsonl"), line);
       return `remembered #${id}`;
     },
   },
