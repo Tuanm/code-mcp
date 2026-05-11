@@ -1155,6 +1155,11 @@ async function loadAggregator(configPath: string): Promise<void> {
     return;
   }
 
+  // Phase 1: validate all entries synchronously, collecting the valid ones.
+  // Invalid entries get their skip messages out immediately so config errors
+  // are obvious even if a probe later hangs.
+  type Entry = { ns: string; cfg: McpServerConfig };
+  const valid: Entry[] = [];
   for (const [ns, cfg] of Object.entries(servers as Record<string, McpServerConfig>)) {
     if (!NAMESPACE_RE.test(ns)) {
       console.error(`[mcp] skipping invalid namespace '${ns}' (must match ${NAMESPACE_RE})`);
@@ -1173,19 +1178,36 @@ async function loadAggregator(configPath: string): Promise<void> {
       console.error(`[mcp] skipping '${ns}': stdio server missing 'command'`);
       continue;
     }
-    try {
-      const list = await probeServer(ns, cfg);
-      const state = makeServerState(ns, cfg, false);
-      aggregatorServers.set(ns, state);
-      for (const tool of list) {
-        const prefixed = `${ns}__${tool.originalName}`;
-        aggregatedTools.set(prefixed, tool);
-      }
-      const transport = cfg.type === "http" ? "http" : "stdio";
-      console.error(`[mcp] probed '${ns}' (${transport}): ${list.length} tool(s) cached`);
-    } catch (e: any) {
-      console.error(`[mcp] probe '${ns}' failed: ${e?.message ?? e}`);
+    valid.push({ ns, cfg });
+  }
+  if (valid.length === 0) return;
+
+  // Phase 2: probe in parallel. Each probe spawns its own subprocess (or
+  // initializes its own HTTP session), so startup time is bounded by the
+  // slowest server rather than the sum.
+  const probes = valid.map(({ ns, cfg }) =>
+    probeServer(ns, cfg).then(
+      (list) => ({ ns, cfg, ok: true as const, list }),
+      (e: any) => ({ ns, cfg, ok: false as const, error: e?.message ?? String(e) }),
+    )
+  );
+  const results = await Promise.all(probes);
+
+  // Phase 3: register and log in the original config order so output is
+  // deterministic regardless of which probe finished first.
+  for (const r of results) {
+    if (!r.ok) {
+      console.error(`[mcp] probe '${r.ns}' failed: ${r.error}`);
+      continue;
     }
+    const state = makeServerState(r.ns, r.cfg, false);
+    aggregatorServers.set(r.ns, state);
+    for (const tool of r.list) {
+      const prefixed = `${r.ns}__${tool.originalName}`;
+      aggregatedTools.set(prefixed, tool);
+    }
+    const transport = r.cfg.type === "http" ? "http" : "stdio";
+    console.error(`[mcp] probed '${r.ns}' (${transport}): ${r.list.length} tool(s) cached`);
   }
 }
 
