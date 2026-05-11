@@ -160,6 +160,28 @@ function verifyUploadSessionId(id: string): { ok: true } | { ok: false; reason: 
   return { ok: true };
 }
 
+// Cap how much output we keep in memory for any captured stream. When the
+// buffer exceeds CAP_MAX, we trim back to CAP_KEEP from the tail. This
+// matters for grep across large trees, cat-ing big files via bash, and any
+// long-running background job that floods output.
+const OUTPUT_CAP_MAX = 1_000_000;
+const OUTPUT_CAP_KEEP = 500_000;
+
+// Pump a readable stream into `sink.text`, capping in-place. Used by both the
+// background-job harness (startJob) and one-shot tool handlers (bash, grep)
+// so memory use is bounded everywhere we capture subprocess output.
+async function pumpCapped(stream: ReadableStream<Uint8Array> | null, sink: { text: string }): Promise<void> {
+  if (!stream) return;
+  const reader = stream.getReader();
+  const dec = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    sink.text += dec.decode(value);
+    if (sink.text.length > OUTPUT_CAP_MAX) sink.text = sink.text.slice(-OUTPUT_CAP_KEEP);
+  }
+}
+
 function startJob(command: string, cwd: string): Job {
   const id = `j${++jobSeq}`;
   const proc = spawn({
@@ -172,19 +194,11 @@ function startJob(command: string, cwd: string): Job {
   const job: Job = { id, command, proc, output: "", status: "running", startedAt: Date.now() };
   jobs.set(id, job);
 
-  const pump = async (stream: ReadableStream<Uint8Array> | null) => {
-    if (!stream) return;
-    const reader = stream.getReader();
-    const dec = new TextDecoder();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      job.output += dec.decode(value);
-      if (job.output.length > 1_000_000) job.output = job.output.slice(-500_000);
-    }
-  };
-  pump(proc.stdout as any);
-  pump(proc.stderr as any);
+  // Both streams write into job.output. Use a thin {text} wrapper so the
+  // pump can mutate the shared buffer in place.
+  const sink = { get text() { return job.output; }, set text(v: string) { job.output = v; } };
+  pumpCapped(proc.stdout as any, sink);
+  pumpCapped(proc.stderr as any, sink);
   proc.exited.then((code) => {
     job.status = "exited";
     job.exitCode = code;
@@ -1352,13 +1366,18 @@ const tools: Record<string, Tool> = {
         stdin: "ignore",
         signal: ctrl.signal,
       });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout as any).text(),
-        new Response(proc.stderr as any).text(),
+      // Cap memory so a runaway command (e.g. `cat huge_file`) can't blow up
+      // this process. The tail is preserved so the last lines (where errors
+      // usually live) survive.
+      const outSink = { text: "" };
+      const errSink = { text: "" };
+      const [, , exitCode] = await Promise.all([
+        pumpCapped(proc.stdout as any, outSink),
+        pumpCapped(proc.stderr as any, errSink),
         proc.exited,
       ]);
       if (t) clearTimeout(t);
-      return `exit=${exitCode}\n${stdout}${stderr}`;
+      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
     },
   },
 
@@ -1386,14 +1405,17 @@ const tools: Record<string, Tool> = {
         stderr: "pipe",
         stdin: "ignore",
       });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout as any).text(),
-        new Response(proc.stderr as any).text(),
+      // Cap output: grep across a large tree can spew megabytes.
+      const outSink = { text: "" };
+      const errSink = { text: "" };
+      const [, , exitCode] = await Promise.all([
+        pumpCapped(proc.stdout as any, outSink),
+        pumpCapped(proc.stderr as any, errSink),
         proc.exited,
       ]);
-      if (stdout) return stdout;
+      if (outSink.text) return outSink.text;
       if (exitCode === 1) return "(no matches)";
-      return `ERROR (exit=${exitCode}): ${stderr}`;
+      return `ERROR (exit=${exitCode}): ${errSink.text}`;
     },
   },
 
