@@ -162,32 +162,75 @@ try {
   console.error(`[spill] failed to prepare ${RESULT_SPILL_ROOT}: ${e?.message ?? e}`);
 }
 
-// If `text` exceeds the threshold, write it to a uuid-named file in the
+// If `text` exceeds the threshold, write it to a metadata-named file in the
 // spill directory and return a preview string with a pointer. Otherwise
 // pass through unchanged. Async so we don't block the event loop on the
 // write; the caller is already awaiting the tool response.
-async function maybeSpillText(text: string): Promise<string> {
-  // Byte length, not char length — multibyte content shouldn't slip through.
+//
+// Preview semantics:
+//   - HEAD/TAIL are measured in bytes (UTF-8), matching the threshold.
+//   - Slicing is byte-exact; decoding tolerates half-characters at the slice
+//     boundary instead of corrupting them.
+//   - After byte-slicing, head is trimmed back to the last newline and tail
+//     forward to the first newline, so the preview lands on line boundaries.
+//     This makes log/JSON/code output readable without forcing the agent to
+//     guess where the cut happened.
+async function maybeSpillText(text: string, toolName?: string): Promise<string> {
   const bytes = Buffer.byteLength(text, "utf8");
   if (bytes <= RESULT_SPILL_THRESHOLD) return text;
 
-  const id = randomUUID();
-  const path = resolve(RESULT_SPILL_ROOT, `${id}.txt`);
+  // Byte-exact head/tail. Use `fatal: false` so a multibyte char straddling
+  // the cut is replaced (U+FFFD) rather than throwing.
+  const buf = Buffer.from(text, "utf8");
+  const dec = new TextDecoder("utf-8", { fatal: false });
+  let head = dec.decode(buf.subarray(0, RESULT_SPILL_HEAD));
+  let tail = dec.decode(buf.subarray(buf.length - RESULT_SPILL_TAIL));
+
+  // Snap to line boundaries when possible. If a line is longer than the
+  // window (e.g., a 50 KB single-line JSON), fall back to the byte cut.
+  const lastNl = head.lastIndexOf("\n");
+  if (lastNl > 0) head = head.slice(0, lastNl);
+  const firstNl = tail.indexOf("\n");
+  if (firstNl >= 0 && firstNl < tail.length - 1) tail = tail.slice(firstNl + 1);
+
+  // Filename: <ISO compact>-<tool>-<uuid8>.txt. Sortable by time, greppable
+  // by tool. UUID suffix keeps it unique within the same millisecond.
+  const ts = new Date().toISOString().replace(/[-:.]/g, "").replace(/Z$/, "");
+  const safeTool = (toolName ?? "unknown").replace(/[^A-Za-z0-9_.-]/g, "_");
+  const shortId = randomUUID().slice(0, 8);
+  const fname = `${ts}-${safeTool}-${shortId}.txt`;
+  const path = resolve(RESULT_SPILL_ROOT, fname);
+
+  // Count whole lines in head/tail so we can give the agent a precise range
+  // hint for the middle section. Total line count is the only O(N) op here.
+  const totalLines = text.length === 0 ? 0 : (text.match(/\n/g)?.length ?? 0) + 1;
+  const headLines = (head.match(/\n/g)?.length ?? 0) + 1;
+  const tailLines = (tail.match(/\n/g)?.length ?? 0) + 1;
+  const midStart = headLines + 1;
+  const midEnd = totalLines - tailLines;
+
   try {
     await Bun.write(path, text);
   } catch (e: any) {
-    // Failing here means we can't spill, so fall back to returning the
-    // original text. pumpCapped still bounds output at ~500KB, which is
-    // bad for context but not for the server — better than dropping data.
+    // Spill failed (full disk, read-only fs, permission). Do NOT fall back
+    // to returning the full text — that would blow the agent's context.
+    // Return the preview with a marker explaining what happened.
     console.error(`[spill] failed to write ${path}: ${e?.message ?? e}`);
-    return text;
+    const failMarker =
+      `\n... [TRUNCATED: full output is ${bytes} bytes; spill to disk FAILED ` +
+      `(${e?.message ?? "unknown error"}). Showing head+tail only; ` +
+      `~${Math.max(0, midEnd - midStart + 1)} lines in the middle are lost.] ...\n`;
+    return head + failMarker + tail;
   }
 
-  const head = text.slice(0, RESULT_SPILL_HEAD);
-  const tail = text.slice(-RESULT_SPILL_TAIL);
+  const rangeHint =
+    midEnd >= midStart
+      ? ` or with range=[${midStart}, ${midEnd}] to view the omitted middle section`
+      : "";
   const marker =
-    `\n... [TRUNCATED: full output is ${bytes} bytes, saved to ${path} — ` +
-    `call the \`read\` tool with that path to see the complete content] ...\n`;
+    `\n... [TRUNCATED: full output is ${bytes} bytes (${totalLines} lines), ` +
+    `saved to ${path} — call the \`read\` tool with that path to see the ` +
+    `complete content${rangeHint}] ...\n`;
   return head + marker + tail;
 }
 
@@ -246,15 +289,29 @@ const OUTPUT_CAP_KEEP = 500_000;
 // Pump a readable stream into `sink.text`, capping in-place. Used by both the
 // background-job harness (startJob) and one-shot tool handlers (bash, grep)
 // so memory use is bounded everywhere we capture subprocess output.
+//
+// Decoder uses {stream:true} so a UTF-8 sequence split across chunk boundaries
+// is held until completion instead of being emitted as U+FFFD. Cap is measured
+// in bytes (via Buffer.byteLength) to stay consistent with maybeSpillText and
+// to give honest accounting for multibyte content; when trimming, we slice the
+// underlying bytes and re-decode with `fatal: false` so a half-character at
+// the head of the kept tail is replaced rather than throwing.
 async function pumpCapped(stream: ReadableStream<Uint8Array> | null, sink: { text: string }): Promise<void> {
   if (!stream) return;
   const reader = stream.getReader();
-  const dec = new TextDecoder();
+  const dec = new TextDecoder("utf-8");
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
-    sink.text += dec.decode(value);
-    if (sink.text.length > OUTPUT_CAP_MAX) sink.text = sink.text.slice(-OUTPUT_CAP_KEEP);
+    if (done) {
+      // Flush any pending partial sequence.
+      sink.text += dec.decode();
+      break;
+    }
+    sink.text += dec.decode(value, { stream: true });
+    if (Buffer.byteLength(sink.text, "utf8") > OUTPUT_CAP_MAX) {
+      const buf = Buffer.from(sink.text, "utf8");
+      sink.text = new TextDecoder("utf-8").decode(buf.subarray(buf.length - OUTPUT_CAP_KEEP));
+    }
   }
 }
 
@@ -865,9 +922,14 @@ function handleServerRequest(msg: any): Json {
 
 function attachStdioIO(ns: string, state: StdioServerState) {
   const proc = state.proc!;
+  // Narrow Bun's stdio union (`number | ReadableStream` / `number | FileSink`)
+  // to the concrete types we get when spawning with `pipe`. These are runtime
+  // invariants from spawnStdioServer(); the casts only quiet the type checker.
+  const procStdout = proc.stdout as ReadableStream<Uint8Array>;
+  const procStderr = proc.stderr as ReadableStream<Uint8Array>;
   // Stdout: parse JSON-RPC responses, route to pending requests.
   (async () => {
-    const reader = proc.stdout.getReader();
+    const reader = procStdout.getReader();
     const dec = new TextDecoder();
     try {
       while (true) {
@@ -879,8 +941,9 @@ function attachStdioIO(ns: string, state: StdioServerState) {
           if (msg.method && msg.id != null) {
             const reply = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: handleServerRequest(msg) }) + "\n";
             try {
-              state.proc!.stdin.write(reply);
-              state.proc!.stdin.flush();
+              const stdin = state.proc!.stdin as import("bun").FileSink;
+              stdin.write(reply);
+              stdin.flush();
             } catch { /* subprocess may be exiting */ }
             continue;
           }
@@ -906,7 +969,7 @@ function attachStdioIO(ns: string, state: StdioServerState) {
   })();
   // Stderr: append to log file.
   (async () => {
-    const reader = proc.stderr.getReader();
+    const reader = procStderr.getReader();
     const dec = new TextDecoder();
     const sink = Bun.file(state.stderrLogPath).writer();
     try {
@@ -965,7 +1028,8 @@ async function spawnStdioServer(ns: string, state: StdioServerState): Promise<vo
 }
 
 async function ensureSpawned(ns: string, state: ServerState): Promise<void> {
-  if (state.proc && state.initialized) return;
+  // HTTP transport has no `proc`; the `initialized` flag alone gates it.
+  if (state.transport === "stdio" ? state.proc && state.initialized : state.initialized) return;
   if (state.initPromise) return state.initPromise;
   if (state.consecutiveSpawnFails >= MAX_CONSECUTIVE_SPAWN_FAILS) {
     throw new Error(`server '${ns}' marked broken after ${MAX_CONSECUTIVE_SPAWN_FAILS} consecutive spawn failures`);
@@ -998,8 +1062,9 @@ function rpcNotify(state: ServerState, method: string, params: Json): Promise<vo
   if (state.transport === "stdio") {
     if (!state.proc) return Promise.reject(new Error("subprocess not running"));
     const msg = JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n";
-    state.proc.stdin.write(msg);
-    state.proc.stdin.flush();
+    const stdin = state.proc.stdin as import("bun").FileSink;
+    stdin.write(msg);
+    stdin.flush();
     return Promise.resolve();
   }
   // HTTP transport: notifications are POSTs without expecting a response body.
@@ -1023,8 +1088,9 @@ function rpcCall(state: ServerState, method: string, params: Json): Promise<Json
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
       try {
-        state.proc!.stdin.write(msg);
-        state.proc!.stdin.flush();
+        const stdin = state.proc!.stdin as import("bun").FileSink;
+        stdin.write(msg);
+        stdin.flush();
       } catch (e: any) {
         clearTimeout(timer);
         state.pending.delete(id);
@@ -1149,7 +1215,7 @@ function resetIdleTimer(ns: string, state: ServerState) {
     if (!state.proc) return;
     console.error(`[mcp:${ns}] idle for ${ttl}ms; shutting down subprocess`);
     try {
-      state.proc.stdin.end();
+      (state.proc.stdin as import("bun").FileSink).end();
     } catch {}
     setTimeout(() => {
       try { state.proc?.kill("SIGTERM"); } catch {}
@@ -1560,7 +1626,7 @@ const tools: Record<string, Tool> = {
       // Honour the user's intent: if they explicitly mention a noise dir in
       // the pattern (e.g. "node_modules/foo/index.js"), don't filter it out.
       const patternRefs = new Set(
-        pat.split(/[\/\\]/).filter((seg) => NOISE_DIRS.has(seg))
+        pat.split(/[\/\\]/).filter((seg: string) => NOISE_DIRS.has(seg))
       );
 
       const results: string[] = [];
@@ -1884,17 +1950,77 @@ if (mcpConfigPath) {
   await loadAggregator(resolve(process.cwd(), mcpConfigPath));
 }
 
-// Walk an MCP `content` array and spill any oversized text blocks. Non-text
-// blocks (image, resource, etc.) are passed through untouched. Used for
-// aggregated-tool responses where the content shape is opaque to us.
-async function spillContentBlocks(content: any): Promise<any> {
+// Walk an MCP `content` array and spill any oversized blocks. Text blocks
+// go through maybeSpillText. Image and resource blocks with large embedded
+// base64 payloads (`data` field, or `resource.blob` / `resource.text`) are
+// spilled too — otherwise a downstream MCP returning, say, a screenshot
+// blob will still blow the agent's context window. The replacement text
+// block points at the spill file and preserves the original mimeType.
+async function spillContentBlocks(content: any, toolName?: string): Promise<any> {
   if (!Array.isArray(content)) return content;
   return await Promise.all(content.map(async (block) => {
-    if (block && block.type === "text" && typeof block.text === "string") {
-      return { ...block, text: await maybeSpillText(block.text) };
+    if (!block || typeof block !== "object") return block;
+    if (block.type === "text" && typeof block.text === "string") {
+      return { ...block, text: await maybeSpillText(block.text, toolName) };
+    }
+    if (block.type === "image" && typeof block.data === "string") {
+      const spilled = await maybeSpillBinaryBlock(block.data, block.mimeType ?? "image/png", toolName);
+      return spilled ?? block;
+    }
+    if (block.type === "resource" && block.resource && typeof block.resource === "object") {
+      const r = block.resource;
+      if (typeof r.text === "string") {
+        return { ...block, resource: { ...r, text: await maybeSpillText(r.text, toolName) } };
+      }
+      if (typeof r.blob === "string") {
+        const spilled = await maybeSpillBinaryBlock(r.blob, r.mimeType ?? "application/octet-stream", toolName);
+        return spilled ?? block;
+      }
     }
     return block;
   }));
+}
+
+// Spill an oversized base64 payload to disk and return a text-block summary
+// pointing at the file. Returns null if under threshold (caller keeps the
+// original block). The raw bytes (not the base64 string) are what's written,
+// so the spilled file is directly usable.
+async function maybeSpillBinaryBlock(b64: string, mimeType: string, toolName?: string): Promise<any | null> {
+  // base64 length ≈ ceil(bytes / 3) * 4. Skip the decode if obviously small.
+  if (b64.length < (RESULT_SPILL_THRESHOLD * 4) / 3) return null;
+
+  let raw: Buffer;
+  try {
+    raw = Buffer.from(b64, "base64");
+  } catch {
+    return null;
+  }
+  if (raw.byteLength <= RESULT_SPILL_THRESHOLD) return null;
+
+  const ts = new Date().toISOString().replace(/[-:.]/g, "").replace(/Z$/, "");
+  const safeTool = (toolName ?? "unknown").replace(/[^A-Za-z0-9_.-]/g, "_");
+  const shortId = randomUUID().slice(0, 8);
+  // Extension hint from mime type, best-effort only.
+  const ext = mimeType.includes("/") ? mimeType.split("/")[1]!.replace(/[^A-Za-z0-9]/g, "") : "bin";
+  const fname = `${ts}-${safeTool}-${shortId}.${ext || "bin"}`;
+  const path = resolve(RESULT_SPILL_ROOT, fname);
+  try {
+    await Bun.write(path, raw);
+  } catch (e: any) {
+    console.error(`[spill] failed to write binary ${path}: ${e?.message ?? e}`);
+    return {
+      type: "text",
+      text:
+        `[TRUNCATED: ${mimeType} payload of ${raw.byteLength} bytes; ` +
+        `spill to disk FAILED (${e?.message ?? "unknown error"}). Payload dropped.]`,
+    };
+  }
+  return {
+    type: "text",
+    text:
+      `[TRUNCATED: ${mimeType} payload of ${raw.byteLength} bytes, ` +
+      `saved to ${path} — read the file directly to access it.]`,
+  };
 }
 
 // ---------- JSON-RPC dispatch ----------
@@ -1928,12 +2054,12 @@ async function handle(msg: Json): Promise<Json | null> {
     }
     if (method === "tools/call") {
       const { name, arguments: args } = params ?? {};
-      // Aggregated tool: forward to subprocess, spill oversized text blocks
+      // Aggregated tool: forward to subprocess, spill oversized blocks
       // before returning so the agent's context window stays bounded.
       if (aggregatedTools.has(name)) {
         const result = await callAggregated(name, args ?? {});
         if (result && typeof result === "object" && "content" in result) {
-          return ok({ ...result, content: await spillContentBlocks(result.content) });
+          return ok({ ...result, content: await spillContentBlocks(result.content, name) });
         }
         return ok(result);
       }
@@ -1941,7 +2067,7 @@ async function handle(msg: Json): Promise<Json | null> {
       if (!t) return err(-32601, `unknown tool: ${name}`);
       const result = await t.handler(args ?? {});
       const text = typeof result === "string" ? result : JSON.stringify(result);
-      return ok({ content: [{ type: "text", text: await maybeSpillText(text) }] });
+      return ok({ content: [{ type: "text", text: await maybeSpillText(text, name) }] });
     }
     return err(-32601, `unknown method: ${method}`);
   } catch (e: any) {
