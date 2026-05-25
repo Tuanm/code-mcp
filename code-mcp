@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 // Minimal MCP server over HTTP (Streamable HTTP transport, JSON-RPC 2.0).
 //
-// Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job, mcp.
+// Tools (always on): read, write, edit, multi_edit, bash, shell, command, powershell, grep, find, ls, job, mcp.
 // Tools (conditional):
 //   - preview              enabled only if `cloudflared` is on PATH
 //   - remember, forget, recall  enabled only with --enable-memory
 //   - get_upload_link      enabled only with --public or --domain
+//
+// Shell tools: only one enabled based on detected shell (bash/shell/command/powershell).
 //
 // Flags:
 //   --port <n>         listen port (default: 7777, or $PORT)
@@ -44,28 +46,31 @@ const jobs = new Map<string, Job>();
 let jobSeq = 0;
 let shuttingDown = false;
 
-// Wrap a shell command string in argv form for the detected shell.
-// Detects: bash, sh (POSIX), cmd.exe, PowerShell (Windows)
-// Shell detection: checks SHELL env var on POSIX, PSModulePath on Windows PowerShell.
-const IS_WINDOWS = process.platform === "win32";
-function shellCmd(command: string): string[] {
-  if (IS_WINDOWS) {
-    // Windows: detect PowerShell vs CMD
-    if (process.env.PSModulePath) {
-      // PowerShell detected (PSModulePath is set in PowerShell sessions)
-      const pwsh = hasOnPath("pwsh") ? "pwsh" : (hasOnPath("powershell") ? "powershell" : "pwsh");
-      return [pwsh, "-Command", command];
-    }
-    // CMD detected
-    return ["cmd.exe", "/d", "/s", "/c", command];
-  }
-  // POSIX: detect bash vs sh
-  const shell = process.env.SHELL;
-  if (shell && shell.endsWith("bash")) {
-    return ["bash", "-c", command];
-  }
-  return ["sh", "-c", command];
+// Shell command wrappers for each shell type.
+function bashCmd(command: string): string[] { return ["bash", "-c", command]; }
+function shCmd(command: string): string[] { return ["sh", "-c", command]; }
+function cmdCmd(command: string): string[] { return ["cmd.exe", "/d", "/s", "/c", command]; }
+function pwshCmd(command: string): string[] {
+  return ["pwsh", "-Command", command];
 }
+
+// Detect running shell at startup.
+type ShellType = "bash" | "sh" | "cmd" | "powershell";
+const IS_WINDOWS = process.platform === "win32";
+function detectShell(): ShellType {
+  if (IS_WINDOWS) {
+    if (process.env.PSModulePath) return "powershell";
+    return "cmd";
+  }
+  const shell = process.env.SHELL;
+  if (shell && shell.endsWith("bash")) return "bash";
+  return "sh";
+}
+const DETECTED_SHELL = detectShell();
+const shellCmd = DETECTED_SHELL === "bash" ? bashCmd
+  : DETECTED_SHELL === "sh" ? shCmd
+  : DETECTED_SHELL === "powershell" ? pwshCmd
+  : cmdCmd;
 
 // Detect optional external binaries once at startup. Use the platform's
 // own binary-locator: `where` on Windows, `command -v` on POSIX. Both
@@ -1749,7 +1754,7 @@ const tools: Record<string, Tool> = {
   },
 
   bash: {
-    description: "Run a shell command using the detected shell (bash/sh/pwsh/cmd). Block until exit, return combined stdout+stderr.",
+    description: "Run a bash command. Block until exit, return combined stdout+stderr.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1763,16 +1768,115 @@ const tools: Record<string, Tool> = {
       const ctrl = new AbortController();
       const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
       const proc = spawn({
-        cmd: shellCmd(command),
+        cmd: bashCmd(command),
         cwd,
         stdout: "pipe",
         stderr: "pipe",
         stdin: "ignore",
         signal: ctrl.signal,
       });
-      // Cap memory so a runaway command (e.g. `cat huge_file`) can't blow up
-      // this process. The tail is preserved so the last lines (where errors
-      // usually live) survive.
+      const outSink = { text: "" };
+      const errSink = { text: "" };
+      const [, , exitCode] = await Promise.all([
+        pumpCapped(proc.stdout as any, outSink),
+        pumpCapped(proc.stderr as any, errSink),
+        proc.exited,
+      ]);
+      if (t) clearTimeout(t);
+      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+    },
+  },
+
+  shell: {
+    description: "Run a POSIX sh command. Block until exit, return combined stdout+stderr.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        command: { type: "string" },
+        timeout_ms: { type: "number" },
+      },
+      required: ["cwd", "command"],
+    },
+    handler: async ({ command, cwd, timeout_ms }) => {
+      const ctrl = new AbortController();
+      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
+      const proc = spawn({
+        cmd: shCmd(command),
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        signal: ctrl.signal,
+      });
+      const outSink = { text: "" };
+      const errSink = { text: "" };
+      const [, , exitCode] = await Promise.all([
+        pumpCapped(proc.stdout as any, outSink),
+        pumpCapped(proc.stderr as any, errSink),
+        proc.exited,
+      ]);
+      if (t) clearTimeout(t);
+      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+    },
+  },
+
+  command: {
+    description: "Run a Windows CMD command. Block until exit, return combined stdout+stderr.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        command: { type: "string" },
+        timeout_ms: { type: "number" },
+      },
+      required: ["cwd", "command"],
+    },
+    handler: async ({ command, cwd, timeout_ms }) => {
+      const ctrl = new AbortController();
+      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
+      const proc = spawn({
+        cmd: cmdCmd(command),
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        signal: ctrl.signal,
+      });
+      const outSink = { text: "" };
+      const errSink = { text: "" };
+      const [, , exitCode] = await Promise.all([
+        pumpCapped(proc.stdout as any, outSink),
+        pumpCapped(proc.stderr as any, errSink),
+        proc.exited,
+      ]);
+      if (t) clearTimeout(t);
+      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+    },
+  },
+
+  powershell: {
+    description: "Run a PowerShell command. Block until exit, return combined stdout+stderr.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+        command: { type: "string" },
+        timeout_ms: { type: "number" },
+      },
+      required: ["cwd", "command"],
+    },
+    handler: async ({ command, cwd, timeout_ms }) => {
+      const ctrl = new AbortController();
+      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
+      const proc = spawn({
+        cmd: pwshCmd(command),
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        signal: ctrl.signal,
+      });
       const outSink = { text: "" };
       const errSink = { text: "" };
       const [, , exitCode] = await Promise.all([
@@ -2276,6 +2380,11 @@ if (disallowedTools.length > 0) {
   if (!publicBaseUrl && !makePublic) {
     delete (tools as any).get_upload_link;
   }
+  // Prune shell tools: only keep the one matching DETECTED_SHELL
+  if (DETECTED_SHELL !== "bash") delete tools.bash;
+  if (DETECTED_SHELL !== "sh") delete tools.shell;
+  if (DETECTED_SHELL !== "cmd") delete tools.command;
+  if (DETECTED_SHELL !== "powershell") delete tools.powershell;
 }
 
 // Load external MCP aggregation config if --mcp was given.
