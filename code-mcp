@@ -80,6 +80,7 @@ function hasOnPath(bin: string): boolean {
   return spawnSync({ cmd: shellCmd(probe), stdout: "ignore", stderr: "ignore" }).exitCode === 0;
 }
 const hasRg = hasOnPath("rg");
+const hasFindstr = hasOnPath("findstr");
 const hasCloudflared = hasOnPath("cloudflared");
 
 // ---------- args ----------
@@ -1890,7 +1891,7 @@ const tools: Record<string, Tool> = {
   },
 
   grep: {
-    description: "Search files by regex. Uses ripgrep if available, else POSIX grep.",
+    description: "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1902,10 +1903,19 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "pattern"],
     },
     handler: async ({ cwd, pattern, path = ".", glob }) => {
-      const cmd = hasRg
-        ? ["rg", "--line-number", "--no-heading", "--color=never",
-           ...(glob ? ["--glob", glob] : []), pattern, path]
-        : ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, path];
+      let cmd: string[];
+      if (hasRg) {
+        cmd = ["rg", "--line-number", "--no-heading", "--color=never",
+           ...(glob ? ["--glob", glob] : []), pattern, path];
+      } else if (IS_WINDOWS && hasFindstr) {
+        // Windows findstr: /r = regex, /n = line numbers, /i = case insensitive (optional)
+        // Note: findstr regex syntax differs slightly from grep
+        const args = ["/r", "/n"];
+        if (glob) args.push(...["--include", glob]);
+        cmd = ["findstr", ...args, pattern, path];
+      } else {
+        cmd = ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, path];
+      }
       const proc = spawn({
         cmd,
         cwd,
@@ -1913,7 +1923,6 @@ const tools: Record<string, Tool> = {
         stderr: "pipe",
         stdin: "ignore",
       });
-      // Cap output: grep across a large tree can spew megabytes.
       const outSink = { text: "" };
       const errSink = { text: "" };
       const [, , exitCode] = await Promise.all([
