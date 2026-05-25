@@ -20,7 +20,7 @@
 import { spawn, spawnSync, file, write } from "bun";
 import { readdirSync, statSync, mkdirSync, rmSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { parseArgs } from "util";
@@ -931,7 +931,7 @@ function validateMcpConfigPath(cwd: string, mcpConfigPath: string): { ok: true; 
     return { ok: false, reason: `cwd does not exist: ${cwd}` };
   }
   const resolved = resolve(cwdResolved, mcpConfigPath);
-  if (!resolved.startsWith(cwdResolved + "/")) {
+  if (!resolved.startsWith(cwdResolved + sep)) {
     return { ok: false, reason: `config path escapes cwd: ${mcpConfigPath}` };
   }
   if (!file(resolved).exists()) {
@@ -1908,11 +1908,12 @@ const tools: Record<string, Tool> = {
         cmd = ["rg", "--line-number", "--no-heading", "--color=never",
            ...(glob ? ["--glob", glob] : []), pattern, path];
       } else if (IS_WINDOWS && hasFindstr) {
-        // Windows findstr: /r = regex, /n = line numbers, /i = case insensitive (optional)
+        // Windows findstr: /r = regex, /n = line numbers
         // Note: findstr regex syntax differs slightly from grep
+        // Glob patterns (e.g. *.txt) must be part of path argument, not a separate flag
         const args = ["/r", "/n"];
-        if (glob) args.push(...["--include", glob]);
-        cmd = ["findstr", ...args, pattern, path];
+        const searchPath = glob ? `${path}\\${glob.replace(/\*/g, "*")}` : path;
+        cmd = ["findstr", ...args, pattern, searchPath];
       } else {
         cmd = ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, path];
       }
