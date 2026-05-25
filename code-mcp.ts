@@ -162,7 +162,6 @@ const UPLOAD_ROOT =
 const RESULT_SPILL_ROOT = resolve(tmpdir(), "code-mcp");
 const RESULT_SPILL_THRESHOLD = 10_000; // bytes
 const RESULT_SPILL_HEAD = 3_000;
-const RESULT_SPILL_TAIL = 3_000;
 
 // Best-effort cleanup of any stale spill files from a previous run. Failure
 // is non-fatal: the spill directory may not exist yet, may belong to another
@@ -182,30 +181,27 @@ try {
 // write; the caller is already awaiting the tool response.
 //
 // Preview semantics:
-//   - HEAD/TAIL are measured in bytes (UTF-8), matching the threshold.
+//   - HEAD is measured in bytes (UTF-8), matching the threshold.
 //   - Slicing is byte-exact; decoding tolerates half-characters at the slice
 //     boundary instead of corrupting them.
-//   - After byte-slicing, head is trimmed back to the last newline and tail
-//     forward to the first newline, so the preview lands on line boundaries.
-//     This makes log/JSON/code output readable without forcing the agent to
-//     guess where the cut happened.
+//   - After byte-slicing, head is trimmed back to the last newline, so the
+//     preview lands on a line boundary. This makes log/JSON/code output
+//     readable without forcing the agent to guess where the cut happened.
+//   - The truncated content is not shown; only a marker pointing to the spill file.
 async function maybeSpillText(text: string, toolName?: string): Promise<string> {
   const bytes = Buffer.byteLength(text, "utf8");
   if (bytes <= RESULT_SPILL_THRESHOLD) return text;
 
-  // Byte-exact head/tail. Use `fatal: false` so a multibyte char straddling
+  // Byte-exact head. Use `fatal: false` so a multibyte char straddling
   // the cut is replaced (U+FFFD) rather than throwing.
   const buf = Buffer.from(text, "utf8");
   const dec = new TextDecoder("utf-8", { fatal: false });
   let head = dec.decode(buf.subarray(0, RESULT_SPILL_HEAD));
-  let tail = dec.decode(buf.subarray(buf.length - RESULT_SPILL_TAIL));
 
   // Snap to line boundaries when possible. If a line is longer than the
   // window (e.g., a 50 KB single-line JSON), fall back to the byte cut.
   const lastNl = head.lastIndexOf("\n");
   if (lastNl > 0) head = head.slice(0, lastNl);
-  const firstNl = tail.indexOf("\n");
-  if (firstNl >= 0 && firstNl < tail.length - 1) tail = tail.slice(firstNl + 1);
 
   // Filename: <ISO compact>-<tool>-<uuid8>.txt. Sortable by time, greppable
   // by tool. UUID suffix keeps it unique within the same millisecond.
@@ -215,13 +211,8 @@ async function maybeSpillText(text: string, toolName?: string): Promise<string> 
   const fname = `${ts}-${safeTool}-${shortId}.txt`;
   const path = resolve(RESULT_SPILL_ROOT, fname);
 
-  // Count whole lines in head/tail so we can give the agent a precise range
-  // hint for the middle section. Total line count is the only O(N) op here.
+  // Count total lines for the marker. This is the only O(N) operation.
   const totalLines = text.length === 0 ? 0 : (text.match(/\n/g)?.length ?? 0) + 1;
-  const headLines = (head.match(/\n/g)?.length ?? 0) + 1;
-  const tailLines = (tail.match(/\n/g)?.length ?? 0) + 1;
-  const midStart = headLines + 1;
-  const midEnd = totalLines - tailLines;
 
   try {
     await Bun.write(path, text);
@@ -231,21 +222,15 @@ async function maybeSpillText(text: string, toolName?: string): Promise<string> 
     // Return the preview with a marker explaining what happened.
     console.error(`[spill] failed to write ${path}: ${e?.message ?? e}`);
     const failMarker =
-      `\n... [TRUNCATED: full output is ${bytes} bytes; spill to disk FAILED ` +
-      `(${e?.message ?? "unknown error"}). Showing head+tail only; ` +
-      `~${Math.max(0, midEnd - midStart + 1)} lines in the middle are lost.] ...\n`;
-    return head + failMarker + tail;
+      `\n... [TRUNCATED: full output is ${bytes} bytes (${totalLines} lines); ` +
+      `spill to disk FAILED (${e?.message ?? "unknown error"})] ...\n`;
+    return head + failMarker;
   }
 
-  const rangeHint =
-    midEnd >= midStart
-      ? ` or with range=[${midStart}, ${midEnd}] to view the omitted middle section`
-      : "";
   const marker =
-    `\n... [TRUNCATED: full output is ${bytes} bytes (${totalLines} lines), ` +
-    `saved to ${path} — call the \`read\` tool with that path to see the ` +
-    `complete content${rangeHint}] ...\n`;
-  return head + marker + tail;
+    `\n... [TRUNCATED: ${bytes} bytes (${totalLines} lines) saved to ${path} — ` +
+    `use read with range or grep to view the remaining content] ...\n`;
+  return head + marker;
 }
 
 // ---------- upload session HMAC ----------
