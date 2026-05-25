@@ -44,19 +44,27 @@ const jobs = new Map<string, Job>();
 let jobSeq = 0;
 let shuttingDown = false;
 
-// Wrap a shell command string in argv form for the platform's default shell.
-// POSIX: ["sh", "-c", cmd]
-// Windows: ["cmd.exe", "/d", "/s", "/c", cmd]
-//   /d disables AutoRun, /s makes quote handling parse-correctly, /c runs
-//   then exits. This matches what Node.js spawn({shell: true}) does on
-//   Windows and is the de-facto standard.
-// Shell *syntax* still differs (POSIX $VAR vs Windows %VAR%, pipes, etc.) —
-// portability of the command itself is the caller's responsibility.
+// Wrap a shell command string in argv form for the detected shell.
+// Detects: bash, sh (POSIX), cmd.exe, PowerShell (Windows)
+// Shell detection: checks SHELL env var on POSIX, PSModulePath on Windows PowerShell.
 const IS_WINDOWS = process.platform === "win32";
 function shellCmd(command: string): string[] {
-  return IS_WINDOWS
-    ? ["cmd.exe", "/d", "/s", "/c", command]
-    : ["sh", "-c", command];
+  if (IS_WINDOWS) {
+    // Windows: detect PowerShell vs CMD
+    if (process.env.PSModulePath) {
+      // PowerShell detected (PSModulePath is set in PowerShell sessions)
+      const pwsh = hasOnPath("pwsh") ? "pwsh" : (hasOnPath("powershell") ? "powershell" : "pwsh");
+      return [pwsh, "-Command", command];
+    }
+    // CMD detected
+    return ["cmd.exe", "/d", "/s", "/c", command];
+  }
+  // POSIX: detect bash vs sh
+  const shell = process.env.SHELL;
+  if (shell && shell.endsWith("bash")) {
+    return ["bash", "-c", command];
+  }
+  return ["sh", "-c", command];
 }
 
 // Detect optional external binaries once at startup. Use the platform's
@@ -1741,7 +1749,7 @@ const tools: Record<string, Tool> = {
   },
 
   bash: {
-    description: "Run a shell command, block until exit, return combined stdout+stderr.",
+    description: "Run a shell command using the detected shell (bash/sh/pwsh/cmd). Block until exit, return combined stdout+stderr.",
     inputSchema: {
       type: "object",
       properties: {
