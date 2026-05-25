@@ -61,3 +61,19 @@ Security:
 - Server name validation: must match [a-z][a-z0-9-]*
 - Args sanitization: rejects prototype pollution, functions, circular refs
 - Resource limits: max 10 servers/cwd, 50 total, 3 concurrent spawns
+
+## Build
+
+Build standalone binary with Bun:
+
+```bash
+bun build ./code-mcp --outfile=./code-mcp --target=bun --compile
+chmod +x code-mcp
+```
+
+With minification:
+
+```bash
+bun build ./code-mcp --outfile=./code-mcp --target=bun --compile --minify
+chmod +x code-mcp
+```
