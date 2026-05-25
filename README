@@ -1,6 +1,6 @@
 Minimal MCP server over HTTP (Streamable HTTP transport, JSON-RPC 2.0).
 
-Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job.
+Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job, mcp.
 Tools (conditional):
   - preview                     enabled only if `cloudflared` is on PATH
   - remember, forget, recall    enabled only with --enable-memory
@@ -8,14 +8,56 @@ Tools (conditional):
 
 Flags:
   --port <n>              listen port (default: 7777, or $PORT)
-  --token <s>             require ?token=<s> on every request (default: no auth)
+  --token <s>            require ?token=<s> on every request (default: no auth)
   --enable-memory         enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
   --disallowed-tools      comma-separated list of tools to disable (highest priority)
   --public                expose via a Cloudflare quick tunnel (requires cloudflared)
   --domain <host>         use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
-  --mcp <path>            aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
+  --mcp <path>           aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
                      Tools from each server are exposed with a "<namespace>__" prefix.
                      Stdio transport (default): {"command": "...", "args": [...], "env": {...}}.
                      HTTP transport: {"type": "http", "url": "...", "headers": {...}}.
                      Per-server "idleTimeoutMs" (default 600000) controls when idle stdio subprocesses are stopped.
 
+## mcp Tool (local MCP config management)
+
+Manage MCP servers from local .mcp.json files without aggregating them globally.
+
+```typescript
+mcp(cwd: string, action: "list"): ServerListResult
+mcp(cwd: string, action: "list", server: string): ServerResult
+mcp(cwd: string, action: "call", server: string, tool: string, args: object): ToolResult
+mcp(cwd: string, action: "unload"): { success: boolean }
+mcp(cwd: string, action: "unload", server: string): { success: boolean }
+```
+
+| Action | Description |
+|--------|-------------|
+| `list` | List all servers in .mcp.json (status: loaded/unloaded, tools: [] if unloaded) |
+| `list server=X` | Load server X and return its tools |
+| `call server=X tool=Y args={...}` | Call tool Y on loaded server X |
+| `unload` | Unload all servers for this cwd |
+| `unload server=X` | Unload specific server X |
+
+Example:
+```bash
+# List servers in project
+mcp(cwd="/projects/myapp", action="list")
+# -> { servers: [{ name: "github", status: "unloaded", tools: [] }] }
+
+# Load and list tools
+mcp(cwd="/projects/myapp", action="list", server="github")
+# -> { server: "github", status: "loaded", tools: [...], idleTimeoutMs: 600000 }
+
+# Call a tool
+mcp(cwd="/projects/myapp", action="call", server="github", tool="createIssue", args={...})
+
+# Unload server
+mcp(cwd="/projects/myapp", action="unload", server="github")
+```
+
+Security:
+- Path validation: cwd must exist, config path cannot escape cwd
+- Server name validation: must match [a-z][a-z0-9-]*
+- Args sanitization: rejects prototype pollution, functions, circular refs
+- Resource limits: max 10 servers/cwd, 50 total, 3 concurrent spawns

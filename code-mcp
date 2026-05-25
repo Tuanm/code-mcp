@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // Minimal MCP server over HTTP (Streamable HTTP transport, JSON-RPC 2.0).
 //
-// Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job.
+// Tools (always on): read, write, edit, multi_edit, bash, grep, find, ls, job, mcp.
 // Tools (conditional):
 //   - preview              enabled only if `cloudflared` is on PATH
 //   - remember, forget, recall  enabled only with --enable-memory
@@ -894,6 +894,223 @@ const MAX_CONSECUTIVE_SPAWN_FAILS = 3;
 const aggregatorServers = new Map<string, ServerState>();
 const aggregatedTools = new Map<string, AggregatedTool>(); // prefixed name -> info
 
+// ---------- mcp tool: per-cwd server cache ----------
+
+const MAX_CONCURRENT_SPAWNS = 3;
+const MAX_SERVERS_PER_CWD = 10;
+const MAX_TOTAL_CACHED_SERVERS = 50;
+const SPAWN_TIMEOUT_MS = 30_000;
+
+const cwdServers = new Map<string, Map<string, ServerState>>(); // key: "${cwd}:${serverName}"
+const serverMetadata = new Map<string, { tools: AggregatedTool[]; loadedAt: number }>(); // key: "${cwd}:${serverName}"
+const activeSpawns = new Set<string>(); // "${cwd}:${serverName}" currently spawning
+
+// ---------- mcp tool: validation functions ----------
+
+function validateMcpConfigPath(cwd: string, mcpConfigPath: string): { ok: true; path: string } | { ok: false; reason: string } {
+  const cwdResolved = resolve(cwd);
+  try {
+    if (!statSync(cwdResolved).isDirectory()) {
+      return { ok: false, reason: `cwd is not a directory: ${cwd}` };
+    }
+  } catch {
+    return { ok: false, reason: `cwd does not exist: ${cwd}` };
+  }
+  const resolved = resolve(cwdResolved, mcpConfigPath);
+  if (!resolved.startsWith(cwdResolved + "/")) {
+    return { ok: false, reason: `config path escapes cwd: ${mcpConfigPath}` };
+  }
+  if (!file(resolved).exists()) {
+    return { ok: false, reason: `.mcp.json not found at ${mcpConfigPath}` };
+  }
+  return { ok: true, path: resolved };
+}
+
+function validateServerName(servers: Record<string, McpServerConfig>, serverName: string): { ok: true } | { ok: false; reason: string } {
+  if (!servers || typeof servers !== "object") {
+    return { ok: false, reason: "invalid .mcp.json: missing mcpServers object" };
+  }
+  if (!(serverName in servers)) {
+    const names = Object.keys(servers).join(", ");
+    return { ok: false, reason: `server '${serverName}' not found in .mcp.json (available: ${names})` };
+  }
+  if (!NAMESPACE_RE.test(serverName)) {
+    return { ok: false, reason: `invalid server name '${serverName}' (must match ${NAMESPACE_RE})` };
+  }
+  return { ok: true };
+}
+
+function validateToolArgs(args: any): { ok: true; sanitized: Record<string, any> } | { ok: false; reason: string } {
+  if (args === null || args === undefined) {
+    return { ok: true, sanitized: {} };
+  }
+  if (typeof args !== "object" || Array.isArray(args)) {
+    return { ok: false, reason: "args must be a plain object" };
+  }
+  if (Object.prototype.hasOwnProperty.call(args, "__proto__") ||
+      Object.prototype.hasOwnProperty.call(args, "constructor") ||
+      Object.prototype.hasOwnProperty.call(args, "prototype")) {
+    return { ok: false, reason: "args contains forbidden prototype properties" };
+  }
+  const seen = new WeakSet();
+  const queue = [args];
+  while (queue.length > 0) {
+    const val = queue.pop();
+    if (typeof val === "function") {
+      return { ok: false, reason: "args contains functions" };
+    }
+    if (typeof val === "object" && val !== null) {
+      if (seen.has(val)) continue;
+      seen.add(val);
+      for (const key of Object.keys(val)) {
+        queue.push(val[key]);
+      }
+    }
+  }
+  return { ok: true, sanitized: JSON.parse(JSON.stringify(args)) };
+}
+
+function validateServerConfig(ns: string, cfg: McpServerConfig): { ok: true } | { ok: false; reason: string } {
+  if (cfg.type === "http") {
+    try {
+      const url = new URL(cfg.url);
+      if (url.protocol !== "https:") {
+        return { ok: false, reason: `server '${ns}': http transport requires https URL, got ${url.protocol}` };
+      }
+    } catch {
+      return { ok: false, reason: `server '${ns}': invalid http url` };
+    }
+  } else if (cfg.type === "stdio" || cfg.type === undefined) {
+    const command = (cfg as StdioServerConfig).command;
+    if (!command || typeof command !== "string") {
+      return { ok: false, reason: `server '${ns}': missing command` };
+    }
+    if (/[;|<>&]/.test(command)) {
+      return { ok: false, reason: `server '${ns}': command contains shell operators` };
+    }
+  } else {
+    return { ok: false, reason: `server '${ns}': unsupported transport type '${cfg.type}'` };
+  }
+  return { ok: true };
+}
+
+// ---------- mcp tool: helper functions ----------
+
+function getOrCreateServerState(cwd: string, ns: string, cfg: McpServerConfig): ServerState {
+  const key = `${cwd}:${ns}`;
+  const existing = cwdServers.get(cwd)?.get(ns);
+  if (existing) return existing;
+  if (!cwdServers.has(cwd)) {
+    cwdServers.set(cwd, new Map());
+  }
+  const cwdMap = cwdServers.get(cwd)!;
+  if (cwdMap.size >= MAX_SERVERS_PER_CWD) {
+    throw new Error(`max servers per cwd (${MAX_SERVERS_PER_CWD}) exceeded for ${cwd}`);
+  }
+  let totalServers = 0;
+  for (const m of cwdServers.values()) totalServers += m.size;
+  if (totalServers >= MAX_TOTAL_CACHED_SERVERS) {
+    throw new Error(`max total cached servers (${MAX_TOTAL_CACHED_SERVERS}) exceeded`);
+  }
+  const state = makeServerState(ns, cfg, false);
+  cwdMap.set(ns, state);
+  return state;
+}
+
+async function loadMcpConfig(cwd: string, mcpConfigPath: string): Promise<{ path: string; servers: Record<string, McpServerConfig> } | { error: string }> {
+  const validation = validateMcpConfigPath(cwd, mcpConfigPath);
+  if (!validation.ok) {
+    return { error: validation.reason };
+  }
+  let raw: string;
+  try {
+    raw = await file(validation.path).text();
+  } catch (e: any) {
+    return { error: `failed to read .mcp.json: ${e?.message ?? e}` };
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e: any) {
+    return { error: `.mcp.json is not valid JSON: ${e?.message ?? e}` };
+  }
+  const servers = parsed?.mcpServers;
+  if (!servers || typeof servers !== "object") {
+    return { error: `.mcp.json has no 'mcpServers' object` };
+  }
+  for (const [ns, cfg] of Object.entries(servers as Record<string, McpServerConfig>)) {
+    const v = validateServerConfig(ns, cfg as McpServerConfig);
+    if (!v.ok) {
+      return { error: v.reason };
+    }
+  }
+  return { path: validation.path, servers };
+}
+
+async function spawnServerWithLimit(cwd: string, ns: string, state: ServerState): Promise<void> {
+  const key = `${cwd}:${ns}`;
+  if (activeSpawns.has(key)) {
+    await new Promise<void>((resolve) => {
+      const iv = setInterval(() => {
+        if (!activeSpawns.has(key)) { clearInterval(iv); resolve(); }
+      }, 50);
+    });
+    return;
+  }
+  while (activeSpawns.size >= MAX_CONCURRENT_SPAWNS) {
+    await new Promise<void>((resolve) => {
+      const iv = setInterval(() => {
+        if (activeSpawns.size < MAX_CONCURRENT_SPAWNS) { clearInterval(iv); resolve(); }
+      }, 50);
+    });
+  }
+  activeSpawns.add(key);
+  try {
+    await ensureSpawned(ns, state);
+  } finally {
+    activeSpawns.delete(key);
+  }
+}
+
+function unloadServer(cwd: string, ns: string): { success: boolean; error?: string } {
+  const cwdMap = cwdServers.get(cwd);
+  if (!cwdMap) return { success: true };
+  const state = cwdMap.get(ns);
+  if (!state) return { success: true };
+  if (state.transport === "stdio") {
+    if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+    if (state.proc) {
+      try { (state.proc.stdin as import("bun").FileSink).end(); } catch {}
+      setTimeout(() => { try { state.proc?.kill("SIGTERM"); } catch {} }, 500);
+    }
+    for (const p of state.pending.values()) { p.reject(new Error("server unloaded")); }
+    state.pending.clear();
+  }
+  cwdMap.delete(ns);
+  serverMetadata.delete(`${cwd}:${ns}`);
+  if (cwdMap.size === 0) cwdServers.delete(cwd);
+  return { success: true };
+}
+
+function unloadAllForCwd(cwd: string): { success: boolean } {
+  const cwdMap = cwdServers.get(cwd);
+  if (!cwdMap) return { success: true };
+  for (const [ns, state] of cwdMap) {
+    if (state.transport === "stdio") {
+      if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+      if (state.proc) {
+        try { (state.proc.stdin as import("bun").FileSink).end(); } catch {}
+        setTimeout(() => { try { state.proc?.kill("SIGTERM"); } catch {} }, 500);
+      }
+      for (const p of state.pending.values()) { p.reject(new Error("server unloaded")); }
+      state.pending.clear();
+    }
+    serverMetadata.delete(`${cwd}:${ns}`);
+  }
+  cwdServers.delete(cwd);
+  return { success: true };
+}
+
 function aggregatorLogDir(): string {
   const dir = resolve(Bun.env.HOME ?? process.cwd(), ".code-mcp", "logs");
   mkdirSync(dir, { recursive: true });
@@ -1375,7 +1592,10 @@ function shutdownAggregator() {
         try { state.proc.kill("SIGTERM"); } catch {}
       }
     }
-    // HTTP: nothing to shut down locally.
+  }
+  // Also unload all per-cwd servers from mcp tool
+  for (const [cwd] of cwdServers) {
+    unloadAllForCwd(cwd);
   }
 }
 
@@ -1922,6 +2142,111 @@ const tools: Record<string, Tool> = {
           "Render the `widget` HTML by calling visualize:show_widget. " +
           "Also show the `url` as a markdown link as fallback.",
       });
+    },
+  },
+
+  mcp: {
+    description:
+      "Manage MCP servers from local .mcp.json files. " +
+      "Actions: " +
+      "  list: List all servers defined in .mcp.json for cwd " +
+      "  list server=X: Load server X and return its tools " +
+      "  call server=X tool=Y args={}: Call tool Y on loaded server X " +
+      "  unload: Unload all servers for this cwd " +
+      "  unload server=X: Unload specific server X",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string", description: "Working directory containing .mcp.json" },
+        action: { type: "string", enum: ["list", "call", "unload"], description: "Action to perform" },
+        server: { type: "string", description: "Server name (required for call, optional for list/unload)" },
+        tool: { type: "string", description: "Tool name (required for call)" },
+        args: { type: "object", description: "Tool arguments (required for call)", additionalProperties: true },
+        mcpConfigPath: { type: "string", default: ".mcp.json", description: "Path to .mcp.json relative to cwd" },
+      },
+      required: ["cwd", "action"],
+    },
+    handler: async ({ cwd, action, server, tool, args, mcpConfigPath = ".mcp.json" }) => {
+      const config = await loadMcpConfig(cwd, mcpConfigPath);
+      if ("error" in config) throw new Error(config.error);
+
+      if (action === "list" && !server) {
+        const servers: any[] = [];
+        for (const [name, cfg] of Object.entries(config.servers)) {
+          const key = `${cwd}:${name}`;
+          const meta = serverMetadata.get(key);
+          const cwdMap = cwdServers.get(cwd);
+          const isLoaded = cwdMap?.get(name)?.initialized ?? false;
+          servers.push({
+            name,
+            status: isLoaded ? "loaded" : "unloaded",
+            tools: meta?.tools.map((t: AggregatedTool) => t.originalName) ?? [],
+            idleTimeoutMs: cfg.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+          });
+        }
+        return { servers, mcpConfigPath };
+      }
+
+      if (action === "list" && server) {
+        const v = validateServerName(config.servers, server);
+        if (!v.ok) throw new Error(v.reason);
+        const cfg = config.servers[server];
+        const key = `${cwd}:${server}`;
+        let state = cwdServers.get(cwd)?.get(server);
+        if (!state || !state.initialized) {
+          state = getOrCreateServerState(cwd, server, cfg);
+          await Promise.race([
+            spawnServerWithLimit(cwd, server, state),
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`spawn timeout after ${SPAWN_TIMEOUT_MS}ms`)), SPAWN_TIMEOUT_MS)),
+          ]);
+        }
+        const toolsResult = await rpcCall(state, "tools/list", {});
+        const tools: AggregatedTool[] = ((toolsResult as any)?.tools ?? []).map((t: any) => ({
+          namespace: server,
+          originalName: t.name,
+          description: t.description ?? "",
+          inputSchema: t.inputSchema ?? { type: "object" },
+        }));
+        serverMetadata.set(key, { tools, loadedAt: Date.now() });
+        return {
+          server,
+          status: "loaded",
+          tools: tools.map((t: AggregatedTool) => ({ name: t.originalName, description: t.description, inputSchema: t.inputSchema })),
+          idleTimeoutMs: cfg.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+        };
+      }
+
+      if (action === "call") {
+        if (!server) throw new Error("server name required for call action");
+        if (!tool) throw new Error("tool name required for call action");
+        const v = validateServerName(config.servers, server);
+        if (!v.ok) throw new Error(v.reason);
+        const argsValidation = validateToolArgs(args);
+        if (!argsValidation.ok) throw new Error(argsValidation.reason);
+        const cfg = config.servers[server];
+        let state = cwdServers.get(cwd)?.get(server);
+        if (!state || !state.initialized) {
+          state = getOrCreateServerState(cwd, server, cfg);
+          await Promise.race([
+            spawnServerWithLimit(cwd, server, state),
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`spawn timeout after ${SPAWN_TIMEOUT_MS}ms`)), SPAWN_TIMEOUT_MS)),
+          ]);
+        }
+        resetIdleTimer(server, state);
+        const result = await rpcCall(state, "tools/call", { name: tool, arguments: argsValidation.sanitized });
+        resetIdleTimer(server, state);
+        return result;
+      }
+
+      if (action === "unload" && server) {
+        return unloadServer(cwd, server);
+      }
+
+      if (action === "unload" && !server) {
+        return unloadAllForCwd(cwd);
+      }
+
+      throw new Error(`unknown action: ${action}`);
     },
   },
 };
