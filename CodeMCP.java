@@ -72,6 +72,7 @@ public final class CodeMCP {
     
     // ===== MAIN ENTRY POINT =====
     public static void main(String[] args) throws Exception {
+        System.err.println("[main] starting...");
         parseArgs(args);
         
         isWindows = System.getProperty("os.name").toLowerCase().startsWith("windows");
