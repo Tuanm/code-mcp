@@ -1084,7 +1084,21 @@ public final class CodeMCP {
         
         if (mode.equals("stop")) {
             if (!j.status.equals("running")) return j.id + " already " + j.status;
-            j.process.destroyForcibly();
+            long timeout = timeoutMs != null ? timeoutMs : 500;
+            j.process.destroy();
+            try {
+                Thread.sleep(timeout);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (j.status.equals("running")) {
+                j.process.destroyForcibly();
+                try {
+                    j.process.waitFor();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             return j.id + " stopped";
         }
         

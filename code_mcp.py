@@ -243,7 +243,9 @@ def edit_file(path: str, old_str: str, new_str: str, cwd: str = ".") -> str:
 
 def multi_edit_files(edits: list[dict], cwd: str = ".") -> str:
     try:
-        originals = {}
+        originals = {}  # resolved_path(string) -> original_text
+        ranges = []  # list of (resolved_path, start, end, replacement, index)
+
         for i, edit in enumerate(edits):
             path = edit["path"]
             old_str = edit["old_str"]
@@ -251,17 +253,31 @@ def multi_edit_files(edits: list[dict], cwd: str = ".") -> str:
             ok, full_path, err = safe_resolve(cwd, path)
             if not ok:
                 return f"ERROR: edit #{i+1}: {err}"
-            if path not in originals:
-                originals[path] = full_path.read_text()
-            text = originals[path]
+            resolved = str(full_path)
+            if resolved not in originals:
+                originals[resolved] = full_path.read_text()
+            text = originals[resolved]
             if old_str not in text:
                 return f"ERROR: edit #{i+1} ({path}): old_str not found"
             if text.count(old_str) > 1:
                 return f"ERROR: edit #{i+1} ({path}): old_str not unique"
-            new_content = text.replace(old_str, new_str, 1)
-            originals[path] = new_content
-        for path, new_content in originals.items():
-            Path(path).write_text(new_content)
+            first = text.index(old_str)
+            start = first
+            end = first + len(old_str)
+            # Check overlap with existing ranges for same file
+            for r_start, r_end, _, r_idx in ranges:
+                if resolved == r[0] and start < r_end and end > r_start:
+                    return f"ERROR: edit #{i+1} ({path}): overlaps edit #{r_idx+1}"
+            ranges.append((resolved, start, end, new_str, i))
+
+        # Apply edits in reverse order so offsets stay valid
+        for resolved, start, end, replacement, idx in sorted(ranges, key=lambda x: -x[1]):
+            text = originals[resolved]
+            originals[resolved] = text[:start] + replacement + text[end:]
+
+        # Write all files
+        for resolved, new_content in originals.items():
+            Path(resolved).write_text(new_content)
         return "ok"
     except Exception as e:
         return f"ERROR: {e}"
@@ -638,7 +654,15 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
     global gateway_ws, gateway_device_id, assigned_device_id
 
     def build_url(d: str, dev_id: str | None) -> str:
-        base = d if d.startswith("wss://") or d.startswith("https://") else "wss://" + d
+        # Determine scheme: wss for production (anything not localhost/127.x), ws for local
+        if d.startswith("wss://") or d.startswith("https://"):
+            base = d.replace("https://", "wss://")
+        elif d.startswith("ws://") or d.startswith("http://"):
+            base = d.replace("http://", "ws://")
+        else:
+            # No scheme specified - use wss for production, ws for localhost/127.x
+            is_local = d.startswith("localhost") or d.startswith("127.") or d.startswith("192.168.") or d.startswith("10.") or d.startswith("172.16.")
+            base = ("ws://" if is_local else "wss://") + d
         if dev_id:
             return base + "/ws?deviceId=" + dev_id
         return base + "/ws"
@@ -742,14 +766,16 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             host = uri.hostname or domain
             port = uri.port or 443
 
-            context = ssl.create_default_context()
-            # Try to use Windows cert store on Windows
-            if sys.platform == "win32":
-                context.load_default_certs()
-
+            use_ssl = url.startswith("wss://") or url.startswith("https://")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             print(f"[gateway] connecting socket to {host}:{port}...", file=sys.stderr)
-            ssock = context.wrap_socket(sock, server_hostname=host)
+            if use_ssl:
+                context = ssl.create_default_context()
+                if sys.platform == "win32":
+                    context.load_default_certs()
+                ssock = context.wrap_socket(sock, server_hostname=host)
+            else:
+                ssock = sock
             ssock.connect((host, port))
             print(f"[gateway] socket connected", file=sys.stderr)
             ssock.settimeout(60)
@@ -779,11 +805,31 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                 resp += chunk
                 print(f"[gateway] received {len(resp)} bytes", file=sys.stderr)
 
-            print(f"[gateway] full response ({len(resp)} bytes): {resp.decode()[:500]}", file=sys.stderr)
-            if "101" not in resp.decode():
+            # Extract HTTP headers only (before \r\n\r\n) to check for 101
+            header_end = resp.find(b"\r\n\r\n")
+            if header_end == -1 or "101" not in resp[:header_end].decode(errors="replace"):
                 print("[gateway] WebSocket upgrade failed", file=sys.stderr)
                 time.sleep(3)
                 continue
+            print(f"[gateway] WebSocket upgrade confirmed", file=sys.stderr)
+
+            # Consume any buffered WebSocket frame data from the upgrade response
+            # (the 239 bytes included the HTTP response + first frame)
+            import errno
+            try:
+                ssock.setblocking(False)
+                while True:
+                    try:
+                        chunk = ssock.recv(4096)
+                        if not chunk:
+                            break
+                    except BlockingIOError as e:
+                        if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
+                            break
+                        raise
+                ssock.setblocking(True)
+            except Exception:
+                pass
 
             if not device_id:
                 device_id = str(uuid.uuid4())
