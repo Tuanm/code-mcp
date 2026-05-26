@@ -53,6 +53,7 @@ gateway_domain: Optional[str] = None
 gateway_device_id: Optional[str] = None
 gateway_lock = threading.Lock()
 assigned_device_id: Optional[str] = None
+memory_enabled = False
 
 
 class ShellType(Enum):
@@ -99,11 +100,13 @@ shell_type = detect_shell_type()
 
 
 def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None]:
-    """Returns (port, token, gateway_domain, device_id)."""
+    """Returns (port, token, gateway_domain, device_id). memory_enabled is set globally."""
+    global memory_enabled
     port = DEFAULT_PORT
     token = None
     gateway_domain = None
     device_id = None
+    memory_enabled = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -119,6 +122,9 @@ def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None
         elif arg == "--id" and i + 1 < len(args):
             device_id = args[i + 1]
             i += 2
+        elif arg == "--enable-memory":
+            memory_enabled = True
+            i += 1
         elif arg == "-h" or arg == "--help":
             print(USAGE)
             sys.exit(0)
@@ -136,6 +142,7 @@ Flags:
   --token <s>       Require ?token=<s> on every request
   --gateway <url>   Connect to gateway server (wss:// or https://)
   --id <uuid>       Use specific device ID for gateway connection
+  --enable-memory   Enable remember/forget/recall tools
 
 Tools: read, write, edit, multi_edit, bash, grep, find, ls, job, mcp
 """
@@ -393,6 +400,15 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                 {"name": "job", "description": "Manage background jobs.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "mode": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "mode"]}},
             ]
+            if memory_enabled:
+                tools.extend([
+                    {"name": "remember", "description": "Append a memo. Returns the assigned id.",
+                     "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "memo": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["cwd", "memo"]}},
+                    {"name": "forget", "description": "Remove a memo by id.",
+                     "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "memo_id": {"type": "number"}}, "required": ["cwd", "memo_id"]}},
+                    {"name": "recall", "description": "Search memos by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
+                     "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "query": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "number"}, "offset": {"type": "number"}}, "required": ["cwd"]}},
+                ])
             self.send_json(jsonrpc_response(req_id, {"tools": tools}))
             return
 
@@ -426,6 +442,20 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                     result = list_jobs()
                 else:
                     result = {"error": "Unknown action", "success": False}
+            elif tool_name == "remember":
+                result = handle_remember(cwd, tool_params.get("memo", ""),
+                                       tool_params.get("tags"))
+            elif tool_name == "forget":
+                try:
+                    result = handle_forget(cwd, tool_params.get("memo_id", 0))
+                except ValueError as e:
+                    result = {"error": str(e), "success": False}
+            elif tool_name == "recall":
+                result = handle_recall(cwd,
+                                       tool_params.get("query"),
+                                       tool_params.get("tags"),
+                                       tool_params.get("limit", 20),
+                                       tool_params.get("offset", 0))
             else:
                 result = {"error": f"Unknown tool: {tool_name}", "success": False}
 
@@ -594,6 +624,108 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
         except Exception as e:
             print(f"[gateway] error: {e}", file=sys.stderr)
             time.sleep(3)
+
+
+# ---------- memos ----------
+MEMO_FILE = ".memo.jsonl"
+MEMO_TAIL_BYTES = 8192
+
+
+def read_memos(cwd: str) -> list[dict]:
+    path = Path(cwd) / MEMO_FILE
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+        return [json.loads(line) for line in content.split("\n") if line.strip()]
+    except Exception:
+        return []
+
+
+def write_memos(cwd: str, memos: list[dict]):
+    path = Path(cwd) / MEMO_FILE
+    with open(path, "w") as f:
+        for m in memos:
+            f.write(json.dumps(m) + "\n")
+
+
+def last_memo_id(cwd: str) -> int:
+    path = Path(cwd) / MEMO_FILE
+    if not path.exists():
+        return 0
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return 0
+        with open(path, "rb") as f:
+            f.seek(max(0, size - MEMO_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = tail.split("\n")
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+                if isinstance(m, dict) and "id" in m:
+                    return m["id"]
+            except Exception:
+                continue
+        # fallback: full scan
+        memos = read_memos(cwd)
+        return max((m["id"] for m in memos if "id" in m), default=0)
+    except Exception:
+        return 0
+
+
+def handle_remember(cwd: str, memo: str, tags: list | None = None) -> str:
+    memo_id = last_memo_id(cwd) + 1
+    entry = {"id": memo_id, "ts": int(time.time() * 1000), "memo": memo}
+    if tags:
+        entry["tags"] = tags
+    path = Path(cwd) / MEMO_FILE
+    with open(path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return f"remembered #{memo_id}"
+
+
+def handle_forget(cwd: str, memo_id: int) -> str:
+    memos = read_memos(cwd)
+    before = len(memos)
+    kept = [m for m in memos if m.get("id") != memo_id]
+    if len(kept) == before:
+        raise ValueError(f"no memo with id {memo_id}")
+    write_memos(cwd, kept)
+    return f"forgot #{memo_id}"
+
+
+def handle_recall(cwd: str, query: str | None = None, tags: list | None = None,
+                  limit: int = 20, offset: int = 0) -> str:
+    memos = read_memos(cwd)
+    q = query.lower() if query else None
+    filtered = []
+    for m in memos:
+        if q and q not in m.get("memo", "").lower():
+            continue
+        if tags and not all(t in m.get("tags", []) for t in tags):
+            continue
+        filtered.append(m)
+    filtered.sort(key=lambda m: m.get("id", 0), reverse=True)
+    total = len(filtered)
+    if not total:
+        return "(no matches)"
+    page = filtered[offset:offset + limit]
+    lines = []
+    for m in page:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(m.get("ts", 0) / 1000))
+        tag_str = f" [{','.join(m['tags'])}]" if m.get("tags") else ""
+        lines.append(f"#{m['id']} {ts}{tag_str} {m['memo']}")
+    end = offset + len(page)
+    footer = f"-- {offset + 1}-{end} of {total}"
+    if end < total:
+        footer += f" (next: offset={end})"
+    return "\n".join(lines) + "\n" + footer
 
 
 def signal_handler(sig, frame):
