@@ -1919,7 +1919,6 @@ public final class CodeMCP {
             while (true) {
                 try {
                     String url = "wss://" + domain + "/ws";
-                    System.err.println("[" + deviceId + "] Connecting to gateway " + url + " ...");
 
                     URI uri = URI.create(url);
                     String host = uri.getHost();
@@ -1946,30 +1945,60 @@ public final class CodeMCP {
                             if (resp.toString().contains("\r\n\r\n")) break;
                         }
                         if (!resp.toString().contains("101")) {
-                            System.err.println("[" + deviceId + "] WebSocket upgrade failed");
                             return;
                         }
 
-                        System.err.println("[" + deviceId + "] Connected to gateway");
                         retries[0] = 0;
 
                         String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
                         sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
 
+                        sslSocket.setSoTimeout(60000);
+
                         while (true) {
-                            int opcode = in.read();
+                            int opcode;
+                            try {
+                                opcode = in.read();
+                            } catch (SocketTimeoutException e) {
+                                // Timeout waiting for data - this is normal, just continue waiting
+                                continue;
+                            }
                             if (opcode == -1) break;
-                            int len = in.read() & 0x7F;
+
+                            int lenByte = in.read();
+
+                            boolean masked = (lenByte & 0x80) != 0;
+                            int len = lenByte & 0x7F;
                             if (len == 126) {
                                 len = (in.read() << 8) | in.read();
                             } else if (len == 127) {
                                 len = 0;
                                 for (int j = 0; j < 8; j++) len = (len << 8) | (in.read() & 0xFF);
                             }
+
                             byte[] mask = new byte[4];
-                            in.read(mask);
+                            if (masked) {
+                                if (in.read(mask) != 4) break;
+                            }
+
+                            // Read exact payload bytes
                             byte[] payload = new byte[len];
-                            for (int j = 0; j < len; j++) payload[j] = (byte) (in.read() ^ mask[j & 3]);
+                            int read = 0;
+                            while (read < len) {
+                                try {
+                                    int n = in.read(payload, read, len - read);
+                                    if (n == -1) break;
+                                    read += n;
+                                } catch (SocketTimeoutException e) {
+                                    break;
+                                }
+                            }
+
+                            if (masked) {
+                                for (int j = 0; j < len; j++) {
+                                    payload[j] = (byte) (payload[j] ^ mask[j % 4]);
+                                }
+                            }
 
                             if ((opcode & 0x0F) == 0x01) {
                                 String msg = new String(payload, StandardCharsets.UTF_8);
@@ -1980,13 +2009,11 @@ public final class CodeMCP {
                         }
                     }
                 } catch (Exception e) {
-                    System.err.println("[" + deviceId + "] Gateway error: " + e.getMessage());
+                    // Gateway error, will retry
                 }
                 if (++retries[0] > MAX_RETRIES) {
-                    System.err.println("[" + deviceId + "] Max retries reached, exiting");
                     System.exit(1);
                 }
-                System.err.println("[" + deviceId + "] Reconnecting in " + RECONNECT_DELAY_MS + "ms ...");
                 try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ignored) {}
             }
         }).start();
