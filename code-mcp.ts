@@ -94,6 +94,7 @@ Options:
   --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
   --domain <host>        Use the given public hostname (tunnel must already route it here). Mutex with --public.
   --mcp <path>           Aggregate tools from external MCP servers defined in the given JSON config.
+  --gateway <domain>   Connect to a gateway server and tunnel requests (wss://{domain}/ws).
   -h, --help            Show this help and exit`;
 
 let args!: Record<string, any>;
@@ -108,6 +109,7 @@ try {
       public: { type: "boolean" },
       domain: { type: "string" },
       mcp: { type: "string" },
+      gateway: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: true,
@@ -130,6 +132,7 @@ const disallowedTools: string[] = args["disallowed-tools"]
   : [];
 const makePublic = args.public === true;
 const domain: string | undefined = args.domain;
+const gatewayDomain: string | undefined = args.gateway;
 const mcpConfigPath: string | undefined = args.mcp;
 
 if (makePublic && domain) {
@@ -2684,6 +2687,60 @@ if (makePublic) {
       console.error("warning: cloudflared did not print a URL within 20s");
     })();
   }
+}
+
+// ---------- gateway client ----------
+// If --gateway is set, connect to the gateway server via WebSocket and
+// tunnel remote requests to the local MCP handler.
+if (gatewayDomain) {
+  const deviceId = randomUUID();
+  const localMcpUrl = `http://localhost:${port}/mcp`;
+  const RECONNECT_DELAY_MS = 3000;
+  const MAX_RETRIES = 10;
+  let retries = 0;
+
+  (function connect() {
+    const url = `wss://${gatewayDomain}/ws`;
+    console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
+    const ws = new WebSocket(url);
+
+    ws.addEventListener("open", () => {
+      console.error(`[${deviceId}] Connected to gateway`);
+      retries = 0;
+      ws.send(JSON.stringify({ type: "register", deviceId }));
+    });
+
+    ws.addEventListener("message", async (e) => {
+      try {
+        const msg = JSON.parse(e.data as string) as { id?: string; request?: Json; token?: string };
+        if (!msg.id || !msg.request) return;
+        const tokenParam = msg.token ? `?token=${msg.token}` : "";
+        const res = await fetch(`${localMcpUrl}${tokenParam}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(msg.request),
+        });
+        const resp = await res.json();
+        ws.send(JSON.stringify({ id: msg.id, response: resp }));
+      } catch (err) {
+        console.error(`[${deviceId}] handle error:`, err);
+      }
+    });
+
+    ws.addEventListener("close", () => {
+      console.error(`[${deviceId}] Disconnected from gateway, retrying in ${RECONNECT_DELAY_MS}ms ...`);
+      if (++retries <= MAX_RETRIES) {
+        setTimeout(connect, RECONNECT_DELAY_MS);
+      } else {
+        console.error(`[${deviceId}] Max retries reached, exiting`);
+        process.exit(1);
+      }
+    });
+
+    ws.addEventListener("error", (err) => {
+      console.error(`[${deviceId}] Gateway WS error:`, err);
+    });
+  })();
 }
 
 // ---------- shutdown ----------
