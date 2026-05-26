@@ -42,10 +42,13 @@ MAX_OUTPUT = 1_000_000
 OUTPUT_CAP_KEEP = 500_000
 UPLOAD_TTL_MS = 10 * 60 * 1000
 MAX_CONCURRENT_JOBS = 10
+MAX_OUTPUT = 1_000_000
+OUTPUT_CAP_KEEP = 500_000
 
 # Global state
 jobs: dict[str, dict] = {}
 job_seq = 0
+total_jobs = 0
 shutting_down = False
 port = DEFAULT_PORT
 token: Optional[str] = None
@@ -303,25 +306,23 @@ def find_files(pattern: str, cwd: str = ".") -> dict:
         return {"error": str(e), "success": False}
 
 
-def list_directory(path: str = ".", cwd: str = ".") -> dict:
+def list_directory(path: str = ".", cwd: str = ".") -> str:
     try:
         ok, full_path, err = safe_resolve(cwd, path)
         if not ok:
-            return {"error": err, "success": False}
+            return f"ERROR: {err}"
         entries = []
         for entry in full_path.iterdir():
             try:
                 st = entry.stat()
-                entries.append({
-                    "name": entry.name,
-                    "type": "dir" if entry.is_dir() else "file",
-                    "size": st.st_size if entry.is_file() else 0
-                })
+                prefix = "d" if entry.is_dir() else "-"
+                size = st.st_size if entry.is_file() else 0
+                entries.append(f"{prefix}{size:>10} {entry.name}")
             except PermissionError:
-                continue
-        return {"entries": entries, "success": True}
+                entries.append(f"? {entry.name}")
+        return "\n".join(sorted(entries))
     except Exception as e:
-        return {"error": str(e), "success": False}
+        return f"ERROR: {e}"
 
 
 def get_job_status(job_id: str) -> dict:
@@ -330,9 +331,95 @@ def get_job_status(job_id: str) -> dict:
     return {"error": "Job not found", "success": False}
 
 
-def list_jobs() -> dict:
-    return {"jobs": {k: {"status": v.get("status"), "created": v.get("created")}
-                     for k, v in jobs.items()}}
+def list_jobs() -> str:
+    if not jobs:
+        return "(no jobs)"
+    lines = []
+    for jid, j in jobs.items():
+        status = j.get("status", "unknown")
+        exit_info = f" {j.get('exit_code')}" if j.get("exit_code") is not None else ""
+        lines.append(f"{jid} [{status}{exit_info}] {j.get('command', '')}")
+    return "\n".join(lines)
+
+
+def start_job(command: str, cwd: str) -> dict:
+    global total_jobs, job_seq
+    if total_jobs >= MAX_CONCURRENT_JOBS:
+        return {"error": f"max concurrent jobs ({MAX_CONCURRENT_JOBS}) exceeded", "success": False}
+    if shutting_down:
+        return {"error": "server is shutting down", "success": False}
+
+    total_jobs += 1
+    job_seq += 1
+    job_id = f"j{job_seq}"
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception as e:
+        total_jobs -= 1
+        return {"error": f"failed to start job: {e}", "success": False}
+
+    job = {
+        "id": job_id,
+        "command": command,
+        "proc": proc,
+        "output": "",
+        "status": "running",
+        "started_at": time.time(),
+    }
+    jobs[job_id] = job
+
+    def pump_and_finalize():
+        try:
+            stdout, stderr = proc.communicate()
+            job["output"] = (stdout + stderr)[:MAX_OUTPUT]
+        except Exception:
+            pass
+        finally:
+            job["status"] = "exited"
+            job["exit_code"] = proc.returncode
+            global total_jobs
+            total_jobs = max(0, total_jobs - 1)
+
+    t = threading.Thread(target=pump_and_finalize, daemon=True)
+    t.start()
+
+    return {"id": job_id, "success": True}
+
+
+def stop_job(job_id: str, timeout_ms: int = 500) -> dict:
+    if job_id not in jobs:
+        return {"error": f"no such job: {job_id}", "success": False}
+    job = jobs[job_id]
+    if job["status"] != "running":
+        return {"id": job_id, "status": job["status"], "success": True}
+
+    proc = job["proc"]
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout_ms / 1000)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    return {"id": job_id, "status": "stopped", "success": True}
+
+
+def view_job(job_id: str) -> dict:
+    if job_id not in jobs:
+        return {"error": f"no such job: {job_id}", "success": False}
+    job = jobs[job_id]
+    status = job.get("status", "unknown")
+    exit_info = f" {job.get('exit_code')}" if job.get("exit_code") is not None else ""
+    output = job.get("output", "")
+    return {"id": job_id, "status": status, "exit_code": job.get("exit_code"), "output": output}
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -397,8 +484,8 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd", "pattern"]}},
                 {"name": "ls", "description": "List directory contents.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd"]}},
-                {"name": "job", "description": "Manage background jobs.",
-                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "mode": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "mode"]}},
+                {"name": "job", "description": "Manage background jobs. mode: list|view|start|stop. command required for start; id (passed as command) required for view/stop. cwd used only for start.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["list", "view", "start", "stop"]}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "mode"]}},
             ]
             if memory_enabled:
                 tools.extend([
@@ -431,17 +518,35 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                 result = execute_bash(tool_params.get("command", ""), cwd)
             elif tool_name == "grep":
                 result = grep_files(tool_params.get("pattern", ""),
-                                   tool_params.get("paths", ["."]), cwd)
+                                   [tool_params.get("path", ".")], cwd)
             elif tool_name == "find":
                 result = find_files(tool_params.get("pattern", ""), cwd)
             elif tool_name == "ls":
                 result = list_directory(tool_params.get("path", "."), cwd)
             elif tool_name == "job":
-                action = tool_params.get("action", "list")
-                if action == "list":
+                mode = tool_params.get("mode", "list")
+                if mode == "list":
                     result = list_jobs()
+                elif mode == "start":
+                    cmd = tool_params.get("command")
+                    if not cmd:
+                        result = {"error": "command required", "success": False}
+                    else:
+                        result = start_job(cmd, cwd)
+                elif mode == "stop":
+                    cmd = tool_params.get("command")
+                    if not cmd:
+                        result = {"error": "job id required (pass as command)", "success": False}
+                    else:
+                        result = stop_job(cmd, tool_params.get("timeout_ms", 500))
+                elif mode == "view":
+                    cmd = tool_params.get("command")
+                    if not cmd:
+                        result = {"error": "job id required (pass as command)", "success": False}
+                    else:
+                        result = view_job(cmd)
                 else:
-                    result = {"error": "Unknown action", "success": False}
+                    result = {"error": f"unknown mode: {mode}", "success": False}
             elif tool_name == "remember":
                 result = handle_remember(cwd, tool_params.get("memo", ""),
                                        tool_params.get("tags"))
@@ -601,7 +706,8 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                 time.sleep(3)
                 continue
 
-            device_id = str(uuid.uuid4())
+            if not device_id:
+                device_id = str(uuid.uuid4())
             register = json.dumps({"type": "register", "deviceId": device_id})
             send_ws_frame(ssock, register.encode())
             print(f"[gateway] registered as {device_id}", file=sys.stderr)
