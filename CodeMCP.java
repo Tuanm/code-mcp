@@ -1924,9 +1924,15 @@ public final class CodeMCP {
             System.err.println("[gateway] starting client for: " + domain);
             while (true) {
                 try {
+                    System.err.println("[gateway] building URL...");
                     String url = domain.startsWith("wss://") || domain.startsWith("https://")
                         ? domain + "/ws"
                         : "wss://" + domain + "/ws";
+                    System.err.println("[gateway] URL built: " + url);
+                    System.err.println("[gateway] creating SSL socket...");
+                    SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
+                    System.err.println("[gateway] socket factory created");
+                    System.err.println("[gateway] connecting to " + host + ":" + port);
 
                     URI uri = URI.create(url);
                     String host = uri.getHost();
@@ -2023,7 +2029,8 @@ public final class CodeMCP {
                         }
                     }
                 } catch (Exception e) {
-                    System.err.println("[gateway] connection error: " + e.getMessage());
+                    System.err.println("[gateway] error: " + e.getClass().getName() + ": " + e.getMessage());
+                    e.printStackTrace();
                 }
                 if (++retries[0] > MAX_RETRIES) {
                     System.exit(1);
