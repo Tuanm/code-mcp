@@ -373,19 +373,27 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
         req_id, method, params = parse_jsonrpc_request(request)
 
         if method == "tools/list":
-            self.send_json(jsonrpc_response(req_id, {
-                "tools": [
-                    {"name": "read", "description": "Read file content"},
-                    {"name": "write", "description": "Write content to file"},
-                    {"name": "edit", "description": "Edit file with string replacement"},
-                    {"name": "multi_edit", "description": "Apply multiple edits"},
-                    {"name": "bash", "description": "Execute shell command"},
-                    {"name": "grep", "description": "Search for pattern in files"},
-                    {"name": "find", "description": "Find files by pattern"},
-                    {"name": "ls", "description": "List directory contents"},
-                    {"name": "job", "description": "Manage background jobs"},
-                ]
-            }))
+            tools = [
+                {"name": "read", "description": "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "range": {"type": "array", "items": {"type": "number"}}, "no_truncate": {"type": "boolean"}}, "required": ["cwd", "path"]}},
+                {"name": "write", "description": "Write/overwrite a file with the given content.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["cwd", "path", "content"]}},
+                {"name": "edit", "description": "Replace old_str with new_str in a file. old_str must occur exactly once.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["cwd", "path", "old_str", "new_str"]}},
+                {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}, "required": ["cwd", "edits"]}},
+                {"name": "bash", "description": "Execute shell command.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "command"]}},
+                {"name": "grep", "description": "Search for pattern in files.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, "required": ["cwd", "pattern"]}},
+                {"name": "find", "description": "Find files by pattern.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd", "pattern"]}},
+                {"name": "ls", "description": "List directory contents.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd"]}},
+                {"name": "job", "description": "Manage background jobs.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "mode": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "mode"]}},
+            ]
+            self.send_json(jsonrpc_response(req_id, {"tools": tools}))
             return
 
         if method == "tools/call":
