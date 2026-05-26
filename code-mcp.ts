@@ -45,6 +45,7 @@ type Job = {
 const jobs = new Map<string, Job>();
 let jobSeq = 0;
 let shuttingDown = false;
+let totalJobs = 0;
 
 // Shell command wrappers for each shell type.
 function bashCmd(command: string): string[] { return ["bash", "-c", command]; }
@@ -318,6 +319,9 @@ async function pumpCapped(stream: ReadableStream<Uint8Array> | null, sink: { tex
 }
 
 function startJob(command: string, cwd: string): Job {
+  if (totalJobs >= MAX_JOBS) throw new Error(`max concurrent jobs (${MAX_JOBS}) exceeded`);
+  if (shuttingDown) throw new Error("server is shutting down");
+  totalJobs++;
   const id = `j${++jobSeq}`;
   const proc = spawn({
     cmd: shellCmd(command),
@@ -335,6 +339,7 @@ function startJob(command: string, cwd: string): Job {
   pumpCapped(proc.stdout as any, sink);
   pumpCapped(proc.stderr as any, sink);
   proc.exited.then((code) => {
+    totalJobs--;
     job.status = "exited";
     job.exitCode = code;
   });
@@ -892,6 +897,20 @@ const NAMESPACE_RE = /^[a-z][a-z0-9-]*$/;
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const SUBPROCESS_CALL_TIMEOUT_MS = 90_000;
 const MAX_CONSECUTIVE_SPAWN_FAILS = 3;
+const MAX_JOBS = 100;
+
+function safeResolve(cwd: string, userPath: string): { ok: true; path: string } | { ok: false; reason: string } {
+  const cwdResolved = resolve(cwd).replace(/\\/g, "/");
+  try {
+    const p = resolve(cwdResolved, userPath).replace(/\\/g, "/");
+    if (!p.startsWith(cwdResolved + "/") && p !== cwdResolved) {
+      return { ok: false, reason: `path escapes cwd: ${userPath}` };
+    }
+    return { ok: true, path: p };
+  } catch {
+    return { ok: false, reason: `invalid path: ${userPath}` };
+  }
+}
 
 const aggregatorServers = new Map<string, ServerState>();
 const aggregatedTools = new Map<string, AggregatedTool>(); // prefixed name -> info
@@ -1615,7 +1634,9 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "path"],
     },
     handler: async ({ cwd, path, range }) => {
-      const text = await file(resolve(cwd, path)).text();
+      const r = safeResolve(cwd, path);
+      if (!r.ok) throw new Error(r.reason);
+      const text = await file(r.path).text();
       if (!range) return text;
       const lines = text.split("\n");
       const [s, e] = range;
@@ -1635,7 +1656,9 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "path", "content"],
     },
     handler: async ({ cwd, path, content }) => {
-      const bytes = await write(resolve(cwd, path), content);
+      const r = safeResolve(cwd, path);
+      if (!r.ok) throw new Error(r.reason);
+      const bytes = await write(r.path, content);
       return `wrote ${bytes} bytes to ${path}`;
     },
   },
@@ -1653,12 +1676,13 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "path", "old_str", "new_str"],
     },
     handler: async ({ cwd, path, old_str, new_str }) => {
-      const p = resolve(cwd, path);
-      const text = await file(p).text();
+      const r = safeResolve(cwd, path);
+      if (!r.ok) throw new Error(r.reason);
+      const text = await file(r.path).text();
       const first = text.indexOf(old_str);
       if (first === -1) throw new Error("old_str not found");
       if (text.indexOf(old_str, first + 1) !== -1) throw new Error("old_str not unique");
-      await write(p, text.slice(0, first) + new_str + text.slice(first + old_str.length));
+      await write(r.path, text.slice(0, first) + new_str + text.slice(first + old_str.length));
       return "ok";
     },
   },
@@ -1702,9 +1726,10 @@ const tools: Record<string, Tool> = {
 
       for (let i = 0; i < edits.length; i++) {
         const { path, old_str, new_str } = edits[i];
-        const p = resolve(cwd, path);
-        if (!originals.has(p)) originals.set(p, await file(p).text());
-        const text = originals.get(p)!;
+        const sr = safeResolve(cwd, path);
+        if (!sr.ok) throw new Error(`edit #${i + 1}: ${sr.reason}`);
+        if (!originals.has(sr.path)) originals.set(sr.path, await file(sr.path).text());
+        const text = originals.get(sr.path)!;
         const first = text.indexOf(old_str);
         if (first === -1) throw new Error(`edit #${i + 1} (${path}): old_str not found`);
         if (text.indexOf(old_str, first + 1) !== -1) {
@@ -1712,31 +1737,31 @@ const tools: Record<string, Tool> = {
         }
         const start = first;
         const end = first + old_str.length;
-        const list = ranges.get(p) ?? [];
+        const list = ranges.get(sr.path) ?? [];
         // Check overlap with edits already queued for this file.
-        for (const r of list) {
-          if (start < r.end && end > r.start) {
+        for (const existing of list) {
+          if (start < existing.end && end > existing.start) {
             throw new Error(
-              `edit #${i + 1} (${path}): overlaps edit #${r.index + 1} ` +
-              `(both target bytes ${Math.max(start, r.start)}..${Math.min(end, r.end)})`
+              `edit #${i + 1} (${path}): overlaps edit #${existing.index + 1} ` +
+              `(both target bytes ${Math.max(start, existing.start)}..${Math.min(end, existing.end)})`
             );
           }
         }
         list.push({ start, end, replacement: new_str, index: i });
-        ranges.set(p, list);
+        ranges.set(sr.path, list);
       }
 
       // All edits validated — apply in reverse order per file.
-      for (const [p, list] of ranges) {
+      for (const [filePath, list] of ranges) {
         const sorted = [...list].sort((a, b) => b.start - a.start);
-        let text = originals.get(p)!;
-        for (const r of sorted) {
-          text = text.slice(0, r.start) + r.replacement + text.slice(r.end);
+        let text = originals.get(filePath)!;
+        for (const edit of sorted) {
+          text = text.slice(0, edit.start) + edit.replacement + text.slice(edit.end);
         }
-        await write(p, text);
+        await write(filePath, text);
       }
       const summary = [...ranges]
-        .map(([p, list]) => `${p} (${list.length} edit${list.length > 1 ? "s" : ""})`)
+        .map(([filePath, list]) => `${filePath} (${list.length} edit${list.length > 1 ? "s" : ""})`)
         .join(", ");
       return `applied ${edits.length} edit(s) across ${ranges.size} file(s): ${summary}`;
     },
@@ -1891,23 +1916,25 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "pattern"],
     },
     handler: async ({ cwd, pattern, path = ".", glob }) => {
+      const sr = safeResolve(cwd, path);
+      if (!sr.ok) throw new Error(sr.reason);
       let cmd: string[];
       if (hasRg) {
         cmd = ["rg", "--line-number", "--no-heading", "--color=never",
-           ...(glob ? ["--glob", glob] : []), pattern, path];
+           ...(glob ? ["--glob", glob] : []), pattern, sr.path];
       } else if (IS_WINDOWS && hasFindstr) {
         // Windows findstr: /r = regex, /n = line numbers
         // Note: findstr regex syntax differs slightly from grep
         // Glob patterns (e.g. *.txt) must be part of path argument, not a separate flag
         const args = ["/r", "/n"];
-        const searchPath = glob ? `${path}\\${glob.replace(/\*/g, "*")}` : path;
+        const searchPath = glob ? `${sr.path}\\${glob.replace(/\*/g, "*")}` : sr.path;
         cmd = ["findstr", ...args, pattern, searchPath];
       } else {
-        cmd = ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, path];
+        cmd = ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, sr.path];
       }
       const proc = spawn({
         cmd,
-        cwd,
+        cwd: sr.path,
         stdout: "pipe",
         stderr: "pipe",
         stdin: "ignore",
@@ -1941,6 +1968,8 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "pattern"],
     },
     handler: async ({ cwd, pattern, path = ".", include_hidden = false }) => {
+      const sr = safeResolve(cwd, path);
+      if (!sr.ok) throw new Error(sr.reason);
       const pat = pattern.includes("/") || pattern.includes("\\") ? pattern : `**/${pattern}`;
       const glob = new Bun.Glob(pat);
 
@@ -1960,7 +1989,7 @@ const tools: Record<string, Tool> = {
       );
 
       const results: string[] = [];
-      for await (const f of glob.scan({ cwd: resolve(cwd, path), onlyFiles: false })) {
+      for await (const f of glob.scan({ cwd: sr.path, onlyFiles: false })) {
         // Split on both separators so Windows paths from Bun.Glob match.
         const segments = f.split(/[\/\\]/);
         let skip = false;
@@ -1990,11 +2019,12 @@ const tools: Record<string, Tool> = {
       required: ["cwd"],
     },
     handler: ({ cwd, path = "." }) => {
-      const p = resolve(cwd, path);
-      return readdirSync(p)
+      const sr = safeResolve(cwd, path);
+      if (!sr.ok) throw new Error(sr.reason);
+      return readdirSync(sr.path)
         .map((name) => {
           try {
-            const s = statSync(`${p}/${name}`);
+            const s = statSync(`${sr.path}/${name}`);
             return `${s.isDirectory() ? "d" : "-"} ${String(s.size).padStart(10)} ${name}`;
           } catch {
             return `? ${name}`;

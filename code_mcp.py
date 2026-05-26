@@ -163,9 +163,32 @@ def parse_jsonrpc_request(data: dict) -> tuple[str, str, dict | None]:
     return req_id, method, params
 
 
+def safe_resolve(cwd: str, user_path: str) -> tuple[bool, Path, str]:
+    """Resolve path safely, ensuring it stays within cwd. Returns (ok, resolved_path, error_msg)."""
+    try:
+        cwd_path = Path(cwd).resolve()
+        # Handle both absolute paths and relative paths
+        if Path(user_path).is_absolute():
+            full_path = Path(user_path).resolve()
+        else:
+            full_path = cwd_path / user_path
+        # Normalize to resolve any .. or . components
+        full_path = full_path.resolve()
+        # Ensure the resolved path is within cwd
+        try:
+            full_path.relative_to(cwd_path)
+        except ValueError:
+            return False, full_path, f"path escapes cwd: {user_path}"
+        return True, full_path, ""
+    except Exception as e:
+        return False, Path("."), f"invalid path: {user_path}"
+
+
 def read_file(path: str, cwd: str = ".") -> dict:
     try:
-        full_path = Path(cwd) / path if not Path(path).is_absolute() else Path(path)
+        ok, full_path, err = safe_resolve(cwd, path)
+        if not ok:
+            return {"error": err, "success": False}
         content = full_path.read_text(errors="replace")
         return {"content": content, "success": True}
     except Exception as e:
@@ -174,7 +197,9 @@ def read_file(path: str, cwd: str = ".") -> dict:
 
 def write_file(path: str, content: str, cwd: str = ".") -> dict:
     try:
-        full_path = Path(cwd) / path if not Path(path).is_absolute() else Path(path)
+        ok, full_path, err = safe_resolve(cwd, path)
+        if not ok:
+            return {"error": err, "success": False}
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content)
         return {"success": True, "path": str(full_path)}
@@ -184,7 +209,9 @@ def write_file(path: str, content: str, cwd: str = ".") -> dict:
 
 def edit_file(path: str, old_str: str, new_str: str, cwd: str = ".") -> dict:
     try:
-        full_path = Path(cwd) / path if not Path(path).is_absolute() else Path(path)
+        ok, full_path, err = safe_resolve(cwd, path)
+        if not ok:
+            return {"error": err, "success": False}
         content = full_path.read_text()
         if old_str not in content:
             return {"error": "String not found", "success": False}
@@ -230,7 +257,14 @@ def execute_bash(command: str, cwd: str = ".") -> dict:
 
 def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> dict:
     try:
-        cmd = ["rg", "--json", "-n", pattern] + paths if has_rg() else ["grep", "-rn", pattern] + paths
+        # Validate each path is within cwd
+        valid_paths = []
+        for p in paths:
+            ok, full_path, err = safe_resolve(cwd, p)
+            if not ok:
+                return {"error": err, "success": False}
+            valid_paths.append(str(full_path))
+        cmd = ["rg", "--json", "-n", pattern] + valid_paths if has_rg() else ["grep", "-rn", pattern] + valid_paths
         result = subprocess.run(
             cmd,
             cwd=cwd,
@@ -245,7 +279,10 @@ def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> dict:
 
 def find_files(pattern: str, cwd: str = ".") -> dict:
     try:
-        matches = list(Path(cwd).rglob(pattern))
+        ok, full_path, err = safe_resolve(cwd, ".")
+        if not ok:
+            return {"error": err, "success": False}
+        matches = list(full_path.rglob(pattern))
         return {"matches": [str(m) for m in matches[:100]], "success": True}
     except Exception as e:
         return {"error": str(e), "success": False}
@@ -253,7 +290,9 @@ def find_files(pattern: str, cwd: str = ".") -> dict:
 
 def list_directory(path: str = ".", cwd: str = ".") -> dict:
     try:
-        full_path = Path(cwd) / path if not Path(path).is_absolute() else Path(path)
+        ok, full_path, err = safe_resolve(cwd, path)
+        if not ok:
+            return {"error": err, "success": False}
         entries = []
         for entry in full_path.iterdir():
             try:
@@ -473,8 +512,6 @@ def start_gateway_client(domain: str) -> None:
             port = uri.port or 443
 
             context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             ssock = context.wrap_socket(sock, server_hostname=host)

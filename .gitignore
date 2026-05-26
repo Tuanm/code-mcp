@@ -1,2 +1,3 @@
 *.class
 .memo.jsonl
+__pycache__/
