@@ -29,8 +29,8 @@ Connect to a [code-mcp-gateway](https://github.com/Tuanm/code-mcp-gateway) to ex
 # Bun
 bun code-mcp.ts --gateway wss://gateway.example.workers.dev --port 7777
 
-# Java
-java CodeMCP --gateway wss://gateway.example.workers.dev --port 7777
+# Java (runs directly, no compilation needed)
+java CodeMCP.java --gateway wss://gateway.example.workers.dev --port 7777
 ```
 
 ## Flags
@@ -71,7 +71,15 @@ bun build ./code-mcp.ts --outfile=./code-mcp --target=bun --compile --minify
 chmod +x code-mcp
 ```
 
-### Java
+### Java (optional)
+
+Java 11+ can run directly without compilation:
+
+```bash
+java CodeMCP.java [args...]
+```
+
+Or compile first for faster startup:
 
 ```bash
 javac CodeMCP.java
