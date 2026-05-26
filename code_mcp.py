@@ -786,7 +786,6 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                 context = ssl.create_default_context()
                 ssock = context.wrap_socket(sock, server_hostname=host)
                 ssock.connect((host, port))
-                ssock.do_handshake()
             else:
                 ssock = sock
                 ssock.connect((host, port))
