@@ -536,7 +536,7 @@ def start_gateway_client(domain: str) -> None:
                 resp += chunk
 
             if "101" not in resp.decode():
-                print("[gateway] WebSocket upgrade failed", file=sys.stderr)
+                print(f"[gateway] WebSocket upgrade failed. Response: {resp.decode()[:200]}", file=sys.stderr)
                 time.sleep(3)
                 continue
 
