@@ -664,7 +664,7 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             is_local = d.startswith("localhost") or d.startswith("127.") or d.startswith("192.168.") or d.startswith("10.") or d.startswith("172.16.")
             base = ("ws://" if is_local else "wss://") + d
         if dev_id:
-            return base + "/ws?deviceId=" + dev_id
+            return base + "/ws/" + dev_id
         return base + "/ws"
 
     def send_ws_frame(sock, data: bytes):
@@ -688,23 +688,38 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
         sock.sendall(bytes(frame))
 
     def recv_ws_frame(sock) -> bytes | None:
+        def _recv_exact(sock, size: int) -> bytes | None:
+            data = b""
+            while len(data) < size:
+                try:
+                    chunk = sock.recv(size - len(data))
+                    if not chunk:
+                        return None
+                    data += chunk
+                except ssl.SSLError as e:
+                    # SSL_ERROR_WANT_READ means retry, not connection closed
+                    if e.errno == ssl.SSL_ERROR_WANT_READ:
+                        continue
+                    raise
+            return data
+
         try:
-            first = sock.recv(1)
+            first = _recv_exact(sock, 1)
             if not first:
                 return None
             first = first[0]
-            second = sock.recv(1)
+            second = _recv_exact(sock, 1)
             if not second:
                 return None
             second = second[0]
             length = second & 0x7F
             if length == 126:
-                length = struct.unpack(">H", sock.recv(2))[0]
+                length = struct.unpack(">H", _recv_exact(sock, 2))[0]
             elif length == 127:
-                length = struct.unpack(">Q", sock.recv(8))[0]
+                length = struct.unpack(">Q", _recv_exact(sock, 8))[0]
             payload = b""
             while len(payload) < length:
-                chunk = sock.recv(length - len(payload))
+                chunk = _recv_exact(sock, length - len(payload))
                 if not chunk:
                     break
                 payload += chunk
@@ -794,7 +809,7 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
 
             ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
             request = (
-                f"GET /ws HTTP/1.1\r\n"
+                f"GET {uri.path} HTTP/1.1\r\n"
                 f"Host: {host}:{port}\r\n"
                 f"Upgrade: websocket\r\n"
                 f"Connection: Upgrade\r\n"

@@ -2735,7 +2735,7 @@ if (gatewayDomain) {
   let retries = 0;
 
   (function connect() {
-    const url = assignedDeviceId ? `wss://${gatewayDomain}/ws?deviceId=${assignedDeviceId}` : `wss://${gatewayDomain}/ws`;
+    const url = assignedDeviceId ? `wss://${gatewayDomain}/ws/${assignedDeviceId}` : `wss://${gatewayDomain}/ws`;
     console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
     const ws = new WebSocket(url);
 

@@ -1952,13 +1952,14 @@ public final class CodeMCP {
                         ? domain
                         : "wss://" + domain;
                     String url = deviceIdParam != null
-                        ? baseUrl + "/ws?deviceId=" + deviceIdParam
+                        ? baseUrl + "/ws/" + deviceIdParam
                         : baseUrl + "/ws";
                     System.err.println("[gateway] connecting to " + url);
 
                     URI uri = URI.create(url);
                     String host = uri.getHost();
                     int port = uri.getPort() > 0 ? uri.getPort() : 443;
+                    String wsPath = uri.getPath();
 
                     SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
                     try (SSLSocket sslSocket = (SSLSocket) sf.createSocket(host, port)) {
@@ -1969,7 +1970,7 @@ public final class CodeMCP {
                         byte[] keyBytes = new byte[16];
                         new Random().nextBytes(keyBytes);
                         String wsKey = Base64.getEncoder().encodeToString(keyBytes);
-                        String request = "GET /ws HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
+                        String request = "GET " + wsPath + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
                                 "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
                                 "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
                         out.writeBytes(request);
