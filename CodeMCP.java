@@ -1920,6 +1920,7 @@ public final class CodeMCP {
         int[] retries = {0};
 
         new Thread(() -> {
+            System.err.println("[gateway] starting client for: " + domain);
             while (true) {
                 try {
                     String url = domain.startsWith("wss://") || domain.startsWith("https://")
