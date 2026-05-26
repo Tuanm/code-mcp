@@ -126,7 +126,11 @@ public final class CodeMCP {
 
         // Start gateway client if --gateway is set
         if (gatewayDomain != null) {
-            startGatewayClient(gatewayDomain);
+            try {
+                startGatewayClient(gatewayDomain);
+            } catch (Exception e) {
+                System.err.println("[gateway] failed to start: " + e.getMessage());
+            }
         }
     }
     
