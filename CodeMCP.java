@@ -1924,26 +1924,18 @@ public final class CodeMCP {
             System.err.println("[gateway] starting client for: " + domain);
             while (true) {
                 try {
-                    System.err.println("[gateway] building URL...");
                     String url = domain.startsWith("wss://") || domain.startsWith("https://")
                         ? domain + "/ws"
                         : "wss://" + domain + "/ws";
-                    System.err.println("[gateway] URL built: " + url);
-                    System.err.println("[gateway] creating SSL socket...");
-                    SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
-                    System.err.println("[gateway] socket factory created");
-                    System.err.println("[gateway] connecting to " + host + ":" + port);
+                    System.err.println("[gateway] connecting to " + url);
 
                     URI uri = URI.create(url);
                     String host = uri.getHost();
                     int port = uri.getPort() > 0 ? uri.getPort() : 443;
 
                     SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
-                    System.err.println("[gateway] connecting to " + host + ":" + port);
                     try (SSLSocket sslSocket = (SSLSocket) sf.createSocket(host, port)) {
-                        System.err.println("[gateway] SSL handshake...");
                         sslSocket.startHandshake();
-                        System.err.println("[gateway] connected, sending WebSocket upgrade...");
                         DataOutputStream out = new DataOutputStream(sslSocket.getOutputStream());
                         InputStream in = sslSocket.getInputStream();
 
@@ -1962,16 +1954,15 @@ public final class CodeMCP {
                             if (resp.toString().contains("\r\n\r\n")) break;
                         }
                         if (!resp.toString().contains("101")) {
-                            System.err.println("[gateway] WebSocket upgrade failed, response: " + resp);
+                            System.err.println("[gateway] WebSocket upgrade failed");
                             return;
                         }
-                        System.err.println("[gateway] WebSocket upgrade OK, response: " + resp.substring(0, Math.min(100, resp.length())));
+                        System.err.println("[gateway] connected, sending register...");
 
                         retries[0] = 0;
 
                         String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
                         sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
-                        System.err.println("[gateway] register frame sent, waiting for response...");
 
                         sslSocket.setSoTimeout(60000);
 
@@ -1980,7 +1971,6 @@ public final class CodeMCP {
                             try {
                                 opcode = in.read();
                             } catch (SocketTimeoutException e) {
-                                // Timeout waiting for data - this is normal, just continue waiting
                                 continue;
                             }
                             if (opcode == -1) break;
@@ -2001,7 +1991,6 @@ public final class CodeMCP {
                                 if (in.read(mask) != 4) break;
                             }
 
-                            // Read exact payload bytes
                             byte[] payload = new byte[len];
                             int read = 0;
                             while (read < len) {
@@ -2022,6 +2011,7 @@ public final class CodeMCP {
 
                             if ((opcode & 0x0F) == 0x01) {
                                 String msg = new String(payload, StandardCharsets.UTF_8);
+                                System.err.println("[gateway] received: " + msg);
                                 if (msg.contains("\"request\"")) {
                                     handleGatewayMessage(out, msg);
                                 }
@@ -2030,7 +2020,6 @@ public final class CodeMCP {
                     }
                 } catch (Exception e) {
                     System.err.println("[gateway] error: " + e.getClass().getName() + ": " + e.getMessage());
-                    e.printStackTrace();
                 }
                 if (++retries[0] > MAX_RETRIES) {
                     System.exit(1);
