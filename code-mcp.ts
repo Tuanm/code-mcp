@@ -1623,20 +1623,22 @@ function shutdownAggregator() {
 // ---------- tools ----------
 const tools: Record<string, Tool> = {
   read: {
-    description: "Read a file. Optional line range [start,end] (1-indexed, inclusive).",
+    description: "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
     inputSchema: {
       type: "object",
       properties: {
         cwd: { type: "string" },
         path: { type: "string" },
         range: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 },
+        no_truncate: { type: "boolean" },
       },
       required: ["cwd", "path"],
     },
-    handler: async ({ cwd, path, range }) => {
+    handler: async ({ cwd, path, range, no_truncate }) => {
       const r = safeResolve(cwd, path);
       if (!r.ok) throw new Error(r.reason);
       const text = await file(r.path).text();
+      if (no_truncate) return text;
       if (!range) return text;
       const lines = text.split("\n");
       const [s, e] = range;

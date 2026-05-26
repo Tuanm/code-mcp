@@ -169,11 +169,10 @@ def safe_resolve(cwd: str, user_path: str) -> tuple[bool, Path, str]:
         cwd_path = Path(cwd).resolve()
         # Handle both absolute paths and relative paths
         if Path(user_path).is_absolute():
+            # Absolute paths: resolve symlinks but keep absolute
             full_path = Path(user_path).resolve()
         else:
-            full_path = cwd_path / user_path
-        # Normalize to resolve any .. or . components
-        full_path = full_path.resolve()
+            full_path = (cwd_path / user_path).resolve()
         # Ensure the resolved path is within cwd
         try:
             full_path.relative_to(cwd_path)
@@ -382,9 +381,9 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
 
         if method == "tools/call":
             tool_name = params.get("name", "") if params else ""
-            tool_params = params.get("params", {}) if params else {}
+            tool_params = params.get("arguments", {}) if params else {}
 
-            cwd = tool_params.get("cwd", ".")
+            cwd = tool_params.get("cwd", ".") if tool_params else "."
 
             if tool_name == "read":
                 result = read_file(tool_params.get("path", ""), cwd)

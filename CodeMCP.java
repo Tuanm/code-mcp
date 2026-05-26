@@ -786,9 +786,10 @@ public final class CodeMCP {
     // ===== TOOL HANDLERS =====
     
     // --- read tool ---
-    private static String handleRead(String cwd, String path, int[] range) throws IOException {
+    private static String handleRead(String cwd, String path, int[] range, boolean noTruncate) throws IOException {
         Path file = safeResolveFile(cwd, path);
         String content = Files.readString(file);
+        if (noTruncate) return content;
         if (range == null) return content;
         String[] lines = content.split("\n");
         int start = Math.max(0, range[0] - 1);
@@ -1307,10 +1308,11 @@ public final class CodeMCP {
                 );
                 case "tools/list" -> {
                     List<Map<String, Object>> tools = new ArrayList<>();
-                    tools.add(makeTool("read", "Read a file. Optional line range [start,end] (1-indexed, inclusive).",
+                    tools.add(makeTool("read", "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
                         List.of(Map.of("name", "cwd", "type", "string"),
                                Map.of("name", "path", "type", "string"),
-                               Map.of("name", "range", "type", "array", "items", Map.of("type", "number")))));
+                               Map.of("name", "range", "type", "array", "items", Map.of("type", "number")),
+                               Map.of("name", "no_truncate", "type", "boolean"))));
 
                     tools.add(makeTool("write", "Write/overwrite a file with the given content.",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
@@ -1426,7 +1428,8 @@ public final class CodeMCP {
                             case "read" -> handleRead(
                                 (String) args.get("cwd"),
                                 (String) args.get("path"),
-                                parseRange(args.get("range")));
+                                parseRange(args.get("range")),
+                                Boolean.TRUE.equals(args.get("no_truncate")));
                             case "write" -> handleWrite(
                                 (String) args.get("cwd"),
                                 (String) args.get("path"),
