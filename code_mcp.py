@@ -50,9 +50,9 @@ shutting_down = False
 port = DEFAULT_PORT
 token: Optional[str] = None
 gateway_domain: Optional[str] = None
-gateway_ws: Optional[socket.socket] = None
 gateway_device_id: Optional[str] = None
 gateway_lock = threading.Lock()
+assigned_device_id: Optional[str] = None
 
 
 class ShellType(Enum):
@@ -98,8 +98,12 @@ def detect_shell_type() -> ShellType:
 shell_type = detect_shell_type()
 
 
-def parse_args(args: list[str]) -> None:
-    global port, token, gateway_domain
+def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None]:
+    """Returns (port, token, gateway_domain, device_id)."""
+    port = DEFAULT_PORT
+    token = None
+    gateway_domain = None
+    device_id = None
     i = 0
     while i < len(args):
         arg = args[i]
@@ -112,11 +116,15 @@ def parse_args(args: list[str]) -> None:
         elif arg == "--gateway" and i + 1 < len(args):
             gateway_domain = args[i + 1]
             i += 2
+        elif arg == "--id" and i + 1 < len(args):
+            device_id = args[i + 1]
+            i += 2
         elif arg == "-h" or arg == "--help":
             print(USAGE)
             sys.exit(0)
         else:
             i += 1
+    return port, token, gateway_domain, device_id
 
 
 USAGE = """Code MCP - Minimal MCP server over HTTP
@@ -127,6 +135,7 @@ Flags:
   --port <n>        Listen port (default: 7777)
   --token <s>       Require ?token=<s> on every request
   --gateway <url>   Connect to gateway server (wss:// or https://)
+  --id <uuid>       Use specific device ID for gateway connection
 
 Tools: read, write, edit, multi_edit, bash, grep, find, ls, job, mcp
 """
@@ -428,14 +437,15 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
         self.send_json({"error": "not found"}, 404)
 
 
-def start_gateway_client(domain: str) -> None:
+def start_gateway_client(domain: str, device_id: str | None) -> None:
     """Connect to gateway and relay requests."""
-    global gateway_ws, gateway_device_id
+    global gateway_ws, gateway_device_id, assigned_device_id
 
-    def build_url(d: str) -> str:
-        if d.startswith("wss://") or d.startswith("https://"):
-            return d + "/ws"
-        return "wss://" + d + "/ws"
+    def build_url(d: str, dev_id: str | None) -> str:
+        base = d if d.startswith("wss://") or d.startswith("https://") else "wss://" + d
+        if dev_id:
+            return base + "/ws?deviceId=" + dev_id
+        return base + "/ws"
 
     def send_ws_frame(sock, data: bytes):
         frame = bytearray()
@@ -503,7 +513,7 @@ def start_gateway_client(domain: str) -> None:
 
     while True:
         try:
-            url = build_url(domain)
+            url = build_url(domain, device_id)
             print(f"[gateway] connecting to {url}", file=sys.stderr)
 
             uri = urllib.parse.urlparse(url)
@@ -585,15 +595,15 @@ def signal_handler(sig, frame):
 
 
 def main():
-    global port, token, gateway_domain
+    global port, token, gateway_domain, assigned_device_id
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    parse_args(sys.argv[1:])
+    port, token, gateway_domain, assigned_device_id = parse_args(sys.argv[1:])
 
     if gateway_domain:
-        t = threading.Thread(target=start_gateway_client, args=(gateway_domain,), daemon=True)
+        t = threading.Thread(target=start_gateway_client, args=(gateway_domain, assigned_device_id), daemon=True)
         t.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", port), MCPRequestHandler)

@@ -96,6 +96,7 @@ Options:
   --domain <host>        Use the given public hostname (tunnel must already route it here). Mutex with --public.
   --mcp <path>           Aggregate tools from external MCP servers defined in the given JSON config.
   --gateway <domain>   Connect to a gateway server and tunnel requests (wss://{domain}/ws).
+  --id <uuid>           Use specific device ID for gateway connection.
   -h, --help            Show this help and exit`;
 
 let args!: Record<string, any>;
@@ -111,6 +112,7 @@ try {
       domain: { type: "string" },
       mcp: { type: "string" },
       gateway: { type: "string" },
+      id: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: true,
@@ -125,7 +127,7 @@ if (args.help) {
   console.log(USAGE);
   process.exit(0);
 }
-const port = Number(args.port ?? Bun.env.PORT ?? 7777);
+const port = Number(args.port ?? 7777);
 const token: string | undefined = args.token;
 const memoryEnabled = args["enable-memory"] === true;
 const disallowedTools: string[] = args["disallowed-tools"]
@@ -134,6 +136,7 @@ const disallowedTools: string[] = args["disallowed-tools"]
 const makePublic = args.public === true;
 const domain: string | undefined = args.domain;
 const gatewayDomain: string | undefined = args.gateway;
+const assignedDeviceId: string | undefined = args.id;
 const mcpConfigPath: string | undefined = args.mcp;
 
 if (makePublic && domain) {
@@ -1133,7 +1136,7 @@ function unloadAllForCwd(cwd: string): { success: boolean } {
 }
 
 function aggregatorLogDir(): string {
-  const dir = resolve(Bun.env.HOME ?? process.cwd(), ".code-mcp", "logs");
+  const dir = resolve(process.env.HOME ?? process.cwd(), ".code-mcp", "logs");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -2725,14 +2728,14 @@ if (makePublic) {
 // If --gateway is set, connect to the gateway server via WebSocket and
 // tunnel remote requests to the local MCP handler.
 if (gatewayDomain) {
-  const deviceId = randomUUID();
+  const deviceId = assignedDeviceId ?? randomUUID();
   const localMcpUrl = `http://localhost:${port}/mcp`;
   const RECONNECT_DELAY_MS = 3000;
   const MAX_RETRIES = 10;
   let retries = 0;
 
   (function connect() {
-    const url = `wss://${gatewayDomain}/ws`;
+    const url = assignedDeviceId ? `wss://${gatewayDomain}/ws?deviceId=${assignedDeviceId}` : `wss://${gatewayDomain}/ws`;
     console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
     const ws = new WebSocket(url);
 

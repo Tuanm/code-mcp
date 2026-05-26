@@ -59,6 +59,7 @@ public final class CodeMCP {
     private static String mcpConfigPath = null;
     private static String publicBaseUrl = null;
     private static String gatewayDomain = null;
+    private static String assignedDeviceId = null;
     private static String uploadRoot;
     private static String spillRoot;
     private static boolean hasRg = false;
@@ -128,7 +129,7 @@ public final class CodeMCP {
         // Start gateway client if --gateway is set
         if (gatewayDomain != null) {
             try {
-                startGatewayClient(gatewayDomain);
+                startGatewayClient(gatewayDomain, assignedDeviceId);
             } catch (Exception e) {
                 System.err.println("[gateway] failed to start: " + e.getMessage());
             }
@@ -161,6 +162,11 @@ public final class CodeMCP {
                     if (++i >= args.length) usage();
                     gatewayDomain = args[i];
                 }
+                case "--id" -> {
+                    if (++i >= args.length) usage();
+                    assignedDeviceId = args[i];
+                    break;
+                }
                 case "-h", "--help" -> {
                     System.out.println(USAGE);
                     System.exit(0);
@@ -184,13 +190,14 @@ public final class CodeMCP {
         Usage: java CodeMCP.java [options]
         
         Options:
-          --port <n>             Listen port (default: 7777, or $PORT)
+          --port <n>             Listen port (default: 7777)
           --token <s>            Require ?token=<s> on every request (default: no auth)
           --enable-memory        Enable remember/forget/recall tools ($PWD/.memo.jsonl)
           --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
           --domain <host>        Use the given public hostname (tunnel must already route it here)
           --mcp <path>           Aggregate tools from external MCP servers defined in JSON config
           --gateway <domain>     Connect to a gateway server and tunnel requests (wss://{domain}/ws)
+          --id <uuid>           Use specific device ID for gateway connection
           -h, --help            Show this help and exit
         """;
     
@@ -1917,19 +1924,22 @@ public final class CodeMCP {
     }
 
     // ===== GATEWAY CLIENT =====
-    private static void startGatewayClient(String domain) throws Exception {
-        String deviceId = UUID.randomUUID().toString();
+    private static void startGatewayClient(String domain, String deviceIdParam) throws Exception {
+        String deviceId = deviceIdParam != null ? deviceIdParam : UUID.randomUUID().toString();
         int RECONNECT_DELAY_MS = 3000;
         int MAX_RETRIES = 10;
         int[] retries = {0};
 
         new Thread(() -> {
-            System.err.println("[gateway] starting client for: " + domain);
+            System.err.println("[gateway] starting client for: " + domain + " with deviceId: " + deviceId);
             while (true) {
                 try {
-                    String url = domain.startsWith("wss://") || domain.startsWith("https://")
-                        ? domain + "/ws"
-                        : "wss://" + domain + "/ws";
+                    String baseUrl = domain.startsWith("wss://") || domain.startsWith("https://")
+                        ? domain
+                        : "wss://" + domain;
+                    String url = deviceIdParam != null
+                        ? baseUrl + "/ws?deviceId=" + deviceIdParam
+                        : baseUrl + "/ws";
                     System.err.println("[gateway] connecting to " + url);
 
                     URI uri = URI.create(url);
