@@ -1918,7 +1918,9 @@ public final class CodeMCP {
         new Thread(() -> {
             while (true) {
                 try {
-                    String url = "wss://" + domain + "/ws";
+                    String url = domain.startsWith("wss://") || domain.startsWith("https://")
+                        ? domain + "/ws"
+                        : "wss://" + domain + "/ws";
 
                     URI uri = URI.create(url);
                     String host = uri.getHost();
