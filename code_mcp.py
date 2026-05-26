@@ -289,7 +289,7 @@ def execute_bash(command: str, cwd: str = ".") -> str:
         return f"ERROR: {e}"
 
 
-def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> str:
+def grep_files(pattern: str, paths: list[str], cwd: str = ".", glob: str | None = None) -> str:
     try:
         valid_paths = []
         for p in paths:
@@ -297,7 +297,16 @@ def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> str:
             if not ok:
                 return f"ERROR: {err}"
             valid_paths.append(str(full_path))
-        cmd = ["rg", "--json", "-n", pattern] + valid_paths if has_rg() else ["grep", "-rn", pattern] + valid_paths
+        if has_rg():
+            cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+            if glob:
+                cmd.extend(["--glob", glob])
+            cmd.extend([pattern] + valid_paths)
+        else:
+            cmd = ["grep", "-rn"]
+            if glob:
+                cmd.extend(["--include", glob])
+            cmd.extend([pattern] + valid_paths)
         result = subprocess.run(
             cmd,
             cwd=cwd,
@@ -560,7 +569,8 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                 result = execute_bash(tool_params.get("command", ""), cwd)
             elif tool_name == "grep":
                 result = grep_files(tool_params.get("pattern", ""),
-                                   [tool_params.get("path", ".")], cwd)
+                                   [tool_params.get("path", ".")], cwd,
+                                   tool_params.get("glob"))
             elif tool_name == "find":
                 result = find_files(tool_params.get("pattern", ""), cwd, tool_params.get("include_hidden", False))
             elif tool_name == "ls":
