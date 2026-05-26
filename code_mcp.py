@@ -513,8 +513,10 @@ def start_gateway_client(domain: str) -> None:
             context = ssl.create_default_context()
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            print(f"[gateway] connecting socket to {host}:{port}...", file=sys.stderr)
             ssock = context.wrap_socket(sock, server_hostname=host)
             ssock.connect((host, port))
+            print(f"[gateway] socket connected", file=sys.stderr)
             ssock.settimeout(60)
 
             ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -526,17 +528,22 @@ def start_gateway_client(domain: str) -> None:
                 f"Sec-WebSocket-Key: {ws_key}\r\n"
                 f"Sec-WebSocket-Version: 13\r\n\r\n"
             )
+            print(f"[gateway] sending WebSocket handshake...", file=sys.stderr)
             ssock.sendall(request.encode())
 
+            print(f"[gateway] waiting for response...", file=sys.stderr)
             resp = b""
             while b"\r\n\r\n" not in resp:
                 chunk = ssock.recv(4096)
                 if not chunk:
+                    print(f"[gateway] received empty chunk", file=sys.stderr)
                     break
                 resp += chunk
+                print(f"[gateway] received {len(resp)} bytes", file=sys.stderr)
 
+            print(f"[gateway] full response ({len(resp)} bytes): {resp.decode()[:500]}", file=sys.stderr)
             if "101" not in resp.decode():
-                print(f"[gateway] WebSocket upgrade failed. Response: {resp.decode()[:200]}", file=sys.stderr)
+                print("[gateway] WebSocket upgrade failed", file=sys.stderr)
                 time.sleep(3)
                 continue
 
