@@ -1933,8 +1933,11 @@ public final class CodeMCP {
                     int port = uri.getPort() > 0 ? uri.getPort() : 443;
 
                     SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
+                    System.err.println("[gateway] connecting to " + host + ":" + port);
                     try (SSLSocket sslSocket = (SSLSocket) sf.createSocket(host, port)) {
+                        System.err.println("[gateway] SSL handshake...");
                         sslSocket.startHandshake();
+                        System.err.println("[gateway] connected, sending WebSocket upgrade...");
                         DataOutputStream out = new DataOutputStream(sslSocket.getOutputStream());
                         InputStream in = sslSocket.getInputStream();
 
@@ -1953,13 +1956,16 @@ public final class CodeMCP {
                             if (resp.toString().contains("\r\n\r\n")) break;
                         }
                         if (!resp.toString().contains("101")) {
+                            System.err.println("[gateway] WebSocket upgrade failed, response: " + resp);
                             return;
                         }
+                        System.err.println("[gateway] WebSocket upgrade OK, response: " + resp.substring(0, Math.min(100, resp.length())));
 
                         retries[0] = 0;
 
                         String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
                         sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
+                        System.err.println("[gateway] register frame sent, waiting for response...");
 
                         sslSocket.setSoTimeout(60000);
 
