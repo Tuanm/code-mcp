@@ -393,12 +393,12 @@ def list_jobs() -> str:
     return "\n".join(lines)
 
 
-def start_job(command: str, cwd: str) -> dict:
+def start_job(command: str, cwd: str) -> str:
     global total_jobs, job_seq
     if total_jobs >= MAX_CONCURRENT_JOBS:
-        return {"error": f"max concurrent jobs ({MAX_CONCURRENT_JOBS}) exceeded", "success": False}
+        return f"ERROR: max concurrent jobs ({MAX_CONCURRENT_JOBS}) exceeded"
     if shutting_down:
-        return {"error": "server is shutting down", "success": False}
+        return "ERROR: server is shutting down"
 
     total_jobs += 1
     job_seq += 1
@@ -416,7 +416,7 @@ def start_job(command: str, cwd: str) -> dict:
         )
     except Exception as e:
         total_jobs -= 1
-        return {"error": f"failed to start job: {e}", "success": False}
+        return f"ERROR: failed to start job: {e}"
 
     job = {
         "id": job_id,
@@ -443,15 +443,15 @@ def start_job(command: str, cwd: str) -> dict:
     t = threading.Thread(target=pump_and_finalize, daemon=True)
     t.start()
 
-    return {"id": job_id, "success": True}
+    return f"started {job_id}"
 
 
-def stop_job(job_id: str, timeout_ms: int = 500) -> dict:
+def stop_job(job_id: str, timeout_ms: int = 500) -> str:
     if job_id not in jobs:
-        return {"error": f"no such job: {job_id}", "success": False}
+        return f"ERROR: no such job: {job_id}"
     job = jobs[job_id]
     if job["status"] != "running":
-        return {"id": job_id, "status": job["status"], "success": True}
+        return f"{job_id} already {job['status']}"
 
     proc = job["proc"]
     proc.terminate()
@@ -460,17 +460,18 @@ def stop_job(job_id: str, timeout_ms: int = 500) -> dict:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    return {"id": job_id, "status": "stopped", "success": True}
+    return f"{job_id} stopped"
 
 
-def view_job(job_id: str) -> dict:
+def view_job(job_id: str) -> str:
     if job_id not in jobs:
-        return {"error": f"no such job: {job_id}", "success": False}
+        return f"ERROR: no such job: {job_id}"
     job = jobs[job_id]
     status = job.get("status", "unknown")
-    exit_info = f" {job.get('exit_code')}" if job.get("exit_code") is not None else ""
+    exit_code = job.get("exit_code")
     output = job.get("output", "")
-    return {"id": job_id, "status": status, "exit_code": job.get("exit_code"), "output": output}
+    exit_info = f" {exit_code}" if exit_code is not None else ""
+    return f"[{job_id}] {job.get('command', '')}\n[{status}{exit_info}]\n{output}"
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -698,7 +699,8 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             result = execute_bash(tool_params.get("command", ""), cwd)
         elif tool_name == "grep":
             result = grep_files(tool_params.get("pattern", ""),
-                               [tool_params.get("path", ".")], cwd)
+                               [tool_params.get("path", ".")], cwd,
+                               tool_params.get("glob"))
         elif tool_name == "find":
             result = find_files(tool_params.get("pattern", ""), cwd)
         elif tool_name == "ls":
@@ -709,25 +711,25 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                 result = list_jobs()
             elif mode == "start":
                 cmd = tool_params.get("command")
-                result = start_job(cmd, cwd) if cmd else {"error": "command required", "success": False}
+                result = start_job(cmd, cwd) if cmd else "ERROR: command required"
             elif mode == "stop":
                 result = stop_job(tool_params.get("command", ""), tool_params.get("timeout_ms", 500))
             elif mode == "view":
                 result = view_job(tool_params.get("command", ""))
             else:
-                result = {"error": f"unknown mode: {mode}", "success": False}
+                result = f"ERROR: unknown mode: {mode}"
         elif tool_name == "remember":
             result = handle_remember(cwd, tool_params.get("memo", ""), tool_params.get("tags"))
         elif tool_name == "forget":
             try:
                 result = handle_forget(cwd, tool_params.get("memo_id", 0))
             except ValueError as e:
-                result = {"error": str(e), "success": False}
+                result = f"ERROR: {e}"
         elif tool_name == "recall":
             result = handle_recall(cwd, tool_params.get("query"), tool_params.get("tags"),
                                    tool_params.get("limit", 20), tool_params.get("offset", 0))
         else:
-            result = {"error": f"Unknown tool: {tool_name}", "success": False}
+            result = f"ERROR: Unknown tool: {tool_name}"
 
         return jsonrpc_response(req_id, result)
 
