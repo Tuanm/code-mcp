@@ -192,7 +192,7 @@ public final class CodeMCP {
         Options:
           --port <n>             Listen port (default: 7777)
           --token <s>            Require ?token=<s> on every request (default: no auth)
-          --enable-memory        Enable remember/forget/recall tools ($PWD/.memo.jsonl)
+          --enable-memory        Enable remember/forget/recall tools
           --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
           --domain <host>        Use the given public hostname (tunnel must already route it here)
           --mcp <path>           Aggregate tools from external MCP servers defined in JSON config
@@ -1395,7 +1395,7 @@ public final class CodeMCP {
                     }
                     
                     if (memoryEnabled) {
-                        tools.add(makeTool("remember", "Append a memo to .memo.jsonl.",
+                        tools.add(makeTool("remember", "Append a memo.",
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "memo", "type", "string", "required", true),
                                    Map.of("name", "tags", "type", "array", "items", Map.of("type", "string")))));

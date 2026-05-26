@@ -12,7 +12,7 @@
 // Flags:
 //   --port <n>         listen port (default: 7777, or $PORT)
 //   --token <s>        require ?token=<s> on every request (default: no auth)
-//   --enable-memory    enable the remember/forget/recall tools (persist to {cwd}/.memo.jsonl)
+//   --enable-memory    enable the remember/forget/recall tools
 //   --public           expose via a Cloudflare quick tunnel (requires cloudflared)
 //   --domain <host>    use the given public hostname (assumes tunnel already routes it to this port). Mutex with --public.
 //   --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
@@ -90,7 +90,7 @@ const USAGE = `Usage: bun code-mcp.ts [options]
 Options:
   --port <n>             Listen port (default: 7777, or $PORT)
   --token <s>            Require ?token=<s> on every request (default: no auth)
-  --enable-memory        Enable remember/forget/recall tools ({cwd}/.memo.jsonl)
+  --enable-memory        Enable remember/forget/recall tools
   --disallowed-tools     Comma-separated list of tools to disable (highest priority)
   --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
   --domain <host>        Use the given public hostname (tunnel must already route it here). Mutex with --public.
@@ -2116,7 +2116,7 @@ const tools: Record<string, Tool> = {
   },
 
   remember: {
-    description: "Append a memo to {cwd}/.memo.jsonl. Returns the assigned id.",
+    description: "Append a memo. Returns the assigned id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2138,7 +2138,7 @@ const tools: Record<string, Tool> = {
   },
 
   forget: {
-    description: "Remove a memo by id from {cwd}/.memo.jsonl.",
+    description: "Remove a memo by id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2158,7 +2158,7 @@ const tools: Record<string, Tool> = {
   },
 
   recall: {
-    description: "Search memos in {cwd}/.memo.jsonl by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
+    description: "Search memos by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
     inputSchema: {
       type: "object",
       properties: {

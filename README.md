@@ -39,7 +39,7 @@ java CodeMCP.java --gateway wss://gateway.example.workers.dev --port 7777
 |------|-------------|---------|
 | `--port <n>` | Listen port | `7777` or `$PORT` |
 | `--token <s>` | Require `?token=<s>` on every request | no auth |
-| `--enable-memory` | Enable remember/forget/recall tools (persists to `{cwd}/.memo.jsonl`) | disabled |
+| `--enable-memory` | Enable remember/forget/recall tools | disabled |
 | `--disallowed-tools` | Comma-separated list of tools to disable | none |
 | `--public` | Expose via Cloudflare quick tunnel (requires `cloudflared`) | disabled |
 | `--domain <host>` | Use existing public hostname (mutually exclusive with `--public`) | none |
