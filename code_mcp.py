@@ -202,53 +202,72 @@ def safe_resolve(cwd: str, user_path: str) -> tuple[bool, Path, str]:
         return False, Path("."), f"invalid path: {user_path}"
 
 
-def read_file(path: str, cwd: str = ".") -> dict:
+def read_file(path: str, cwd: str = ".") -> str:
     try:
         ok, full_path, err = safe_resolve(cwd, path)
         if not ok:
-            return {"error": err, "success": False}
-        content = full_path.read_text(errors="replace")
-        return {"content": content, "success": True}
+            return f"ERROR: {err}"
+        return full_path.read_text(errors="replace")
     except Exception as e:
-        return {"error": str(e), "success": False}
+        return f"ERROR: {e}"
 
 
-def write_file(path: str, content: str, cwd: str = ".") -> dict:
+def write_file(path: str, content: str, cwd: str = ".") -> str:
     try:
         ok, full_path, err = safe_resolve(cwd, path)
         if not ok:
-            return {"error": err, "success": False}
+            return f"ERROR: {err}"
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content)
-        return {"success": True, "path": str(full_path)}
+        return f"wrote {len(content)} bytes to {path}"
     except Exception as e:
-        return {"error": str(e), "success": False}
+        return f"ERROR: {e}"
 
 
-def edit_file(path: str, old_str: str, new_str: str, cwd: str = ".") -> dict:
+def edit_file(path: str, old_str: str, new_str: str, cwd: str = ".") -> str:
     try:
         ok, full_path, err = safe_resolve(cwd, path)
         if not ok:
-            return {"error": err, "success": False}
+            return f"ERROR: {err}"
         content = full_path.read_text()
         if old_str not in content:
-            return {"error": "String not found", "success": False}
+            return f"ERROR: String not found"
+        if content.count(old_str) > 1:
+            return f"ERROR: old_str not unique"
         new_content = content.replace(old_str, new_str, 1)
         full_path.write_text(new_content)
-        return {"success": True}
+        return "ok"
     except Exception as e:
-        return {"error": str(e), "success": False}
+        return f"ERROR: {e}"
 
 
-def multi_edit_files(edits: list[dict], cwd: str = ".") -> dict:
-    results = []
-    for edit in edits:
-        result = edit_file(edit["path"], edit["old_str"], edit["new_str"], cwd)
-        results.append(result)
-    return {"results": results}
+def multi_edit_files(edits: list[dict], cwd: str = ".") -> str:
+    try:
+        originals = {}
+        for i, edit in enumerate(edits):
+            path = edit["path"]
+            old_str = edit["old_str"]
+            new_str = edit["new_str"]
+            ok, full_path, err = safe_resolve(cwd, path)
+            if not ok:
+                return f"ERROR: edit #{i+1}: {err}"
+            if path not in originals:
+                originals[path] = full_path.read_text()
+            text = originals[path]
+            if old_str not in text:
+                return f"ERROR: edit #{i+1} ({path}): old_str not found"
+            if text.count(old_str) > 1:
+                return f"ERROR: edit #{i+1} ({path}): old_str not unique"
+            new_content = text.replace(old_str, new_str, 1)
+            originals[path] = new_content
+        for path, new_content in originals.items():
+            Path(path).write_text(new_content)
+        return "ok"
+    except Exception as e:
+        return f"ERROR: {e}"
 
 
-def execute_bash(command: str, cwd: str = ".") -> dict:
+def execute_bash(command: str, cwd: str = ".") -> str:
     try:
         result = subprocess.run(
             command,
@@ -261,26 +280,22 @@ def execute_bash(command: str, cwd: str = ".") -> dict:
         )
         stdout = result.stdout[-MAX_OUTPUT:] if len(result.stdout) > MAX_OUTPUT else result.stdout
         stderr = result.stderr[-OUTPUT_CAP_KEEP:] if len(result.stderr) > OUTPUT_CAP_KEEP else result.stderr
-        return {
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": result.returncode,
-            "success": True
-        }
+        if stderr:
+            return stdout + "\n" + stderr
+        return stdout
     except subprocess.TimeoutExpired:
-        return {"error": "Timeout", "exit_code": -1, "success": False}
+        return "ERROR: Timeout"
     except Exception as e:
-        return {"error": str(e), "exit_code": -1, "success": False}
+        return f"ERROR: {e}"
 
 
-def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> dict:
+def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> str:
     try:
-        # Validate each path is within cwd
         valid_paths = []
         for p in paths:
             ok, full_path, err = safe_resolve(cwd, p)
             if not ok:
-                return {"error": err, "success": False}
+                return f"ERROR: {err}"
             valid_paths.append(str(full_path))
         cmd = ["rg", "--json", "-n", pattern] + valid_paths if has_rg() else ["grep", "-rn", pattern] + valid_paths
         result = subprocess.run(
@@ -290,20 +305,47 @@ def grep_files(pattern: str, paths: list[str], cwd: str = ".") -> dict:
             text=True,
             timeout=30
         )
-        return {"matches": result.stdout, "success": True}
+        if result.stdout:
+            return result.stdout
+        if result.returncode == 1:
+            return "(no matches)"
+        return f"ERROR (exit={result.returncode}): {result.stderr}"
     except Exception as e:
-        return {"error": str(e), "success": False}
+        return f"ERROR: {e}"
 
 
-def find_files(pattern: str, cwd: str = ".") -> dict:
+def find_files(pattern: str, cwd: str = ".", include_hidden: bool = False) -> str:
     try:
         ok, full_path, err = safe_resolve(cwd, ".")
         if not ok:
-            return {"error": err, "success": False}
-        matches = list(full_path.rglob(pattern))
-        return {"matches": [str(m) for m in matches[:100]], "success": True}
+            return f"ERROR: {err}"
+        pat = pattern if "/" in pattern or "\\" in pattern else f"**/{pattern}"
+        matches = list(Path(full_path).glob(pat))
+        noise_dirs = {"node_modules", ".git", ".next", ".nuxt", ".turbo", ".cache",
+                      "dist", "build", "out", "target", "coverage",
+                      ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+                      ".idea", ".vscode"}
+        results = []
+        for m in matches[:10000]:
+            if m.is_dir():
+                continue
+            parts = m.parts
+            skip = False
+            for seg in parts:
+                if seg in noise_dirs and seg not in parts:
+                    skip = True
+                    break
+                if not include_hidden and seg.startswith(".") and seg not in [".", ".."]:
+                    if not pattern.startswith("."):
+                        skip = True
+                        break
+            if not skip:
+                results.append(str(m))
+        if not results:
+            return "(no matches)"
+        return "\n".join(results[:100])
     except Exception as e:
-        return {"error": str(e), "success": False}
+        return f"ERROR: {e}"
 
 
 def list_directory(path: str = ".", cwd: str = ".") -> str:
@@ -474,15 +516,15 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["cwd", "path", "content"]}},
                 {"name": "edit", "description": "Replace old_str with new_str in a file. old_str must occur exactly once.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["cwd", "path", "old_str", "new_str"]}},
-                {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files.",
+                {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files. Validates every edit first; if any fails, nothing is written. Edits to the same file are applied in order.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}, "required": ["cwd", "edits"]}},
-                {"name": "bash", "description": "Execute shell command.",
+                {"name": "bash", "description": "Run a bash command. Block until exit, return combined stdout+stderr.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "command"]}},
-                {"name": "grep", "description": "Search for pattern in files.",
+                {"name": "grep", "description": "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, "required": ["cwd", "pattern"]}},
-                {"name": "find", "description": "Find files by pattern.",
-                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd", "pattern"]}},
-                {"name": "ls", "description": "List directory contents.",
+                {"name": "find", "description": "Find files by glob pattern. Supports ** for recursive. Skips common noise dirs unless pattern explicitly references them.",
+                 "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "include_hidden": {"type": "boolean"}}, "required": ["cwd", "pattern"]}},
+                {"name": "ls", "description": "List directory entries with type and size.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd"]}},
                 {"name": "job", "description": "Manage background jobs. mode: list|view|start|stop. command required for start; id (passed as command) required for view/stop. cwd used only for start.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["list", "view", "start", "stop"]}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "mode"]}},
@@ -520,7 +562,7 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                 result = grep_files(tool_params.get("pattern", ""),
                                    [tool_params.get("path", ".")], cwd)
             elif tool_name == "find":
-                result = find_files(tool_params.get("pattern", ""), cwd)
+                result = find_files(tool_params.get("pattern", ""), cwd, tool_params.get("include_hidden", False))
             elif tool_name == "ls":
                 result = list_directory(tool_params.get("path", "."), cwd)
             elif tool_name == "job":
@@ -640,15 +682,40 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
         elif tool_name == "edit":
             result = edit_file(tool_params.get("path", ""), tool_params.get("old_str", ""),
                               tool_params.get("new_str", ""), cwd)
+        elif tool_name == "multi_edit":
+            result = multi_edit_files(tool_params.get("edits", []), cwd)
         elif tool_name == "bash":
             result = execute_bash(tool_params.get("command", ""), cwd)
         elif tool_name == "grep":
             result = grep_files(tool_params.get("pattern", ""),
-                               tool_params.get("paths", ["."]), cwd)
+                               [tool_params.get("path", ".")], cwd)
         elif tool_name == "find":
             result = find_files(tool_params.get("pattern", ""), cwd)
         elif tool_name == "ls":
             result = list_directory(tool_params.get("path", "."), cwd)
+        elif tool_name == "job":
+            mode = tool_params.get("mode", "list")
+            if mode == "list":
+                result = list_jobs()
+            elif mode == "start":
+                cmd = tool_params.get("command")
+                result = start_job(cmd, cwd) if cmd else {"error": "command required", "success": False}
+            elif mode == "stop":
+                result = stop_job(tool_params.get("command", ""), tool_params.get("timeout_ms", 500))
+            elif mode == "view":
+                result = view_job(tool_params.get("command", ""))
+            else:
+                result = {"error": f"unknown mode: {mode}", "success": False}
+        elif tool_name == "remember":
+            result = handle_remember(cwd, tool_params.get("memo", ""), tool_params.get("tags"))
+        elif tool_name == "forget":
+            try:
+                result = handle_forget(cwd, tool_params.get("memo_id", 0))
+            except ValueError as e:
+                result = {"error": str(e), "success": False}
+        elif tool_name == "recall":
+            result = handle_recall(cwd, tool_params.get("query"), tool_params.get("tags"),
+                                   tool_params.get("limit", 20), tool_params.get("offset", 0))
         else:
             result = {"error": f"Unknown tool: {tool_name}", "success": False}
 
