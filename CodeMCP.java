@@ -2011,7 +2011,7 @@ public final class CodeMCP {
                         }
                     }
                 } catch (Exception e) {
-                    // Gateway error, will retry
+                    System.err.println("[gateway] connection error: " + e.getMessage());
                 }
                 if (++retries[0] > MAX_RETRIES) {
                     System.exit(1);
