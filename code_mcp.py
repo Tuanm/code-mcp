@@ -487,8 +487,8 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
         """Handle incoming request from gateway, relay to local MCP."""
         req_id, method, params = parse_jsonrpc_request(req)
         tool_name = params.get("name", "") if params else ""
-        tool_params = params.get("params", {}) if params else {}
-        cwd = tool_params.get("cwd", ".")
+        tool_params = params.get("arguments", {}) if params else {}
+        cwd = tool_params.get("cwd", ".") if tool_params else "."
 
         if tool_name == "read":
             result = read_file(tool_params.get("path", ""), cwd)
