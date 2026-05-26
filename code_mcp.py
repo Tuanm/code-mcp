@@ -511,6 +511,11 @@ def start_gateway_client(domain: str) -> None:
             port = uri.port or 443
 
             context = ssl.create_default_context()
+            # Try to use Windows cert store on Windows and set safer options
+            if sys.platform == "win32":
+                context.load_default_certs()
+            # Set TLS version to match browsers
+            context.minimum_version = ssl.TLSVersion.TLSv1.2
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             print(f"[gateway] connecting socket to {host}:{port}...", file=sys.stderr)
@@ -526,7 +531,10 @@ def start_gateway_client(domain: str) -> None:
                 f"Upgrade: websocket\r\n"
                 f"Connection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {ws_key}\r\n"
-                f"Sec-WebSocket-Version: 13\r\n\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
+                f"Accept: */*\r\n"
+                f"\r\n"
             )
             print(f"[gateway] sending WebSocket handshake...", file=sys.stderr)
             ssock.sendall(request.encode())
