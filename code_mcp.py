@@ -687,21 +687,34 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
         frame.extend(masked)
         sock.sendall(bytes(frame))
 
-    def recv_ws_frame(sock) -> bytes:
-        first = sock.recv(1)[0]
-        second = sock.recv(1)[0]
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", sock.recv(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", sock.recv(8))[0]
-        payload = b""
-        while len(payload) < length:
-            chunk = sock.recv(length - len(payload))
-            if not chunk:
-                break
-            payload += chunk
-        return payload
+    def recv_ws_frame(sock) -> bytes | None:
+        try:
+            first = sock.recv(1)
+            if not first:
+                return None
+            first = first[0]
+            second = sock.recv(1)
+            if not second:
+                return None
+            second = second[0]
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", sock.recv(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", sock.recv(8))[0]
+            payload = b""
+            while len(payload) < length:
+                chunk = sock.recv(length - len(payload))
+                if not chunk:
+                    break
+                payload += chunk
+            return payload
+        except ssl.SSLError as e:
+            print(f"[gateway] SSL error: {e}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"[gateway] recv error: {e}", file=sys.stderr)
+            return None
 
     def handle_request(req: dict) -> dict:
         """Handle incoming request from gateway, relay to local MCP."""
@@ -771,12 +784,12 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             print(f"[gateway] connecting socket to {host}:{port}...", file=sys.stderr)
             if use_ssl:
                 context = ssl.create_default_context()
-                if sys.platform == "win32":
-                    context.load_default_certs()
                 ssock = context.wrap_socket(sock, server_hostname=host)
+                ssock.connect((host, port))
+                ssock.do_handshake()
             else:
                 ssock = sock
-            ssock.connect((host, port))
+                ssock.connect((host, port))
             print(f"[gateway] socket connected", file=sys.stderr)
             ssock.settimeout(60)
 
