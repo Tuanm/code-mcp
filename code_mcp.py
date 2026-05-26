@@ -872,7 +872,9 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                     msg = json.loads(payload.decode())
                     if "request" in msg:
                         resp = handle_request(msg["request"])
-                        send_ws_frame(ssock, json.dumps(resp).encode())
+                        # Wrap in TunnelResponse format expected by gateway
+                        tunnel_resp = {"id": msg["id"], "response": resp}
+                        send_ws_frame(ssock, json.dumps(tunnel_resp).encode())
                 except socket.timeout:
                     continue
                 except Exception as e:
