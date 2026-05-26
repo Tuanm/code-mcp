@@ -401,10 +401,10 @@ public final class CodeMCP {
             Files.writeString(path, text, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         } catch (IOException e) {
             System.err.println("[spill] failed to write " + path + ": " + e.getMessage());
-            return head + "\n... [TRUNCATED: full output is " + bytes.length + " bytes (" + totalLines + " lines); spill to disk FAILED (" + e.getMessage() + ")] ...\n";
+            return head + "\n[TRUNCATED: full output is " + bytes.length + " bytes (" + totalLines + " lines); spill to disk FAILED (" + e.getMessage() + ")]\n";
         }
         
-        String marker = "\n... [TRUNCATED: " + bytes.length + " bytes (" + totalLines + " lines) saved to " + path + " — use read with range or grep to view the remaining content] ...\n";
+        String marker = "\n[TRUNCATED: " + bytes.length + " bytes (" + totalLines + " lines) saved to " + path + " — use read with range or grep to view the remaining content]\n";
         return head + marker;
     }
     

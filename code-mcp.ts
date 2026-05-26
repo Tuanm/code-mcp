@@ -226,14 +226,14 @@ async function maybeSpillText(text: string, toolName?: string): Promise<string> 
     // Return the preview with a marker explaining what happened.
     console.error(`[spill] failed to write ${path}: ${e?.message ?? e}`);
     const failMarker =
-      `\n... [TRUNCATED: full output is ${bytes} bytes (${totalLines} lines); ` +
-      `spill to disk FAILED (${e?.message ?? "unknown error"})] ...\n`;
+      `\n[TRUNCATED: full output is ${bytes} bytes (${totalLines} lines); ` +
+      `spill to disk FAILED (${e?.message ?? "unknown error"})]\n`;
     return head + failMarker;
   }
 
   const marker =
-    `\n... [TRUNCATED: ${bytes} bytes (${totalLines} lines) saved to ${path} — ` +
-    `use read with range or grep to view the remaining content] ...\n`;
+    `\n[TRUNCATED: ${bytes} bytes (${totalLines} lines) saved to ${path} — ` +
+    `use read with range or grep to view the remaining content]\n`;
   return head + marker;
 }
 
