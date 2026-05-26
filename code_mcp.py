@@ -792,7 +792,7 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
 
             uri = urllib.parse.urlparse(url)
             host = uri.hostname or domain
-            port = uri.port or 443
+            port = uri.port or (443 if uri.scheme == "wss" else 80)
 
             use_ssl = url.startswith("wss://") or url.startswith("https://")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
