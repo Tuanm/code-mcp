@@ -511,11 +511,9 @@ def start_gateway_client(domain: str) -> None:
             port = uri.port or 443
 
             context = ssl.create_default_context()
-            # Try to use Windows cert store on Windows and set safer options
+            # Try to use Windows cert store on Windows
             if sys.platform == "win32":
                 context.load_default_certs()
-            # Set TLS version to match browsers
-            context.minimum_version = ssl.TLSVersion.TLSv1.2
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             print(f"[gateway] connecting socket to {host}:{port}...", file=sys.stderr)
