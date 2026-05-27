@@ -63,8 +63,10 @@ function detectShell(): ShellType {
     if (process.env.PSModulePath) return "powershell";
     return "cmd";
   }
+  // Prefer bash if present (matches Python/Java); fall back to $SHELL hint then sh.
+  if (spawnSync({ cmd: ["sh", "-c", "command -v bash"], stdout: "ignore", stderr: "ignore" }).exitCode === 0) return "bash";
   const shell = process.env.SHELL;
-  if (shell && shell.endsWith("bash")) return "bash";
+  if (shell && /\/(bash|zsh|fish|ksh)$/.test(shell)) return shell.endsWith("bash") ? "bash" : "sh";
   return "sh";
 }
 const DETECTED_SHELL = detectShell();
@@ -89,15 +91,16 @@ const USAGE = `Usage: bun code-mcp.ts [options]
 
 Options:
   --port <n>             Listen port (default: 7777, or $PORT)
-  --token <s>            Require ?token=<s> on every request (default: no auth)
+  --bind <addr>          Bind address (default: 127.0.0.1)
+  --token <s>            Require ?token=<s> or Bearer auth on every request
   --enable-memory        Enable remember/forget/recall tools
   --disallowed-tools     Comma-separated list of tools to disable (highest priority)
-  --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
-  --domain <host>        Use the given public hostname (tunnel must already route it here). Mutex with --public.
-  --mcp <path>           Aggregate tools from external MCP servers defined in the given JSON config.
-  --gateway <domain>   Connect to a gateway server and tunnel requests (wss://{domain}/ws).
-  --id <uuid>           Use specific device ID for gateway connection.
-  -h, --help            Show this help and exit`;
+  --public               Expose via Cloudflare quick tunnel (requires cloudflared)
+  --domain <host>        Use given public hostname (mutually exclusive with --public)
+  --mcp <path>           Aggregate tools from external MCP servers (JSON config)
+  --gateway <domain>     Connect to gateway server (wss://{domain}/ws)
+  --id <uuid>            Use specific device ID for gateway connection
+  -h, --help             Show this help and exit`;
 
 let args!: Record<string, any>;
 try {
@@ -105,6 +108,7 @@ try {
     args: Bun.argv.slice(2),
     options: {
       port: { type: "string" },
+      bind: { type: "string" },
       token: { type: "string" },
       "enable-memory": { type: "boolean" },
       "disallowed-tools": { type: "string" },
@@ -127,7 +131,13 @@ if (args.help) {
   console.log(USAGE);
   process.exit(0);
 }
-const port = Number(args.port ?? 7777);
+const portRaw = args.port ?? process.env.PORT ?? 7777;
+const port = Number(portRaw);
+if (!Number.isFinite(port) || port < 1 || port > 65535 || !Number.isInteger(port)) {
+  console.error(`error: invalid port: ${portRaw}`);
+  process.exit(2);
+}
+const bindAddr: string = typeof args.bind === "string" ? args.bind : "127.0.0.1";
 const token: string | undefined = args.token;
 const memoryEnabled = args["enable-memory"] === true;
 const disallowedTools: string[] = args["disallowed-tools"]
@@ -142,6 +152,10 @@ const mcpConfigPath: string | undefined = args.mcp;
 if (makePublic && domain) {
   console.error("error: --public and --domain are mutually exclusive\n");
   console.error(USAGE);
+  process.exit(2);
+}
+if (domain && !/^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$/.test(domain)) {
+  console.error(`error: invalid --domain: ${domain}`);
   process.exit(2);
 }
 
@@ -173,9 +187,8 @@ const RESULT_SPILL_HEAD = 3_000;
 // Best-effort cleanup of any stale spill files from a previous run. Failure
 // is non-fatal: the spill directory may not exist yet, may belong to another
 // user, or may be on a read-only filesystem.
-try {
-  rmSync(RESULT_SPILL_ROOT, { recursive: true, force: true });
-} catch { /* ignore */ }
+// We DO NOT rmSync the shared root because concurrent instances would clobber
+// each other; we just ensure our per-PID subdirectory exists.
 try {
   mkdirSync(RESULT_SPILL_ROOT, { recursive: true });
 } catch (e: any) {
@@ -292,6 +305,28 @@ function verifyUploadSessionId(id: string): { ok: true } | { ok: false; reason: 
 const OUTPUT_CAP_MAX = 1_000_000;
 const OUTPUT_CAP_KEEP = 500_000;
 
+// Spawn-time env allow-list. Used for both .mcp.json children AND user-invoked
+// shell tools. The MCP token is itself sensitive (full RCE on hand-off), so we
+// limit blast radius: even if an attacker phishes the token, they can't trivially
+// exfiltrate AWS_*, OPENAI_API_KEY, etc. — those vars are not forwarded.
+// Users who need extra vars in their commands should set them inline:
+//   bash -c "FOO=$FOO_FROM_FILE my-cmd"
+const SPAWN_ENV_ALLOWLIST = new Set([
+  "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TZ",
+  "TMPDIR", "TEMP", "TMP",
+  "SystemRoot", "SystemDrive", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+  "PROGRAMFILES", "PROGRAMDATA", "WINDIR", "COMSPEC", "PATHEXT",
+]);
+
+function buildChildEnv(extra: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = {};
+  for (const k of SPAWN_ENV_ALLOWLIST) {
+    const v = process.env[k];
+    if (typeof v === "string") base[k] = v;
+  }
+  return { ...base, ...extra };
+}
+
 // Pump a readable stream into `sink.text`, capping in-place. Used by both the
 // background-job harness (startJob) and one-shot tool handlers (bash, grep)
 // so memory use is bounded everywhere we capture subprocess output.
@@ -306,15 +341,17 @@ async function pumpCapped(stream: ReadableStream<Uint8Array> | null, sink: { tex
   if (!stream) return;
   const reader = stream.getReader();
   const dec = new TextDecoder("utf-8");
+  // Only re-cap when text has grown noticeably past the limit so we don't
+  // re-encode the whole buffer on every single chunk during log spam.
+  const RECAP_THRESHOLD = OUTPUT_CAP_MAX + (OUTPUT_CAP_MAX - OUTPUT_CAP_KEEP);
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
-      // Flush any pending partial sequence.
       sink.text += dec.decode();
       break;
     }
     sink.text += dec.decode(value, { stream: true });
-    if (Buffer.byteLength(sink.text, "utf8") > OUTPUT_CAP_MAX) {
+    if (Buffer.byteLength(sink.text, "utf8") > RECAP_THRESHOLD) {
       const buf = Buffer.from(sink.text, "utf8");
       sink.text = new TextDecoder("utf-8").decode(buf.subarray(buf.length - OUTPUT_CAP_KEEP));
     }
@@ -326,22 +363,27 @@ function startJob(command: string, cwd: string): Job {
   if (shuttingDown) throw new Error("server is shutting down");
   totalJobs++;
   const id = `j${++jobSeq}`;
-  const proc = spawn({
-    cmd: shellCmd(command),
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-  });
+  let proc: any;
+  try {
+    proc = spawn({
+      cmd: shellCmd(command),
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      env: buildChildEnv({}),
+    });
+  } catch (e) {
+    totalJobs--;
+    throw e;
+  }
   const job: Job = { id, command, proc, output: "", status: "running", startedAt: Date.now() };
   jobs.set(id, job);
 
-  // Both streams write into job.output. Use a thin {text} wrapper so the
-  // pump can mutate the shared buffer in place.
   const sink = { get text() { return job.output; }, set text(v: string) { job.output = v; } };
   pumpCapped(proc.stdout as any, sink);
   pumpCapped(proc.stderr as any, sink);
-  proc.exited.then((code) => {
+  proc.exited.then((code: number) => {
     totalJobs--;
     job.status = "exited";
     job.exitCode = code;
@@ -928,6 +970,18 @@ const SPAWN_TIMEOUT_MS = 30_000;
 const cwdServers = new Map<string, Map<string, ServerState>>(); // key: "${cwd}:${serverName}"
 const serverMetadata = new Map<string, { tools: AggregatedTool[]; loadedAt: number }>(); // key: "${cwd}:${serverName}"
 const activeSpawns = new Set<string>(); // "${cwd}:${serverName}" currently spawning
+const spawnWaiters: Array<() => void> = []; // FIFO of resolvers waiting for a slot
+const perKeyWaiters = new Map<string, Array<() => void>>(); // waiters blocked on a specific key
+function notifySpawnWaiters(key: string) {
+  const list = perKeyWaiters.get(key);
+  if (list) {
+    perKeyWaiters.delete(key);
+    for (const r of list) r();
+  }
+  // Wake one queued spawn-slot waiter (FIFO)
+  const next = spawnWaiters.shift();
+  if (next) next();
+}
 
 // ---------- mcp tool: validation functions ----------
 
@@ -995,6 +1049,9 @@ function validateToolArgs(args: any): { ok: true; sanitized: Record<string, any>
 }
 
 function validateServerConfig(ns: string, cfg: McpServerConfig): { ok: true } | { ok: false; reason: string } {
+  if (cfg == null || typeof cfg !== "object") {
+    return { ok: false, reason: `server '${ns}': config must be an object` };
+  }
   if (cfg.type === "http") {
     try {
       const url = new URL(cfg.url);
@@ -1005,12 +1062,42 @@ function validateServerConfig(ns: string, cfg: McpServerConfig): { ok: true } | 
       return { ok: false, reason: `server '${ns}': invalid http url` };
     }
   } else if (cfg.type === "stdio" || cfg.type === undefined) {
-    const command = (cfg as StdioServerConfig).command;
+    const stdioCfg = cfg as StdioServerConfig;
+    const command = stdioCfg.command;
     if (!command || typeof command !== "string") {
       return { ok: false, reason: `server '${ns}': missing command` };
     }
-    if (/[;|<>&]/.test(command)) {
-      return { ok: false, reason: `server '${ns}': command contains shell operators` };
+    // We spawn with shell:false (array form) so the command is exec'd directly.
+    // Still reject shell metacharacters in case a future change re-enables shell mode,
+    // and reject NUL anywhere — process spawning treats it as terminator.
+    if (/[;|<>&\x00]/.test(command)) {
+      return { ok: false, reason: `server '${ns}': command contains shell operators or NUL` };
+    }
+    if (stdioCfg.args !== undefined) {
+      if (!Array.isArray(stdioCfg.args)) {
+        return { ok: false, reason: `server '${ns}': 'args' must be an array of strings` };
+      }
+      for (const a of stdioCfg.args) {
+        if (typeof a !== "string") {
+          return { ok: false, reason: `server '${ns}': all args must be strings` };
+        }
+        if (a.includes("\x00")) {
+          return { ok: false, reason: `server '${ns}': args may not contain NUL` };
+        }
+      }
+    }
+    if (stdioCfg.env !== undefined) {
+      if (typeof stdioCfg.env !== "object" || Array.isArray(stdioCfg.env) || stdioCfg.env === null) {
+        return { ok: false, reason: `server '${ns}': 'env' must be an object` };
+      }
+      for (const [k, v] of Object.entries(stdioCfg.env)) {
+        if (typeof v !== "string") {
+          return { ok: false, reason: `server '${ns}': env.${k} must be a string` };
+        }
+        if (k.includes("=") || k.includes("\x00") || v.includes("\x00")) {
+          return { ok: false, reason: `server '${ns}': env contains invalid characters` };
+        }
+      }
     }
   } else {
     return { ok: false, reason: `server '${ns}': unsupported transport type '${cfg.type}'` };
@@ -1071,28 +1158,40 @@ async function loadMcpConfig(cwd: string, mcpConfigPath: string): Promise<{ path
   return { path: validation.path, servers };
 }
 
+// Per-key results published when a spawn completes so waiters see success or failure.
+const spawnResults = new Map<string, { ok: boolean; error?: any }>();
+
 async function spawnServerWithLimit(cwd: string, ns: string, state: ServerState): Promise<void> {
   const key = `${cwd}:${ns}`;
+  // Another caller is already spawning this same server — wait, then propagate their outcome.
   if (activeSpawns.has(key)) {
     await new Promise<void>((resolve) => {
-      const iv = setInterval(() => {
-        if (!activeSpawns.has(key)) { clearInterval(iv); resolve(); }
-      }, 50);
+      let list = perKeyWaiters.get(key);
+      if (!list) { list = []; perKeyWaiters.set(key, list); }
+      list.push(resolve);
     });
+    const result = spawnResults.get(key);
+    if (result && !result.ok) {
+      throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
     return;
   }
+  // Wait for a global spawn slot to open up.
   while (activeSpawns.size >= MAX_CONCURRENT_SPAWNS) {
-    await new Promise<void>((resolve) => {
-      const iv = setInterval(() => {
-        if (activeSpawns.size < MAX_CONCURRENT_SPAWNS) { clearInterval(iv); resolve(); }
-      }, 50);
-    });
+    await new Promise<void>((resolve) => spawnWaiters.push(resolve));
   }
   activeSpawns.add(key);
   try {
     await ensureSpawned(ns, state);
+    spawnResults.set(key, { ok: true });
+  } catch (e) {
+    spawnResults.set(key, { ok: false, error: e });
+    throw e;
   } finally {
     activeSpawns.delete(key);
+    notifySpawnWaiters(key);
+    // Clear after notification so next spawn cycle starts fresh.
+    setTimeout(() => spawnResults.delete(key), 0);
   }
 }
 
@@ -1141,8 +1240,13 @@ function aggregatorLogDir(): string {
   return dir;
 }
 
+const MAX_STDIO_BUFFER_BYTES = 10 * 1024 * 1024;
 function readJsonRpcLines(state: StdioServerState, chunk: string): Json[] {
   state.stdoutBuf += chunk;
+  // Cap the buffer so a misbehaving child can't OOM us by never emitting \n.
+  if (state.stdoutBuf.length > MAX_STDIO_BUFFER_BYTES) {
+    state.stdoutBuf = state.stdoutBuf.slice(-MAX_STDIO_BUFFER_BYTES);
+  }
   const out: Json[] = [];
   let nl: number;
   while ((nl = state.stdoutBuf.indexOf("\n")) !== -1) {
@@ -1248,7 +1352,7 @@ async function spawnStdioServer(ns: string, state: StdioServerState): Promise<vo
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ...env },
+    env: buildChildEnv(env),
   });
   state.proc = proc;
   state.stdoutBuf = "";
@@ -1786,23 +1890,27 @@ const tools: Record<string, Tool> = {
     handler: async ({ command, cwd, timeout_ms }) => {
       const ctrl = new AbortController();
       const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      const proc = spawn({
-        cmd: bashCmd(command),
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-        signal: ctrl.signal,
-      });
-      const outSink = { text: "" };
-      const errSink = { text: "" };
-      const [, , exitCode] = await Promise.all([
-        pumpCapped(proc.stdout as any, outSink),
-        pumpCapped(proc.stderr as any, errSink),
-        proc.exited,
-      ]);
-      if (t) clearTimeout(t);
-      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      try {
+        const proc = spawn({
+          cmd: bashCmd(command),
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+          stdin: "ignore",
+          signal: ctrl.signal,
+          env: buildChildEnv({}),
+        });
+        const outSink = { text: "" };
+        const errSink = { text: "" };
+        const [, , exitCode] = await Promise.all([
+          pumpCapped(proc.stdout as any, outSink),
+          pumpCapped(proc.stderr as any, errSink),
+          proc.exited,
+        ]);
+        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      } finally {
+        if (t) clearTimeout(t);
+      }
     },
   },
 
@@ -1820,23 +1928,27 @@ const tools: Record<string, Tool> = {
     handler: async ({ command, cwd, timeout_ms }) => {
       const ctrl = new AbortController();
       const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      const proc = spawn({
-        cmd: shCmd(command),
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-        signal: ctrl.signal,
-      });
-      const outSink = { text: "" };
-      const errSink = { text: "" };
-      const [, , exitCode] = await Promise.all([
-        pumpCapped(proc.stdout as any, outSink),
-        pumpCapped(proc.stderr as any, errSink),
-        proc.exited,
-      ]);
-      if (t) clearTimeout(t);
-      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      try {
+        const proc = spawn({
+          cmd: shCmd(command),
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+          stdin: "ignore",
+          signal: ctrl.signal,
+          env: buildChildEnv({}),
+        });
+        const outSink = { text: "" };
+        const errSink = { text: "" };
+        const [, , exitCode] = await Promise.all([
+          pumpCapped(proc.stdout as any, outSink),
+          pumpCapped(proc.stderr as any, errSink),
+          proc.exited,
+        ]);
+        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      } finally {
+        if (t) clearTimeout(t);
+      }
     },
   },
 
@@ -1854,23 +1966,27 @@ const tools: Record<string, Tool> = {
     handler: async ({ command, cwd, timeout_ms }) => {
       const ctrl = new AbortController();
       const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      const proc = spawn({
-        cmd: cmdCmd(command),
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-        signal: ctrl.signal,
-      });
-      const outSink = { text: "" };
-      const errSink = { text: "" };
-      const [, , exitCode] = await Promise.all([
-        pumpCapped(proc.stdout as any, outSink),
-        pumpCapped(proc.stderr as any, errSink),
-        proc.exited,
-      ]);
-      if (t) clearTimeout(t);
-      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      try {
+        const proc = spawn({
+          cmd: cmdCmd(command),
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+          stdin: "ignore",
+          signal: ctrl.signal,
+          env: buildChildEnv({}),
+        });
+        const outSink = { text: "" };
+        const errSink = { text: "" };
+        const [, , exitCode] = await Promise.all([
+          pumpCapped(proc.stdout as any, outSink),
+          pumpCapped(proc.stderr as any, errSink),
+          proc.exited,
+        ]);
+        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      } finally {
+        if (t) clearTimeout(t);
+      }
     },
   },
 
@@ -1888,23 +2004,27 @@ const tools: Record<string, Tool> = {
     handler: async ({ command, cwd, timeout_ms }) => {
       const ctrl = new AbortController();
       const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      const proc = spawn({
-        cmd: pwshCmd(command),
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-        signal: ctrl.signal,
-      });
-      const outSink = { text: "" };
-      const errSink = { text: "" };
-      const [, , exitCode] = await Promise.all([
-        pumpCapped(proc.stdout as any, outSink),
-        pumpCapped(proc.stderr as any, errSink),
-        proc.exited,
-      ]);
-      if (t) clearTimeout(t);
-      return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      try {
+        const proc = spawn({
+          cmd: pwshCmd(command),
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+          stdin: "ignore",
+          signal: ctrl.signal,
+          env: buildChildEnv({}),
+        });
+        const outSink = { text: "" };
+        const errSink = { text: "" };
+        const [, , exitCode] = await Promise.all([
+          pumpCapped(proc.stdout as any, outSink),
+          pumpCapped(proc.stderr as any, errSink),
+          proc.exited,
+        ]);
+        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+      } finally {
+        if (t) clearTimeout(t);
+      }
     },
   },
 
@@ -1925,8 +2045,9 @@ const tools: Record<string, Tool> = {
       if (!sr.ok) throw new Error(sr.reason);
       let cmd: string[];
       if (hasRg) {
+        // Insert `--` so a user-supplied pattern that starts with `-` isn't parsed as a flag.
         cmd = ["rg", "--line-number", "--no-heading", "--color=never",
-           ...(glob ? ["--glob", glob] : []), pattern, sr.path];
+           ...(glob ? ["--glob", glob] : []), "--", pattern, sr.path];
       } else if (IS_WINDOWS && hasFindstr) {
         // Windows findstr: /r = regex, /n = line numbers
         // Note: findstr regex syntax differs slightly from grep
@@ -1935,7 +2056,8 @@ const tools: Record<string, Tool> = {
         const searchPath = glob ? `${sr.path}\\${glob.replace(/\*/g, "*")}` : sr.path;
         cmd = ["findstr", ...args, pattern, searchPath];
       } else {
-        cmd = ["grep", "-rEn", ...(glob ? ["--include", glob] : []), pattern, sr.path];
+        // Insert `--` so a user-supplied pattern that starts with `-` isn't parsed as a flag.
+        cmd = ["grep", "-rEn", ...(glob ? ["--include", glob] : []), "--", pattern, sr.path];
       }
       const proc = spawn({
         cmd,
@@ -1943,6 +2065,7 @@ const tools: Record<string, Tool> = {
         stdout: "pipe",
         stderr: "pipe",
         stdin: "ignore",
+        env: buildChildEnv({}),
       });
       const outSink = { text: "" };
       const errSink = { text: "" };
@@ -2071,19 +2194,16 @@ const tools: Record<string, Tool> = {
       }
       if (mode === "stop") {
         if (j.status !== "running") return `${j.id} already ${j.status}`;
-        j.proc.kill("SIGTERM");
-        // Wait for exit or timeout — no polling. SIGTERM + grace period,
-        // then SIGKILL if still alive. proc.exited is the Promise the
-        // subprocess already exposes; race it against a sleep.
+        // Try to kill the whole process group so shell children die too.
+        // Fall back to single-pid kill if pgid signalling fails.
+        killJobTree(j as any, "SIGTERM");
         let timedOut = false;
         const timer = new Promise<void>((resolve) => {
           setTimeout(() => { timedOut = true; resolve(); }, timeout_ms);
         });
         await Promise.race([j.proc.exited, timer]);
         if (timedOut && j.status === "running") {
-          j.proc.kill("SIGKILL");
-          // Wait for the kill to actually take effect, otherwise we'd
-          // return while the process is still being reaped.
+          killJobTree(j as any, "SIGKILL");
           await j.proc.exited;
         }
         return `${j.id} stopped`;
@@ -2340,10 +2460,17 @@ const tools: Record<string, Tool> = {
         let state = cwdServers.get(cwd)?.get(server);
         if (!state || !state.initialized) {
           state = getOrCreateServerState(cwd, server, cfg);
-          await Promise.race([
-            spawnServerWithLimit(cwd, server, state),
-            new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`spawn timeout after ${SPAWN_TIMEOUT_MS}ms`)), SPAWN_TIMEOUT_MS)),
-          ]);
+          let spawnTimer: ReturnType<typeof setTimeout> | null = null;
+          try {
+            await Promise.race([
+              spawnServerWithLimit(cwd, server, state),
+              new Promise<void>((_, reject) => {
+                spawnTimer = setTimeout(() => reject(new Error(`spawn timeout after ${SPAWN_TIMEOUT_MS}ms`)), SPAWN_TIMEOUT_MS);
+              }),
+            ]);
+          } finally {
+            if (spawnTimer) clearTimeout(spawnTimer);
+          }
         }
         const toolsResult = await rpcCall(state, "tools/list", {});
         const tools: AggregatedTool[] = ((toolsResult as any)?.tools ?? []).map((t: any) => ({
@@ -2372,10 +2499,17 @@ const tools: Record<string, Tool> = {
         let state = cwdServers.get(cwd)?.get(server);
         if (!state || !state.initialized) {
           state = getOrCreateServerState(cwd, server, cfg);
-          await Promise.race([
-            spawnServerWithLimit(cwd, server, state),
-            new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`spawn timeout after ${SPAWN_TIMEOUT_MS}ms`)), SPAWN_TIMEOUT_MS)),
-          ]);
+          let spawnTimer: ReturnType<typeof setTimeout> | null = null;
+          try {
+            await Promise.race([
+              spawnServerWithLimit(cwd, server, state),
+              new Promise<void>((_, reject) => {
+                spawnTimer = setTimeout(() => reject(new Error(`spawn timeout after ${SPAWN_TIMEOUT_MS}ms`)), SPAWN_TIMEOUT_MS);
+              }),
+            ]);
+          } finally {
+            if (spawnTimer) clearTimeout(spawnTimer);
+          }
         }
         resetIdleTimer(server, state);
         const result = await rpcCall(state, "tools/call", { name: tool, arguments: argsValidation.sanitized });
@@ -2396,28 +2530,24 @@ const tools: Record<string, Tool> = {
   },
 };
 
-// Prune tools based on startup flags and binary availability.
-// --disallowed-tools has highest priority: removes tools regardless of other flags.
-if (disallowedTools.length > 0) {
-  for (const name of disallowedTools) {
-    delete tools[name];
-  }
-} else {
-  // Default behavior: only prune if --disallowed-tools was not specified
-  if (!hasCloudflared) delete tools.preview;
-  if (!memoryEnabled) {
-    delete tools.remember;
-    delete tools.forget;
-    delete tools.recall;
-  }
-  if (!publicBaseUrl && !makePublic) {
-    delete (tools as any).get_upload_link;
-  }
-  // Prune shell tools: only keep the one matching DETECTED_SHELL
-  if (DETECTED_SHELL !== "bash") delete tools.bash;
-  if (DETECTED_SHELL !== "sh") delete tools.shell;
-  if (DETECTED_SHELL !== "cmd") delete tools.command;
-  if (DETECTED_SHELL !== "powershell") delete tools.powershell;
+// Prune tools based on startup flags and binary availability. Always apply
+// the default pruning first (cloudflared, memory, public, shell match), then
+// remove anything listed in --disallowed-tools on top.
+if (!hasCloudflared) delete tools.preview;
+if (!memoryEnabled) {
+  delete tools.remember;
+  delete tools.forget;
+  delete tools.recall;
+}
+if (!publicBaseUrl && !makePublic) {
+  delete (tools as any).get_upload_link;
+}
+if (DETECTED_SHELL !== "bash") delete tools.bash;
+if (DETECTED_SHELL !== "sh") delete tools.shell;
+if (DETECTED_SHELL !== "cmd") delete tools.command;
+if (DETECTED_SHELL !== "powershell") delete tools.powershell;
+for (const name of disallowedTools) {
+  delete tools[name];
 }
 
 // Load external MCP aggregation config if --mcp was given.
@@ -2500,10 +2630,16 @@ async function maybeSpillBinaryBlock(b64: string, mimeType: string, toolName?: s
 
 // ---------- JSON-RPC dispatch ----------
 async function handle(msg: Json): Promise<Json | null> {
-  const { id, method, params } = msg;
+  const { id, method, params } = (msg ?? {}) as any;
   const ok = (result: Json) => ({ jsonrpc: "2.0", id, result });
   const err = (code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
 
+  // params (when present) must be an object or array per JSON-RPC 2.0. We use
+  // object-style throughout; reject array / scalar with -32602 rather than
+  // tripping over typeof errors deeper in handlers.
+  if (params !== undefined && params !== null && (typeof params !== "object" || Array.isArray(params))) {
+    return err(-32602, "Invalid params: expected object");
+  }
   try {
     if (method === "initialize") {
       return ok({
@@ -2546,8 +2682,8 @@ async function handle(msg: Json): Promise<Json | null> {
     }
     return err(-32601, `unknown method: ${method}`);
   } catch (e: any) {
-    // Error messages can also blow past the threshold (e.g. a subprocess
-    // dumps a long stack trace). Spill them too.
+    // Notifications (no id) must not get a response body even on error.
+    if (id == null) return null;
     const text = `ERROR: ${e?.message ?? e}`;
     return ok({ content: [{ type: "text", text: await maybeSpillText(text) }], isError: true });
   }
@@ -2569,6 +2705,14 @@ async function handleUpload(req: Request, sessionId: string): Promise<Response> 
   if (!check.ok) {
     return new Response(JSON.stringify({ error: check.reason }), {
       status: 401,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+  // Reject early via Content-Length before parsing the entire body into memory.
+  const declaredLen = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_UPLOAD_BYTES) {
+    return new Response(JSON.stringify({ error: `upload exceeds ${MAX_UPLOAD_BYTES} bytes` }), {
+      status: 413,
       headers: { "Content-Type": "application/json", ...CORS_HEADERS },
     });
   }
@@ -2595,15 +2739,12 @@ async function handleUpload(req: Request, sessionId: string): Promise<Response> 
     });
   }
 
-  // Sanitise: strip directory components, reject empty names.
+  // Sanitise: strip directory components, reject empty/dotfile/traversal names.
   const raw = f.name || "upload.bin";
   const base = raw.split(/[\\/]/).pop() || "upload.bin";
-  const safe = base.replace(/[\x00-\x1f]/g, "_");
-  if (!safe) {
-    return new Response(JSON.stringify({ error: "empty filename" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-    });
+  let safe = base.replace(/[\x00-\x1f]/g, "_");
+  if (!safe || safe === "." || safe === "..") {
+    safe = `upload-${Date.now()}`;
   }
 
   const destDir = resolve(UPLOAD_ROOT, sessionId);
@@ -2636,12 +2777,19 @@ async function handleUpload(req: Request, sessionId: string): Promise<Response> 
 
 Bun.serve({
   port,
+  hostname: bindAddr,
   async fetch(req) {
     const url = new URL(req.url);
 
-    // CORS preflight for upload endpoint
-    if (req.method === "OPTIONS" && url.pathname.startsWith("/upload/")) {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    // CORS preflight — also handle /mcp so browser-based clients work.
+    if (req.method === "OPTIONS" && (url.pathname.startsWith("/upload/") || url.pathname === "/mcp")) {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          ...CORS_HEADERS,
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      });
     }
 
     // Upload endpoint: /upload/<session_id>
@@ -2675,19 +2823,38 @@ Bun.serve({
     // MCP JSON-RPC endpoint
     if (url.pathname !== "/mcp") return new Response("not found", { status: 404 });
     if (req.method !== "POST") return new Response("POST /mcp", { status: 405 });
-    if (token && url.searchParams.get("token") !== token) {
-      return new Response("unauthorized", { status: 401 });
+
+    // Token check: ?token=… or Authorization: Bearer …, constant-time compare.
+    if (token) {
+      let given = url.searchParams.get("token") ?? "";
+      if (!given) {
+        const auth = req.headers.get("authorization") ?? "";
+        if (auth.startsWith("Bearer ")) given = auth.slice(7).trim();
+      }
+      const expectedBuf = Buffer.from(token);
+      const givenBuf = Buffer.from(given);
+      const ok = givenBuf.length === expectedBuf.length && timingSafeEqual(givenBuf, expectedBuf);
+      if (!ok) return new Response("unauthorized", { status: 401, headers: CORS_HEADERS });
     }
-    const body = await req.json();
+
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return Response.json(
+        { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+        { status: 400, headers: CORS_HEADERS });
+    }
     const resp = await handle(body);
-    if (resp === null) return new Response(null, { status: 202 });
-    return Response.json(resp);
+    if (resp === null) return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return Response.json(resp, { headers: CORS_HEADERS });
   },
 });
 
+const bindLabel = (bindAddr === "0.0.0.0" || bindAddr === "::") ? "localhost" : bindAddr;
 console.error(
-  `code-mcp listening on http://localhost:${port}/mcp` +
-  `${token ? " (auth: ?token=...)" : " (no auth)"}` +
+  `code-mcp listening on http://${bindLabel}:${port}/mcp` +
+  `${token ? " (auth)" : " (no auth)"}` +
   ` — tools: ${Object.keys(tools).join(", ")}`
 );
 if (publicBaseUrl) {
@@ -2729,14 +2896,13 @@ if (makePublic) {
 // tunnel remote requests to the local MCP handler.
 if (gatewayDomain) {
   const deviceId = assignedDeviceId ?? randomUUID();
-  const localMcpUrl = `http://localhost:${port}/mcp`;
-  const RECONNECT_DELAY_MS = 3000;
-  const MAX_RETRIES = 10;
+  const localMcpUrl = `http://127.0.0.1:${port}/mcp`;
+  const BASE_DELAY_MS = 1000;
+  const MAX_DELAY_MS = 60_000;
   let retries = 0;
 
   (function connect() {
-    // Determine scheme: ws for local/dev, wss for production
-    const isLocal = gatewayDomain.startsWith("localhost") || gatewayDomain.startsWith("127.") || gatewayDomain.startsWith("192.168.") || gatewayDomain.startsWith("10.") || gatewayDomain.startsWith("172.16.") || gatewayDomain.startsWith("ws://") || gatewayDomain.startsWith("http://");
+    const isLocal = /^(localhost|127\.|192\.168\.|10\.|172\.16\.|ws:\/\/|http:\/\/)/.test(gatewayDomain);
     const scheme = isLocal ? "ws" : "wss";
     const url = assignedDeviceId ? `${scheme}://${gatewayDomain}/ws/${assignedDeviceId}` : `${scheme}://${gatewayDomain}/ws`;
     console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
@@ -2751,12 +2917,13 @@ if (gatewayDomain) {
     ws.addEventListener("message", async (e) => {
       try {
         const msg = JSON.parse(e.data as string) as { id?: string; request?: Json; token?: string };
-        if (!msg.id || !msg.request) return;
+        if (msg.id == null || !msg.request) return;
         const tokenParam = msg.token ? `?token=${msg.token}` : "";
         const res = await fetch(`${localMcpUrl}${tokenParam}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(msg.request),
+          signal: AbortSignal.timeout(60_000),
         });
         const resp = await res.json();
         ws.send(JSON.stringify({ id: msg.id, response: resp }));
@@ -2766,39 +2933,39 @@ if (gatewayDomain) {
     });
 
     ws.addEventListener("close", () => {
-      console.error(`[${deviceId}] Disconnected from gateway, retrying in ${RECONNECT_DELAY_MS}ms ...`);
-      if (++retries <= MAX_RETRIES) {
-        setTimeout(connect, RECONNECT_DELAY_MS);
-      } else {
-        console.error(`[${deviceId}] Max retries reached, exiting`);
-        process.exit(1);
-      }
+      // Exponential backoff with jitter — never kill the local server.
+      const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** Math.min(retries, 6))
+        + Math.floor(Math.random() * 500);
+      retries++;
+      console.error(`[${deviceId}] Disconnected; retry #${retries} in ${delay}ms`);
+      setTimeout(connect, delay);
     });
 
     ws.addEventListener("error", (err) => {
-      console.error(`[${deviceId}] Gateway WS error:`, err);
+      console.error(`[${deviceId}] Gateway WS error:`, (err as any)?.message ?? err);
     });
   })();
 }
 
 // ---------- shutdown ----------
+function killJobTree(j: { proc: any; status: string }, sig: "SIGTERM" | "SIGKILL") {
+  if (j.status !== "running") return;
+  const pid = j.proc?.pid;
+  if (process.platform !== "win32" && pid) {
+    // Negative PID targets the whole process group when start_new_session was used.
+    try { process.kill(-pid, sig); return; } catch {}
+  }
+  try { j.proc.kill(sig); } catch {}
+}
+
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   shutdownAggregator();
   console.error(`\n[${signal}] stopping ${jobs.size} job(s)...`);
-  for (const j of jobs.values()) {
-    if (j.status === "running") {
-      try { j.proc.kill("SIGTERM"); } catch {}
-    }
-  }
-  // Give jobs a moment to exit cleanly, then hard-kill.
+  for (const j of jobs.values()) killJobTree(j as any, "SIGTERM");
   setTimeout(() => {
-    for (const j of jobs.values()) {
-      if (j.status === "running") {
-        try { j.proc.kill("SIGKILL"); } catch {}
-      }
-    }
+    for (const j of jobs.values()) killJobTree(j as any, "SIGKILL");
     process.exit(0);
   }, 500);
 }

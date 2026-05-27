@@ -43,6 +43,29 @@ public final class CodeMCP {
     private static final int MEMO_TAIL_BYTES = 8192;
     private static final int MAX_CONCURRENT_JOBS = 10;
     private static final int MAX_SHELL_SEMAPHORE_PERMITS = 5;
+    private static final long MAX_UPLOAD_BYTES = 100L * 1024 * 1024;
+    private static final long MAX_WS_FRAME_BYTES = 64L * 1024 * 1024;
+    private static final int MAX_GATEWAY_HEADER_BYTES = 64 * 1024;
+    private static final int MAX_REQUEST_BYTES = 100 * 1024 * 1024;
+    private static final int MAX_HTTP_THREADS = 64;
+    private static final String DEFAULT_BIND = "127.0.0.1";
+    private static final int MAX_RETRIES = 30;
+    private static final long RECONNECT_DELAY_MS = 3000L;
+
+    // Allow-list of env vars to forward to spawned children. Limits blast radius
+    // of MCP token compromise: even if the token leaks, AWS_*/OPENAI_API_KEY/etc.
+    // are not handed to user-invoked commands or external MCP children.
+    private static final Set<String> SPAWN_ENV_ALLOWLIST = Set.of(
+        "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TZ",
+        "TMPDIR", "TEMP", "TMP",
+        "SystemRoot", "SystemDrive", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+        "PROGRAMFILES", "PROGRAMDATA", "WINDIR", "COMSPEC", "PATHEXT"
+    );
+
+    private static void scrubEnv(ProcessBuilder pb) {
+        Map<String, String> env = pb.environment();
+        env.keySet().removeIf(k -> !SPAWN_ENV_ALLOWLIST.contains(k));
+    }
     
     // ===== STATIC STATE =====
     private static final Map<String, Job> jobs = new ConcurrentHashMap<>();
@@ -58,6 +81,7 @@ public final class CodeMCP {
     
     // ===== CONFIGURATION =====
     private static int port = DEFAULT_PORT;
+    private static String bindAddr = DEFAULT_BIND;
     private static String token = null;
     private static boolean memoryEnabled = false;
     private static boolean makePublic = false;
@@ -66,6 +90,8 @@ public final class CodeMCP {
     private static String publicBaseUrl = null;
     private static String gatewayDomain = null;
     private static String assignedDeviceId = null;
+    private static final Set<String> disallowedTools = new HashSet<>();
+    private static final Object memoLock = new Object();
     private static String uploadRoot;
     private static String spillRoot;
     private static boolean hasRg = false;
@@ -113,18 +139,25 @@ public final class CodeMCP {
             publicBaseUrl = "https://" + domain;
         }
         
-        // Create HTTP server
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        
+        // Create HTTP server bound to selected address (default 127.0.0.1).
+        HttpServer server = HttpServer.create(new InetSocketAddress(bindAddr, port), 0);
+
         // Routes
         server.createContext("/mcp", new MCPRouteHandler());
         server.createContext("/upload/", new UploadRouteHandler());
-        
-        server.setExecutor(Executors.newCachedThreadPool());
+
+        // Bounded thread pool with backpressure (caller-runs) instead of unbounded cached pool.
+        server.setExecutor(new ThreadPoolExecutor(
+            8, MAX_HTTP_THREADS,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(256),
+            r -> { Thread t = new Thread(r, "http-" + System.nanoTime()); t.setDaemon(true); return t; },
+            new ThreadPoolExecutor.CallerRunsPolicy()));
         server.start();
-        
-        System.err.println("code-mcp listening on http://localhost:" + port + "/mcp" +
-            (token != null ? " (auth: ?token=...)" : " (no auth)"));
+
+        String bindLabel = (bindAddr.equals("0.0.0.0") || bindAddr.equals("::")) ? "localhost" : bindAddr;
+        System.err.println("code-mcp listening on http://" + bindLabel + ":" + port + "/mcp" +
+            (token != null ? " (auth)" : " (no auth)"));
         
         // Handle shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -144,11 +177,33 @@ public final class CodeMCP {
     
     // ===== ARGUMENT PARSING =====
     private static void parseArgs(String[] args) {
+        String envPort = System.getenv("PORT");
+        if (envPort != null && !envPort.isBlank()) {
+            try {
+                port = Integer.parseInt(envPort);
+            } catch (NumberFormatException e) {
+                System.err.println("error: invalid $PORT=" + envPort);
+                System.exit(2);
+            }
+        }
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--port" -> {
                     if (++i >= args.length) usage();
-                    port = Integer.parseInt(args[i]);
+                    try {
+                        port = Integer.parseInt(args[i]);
+                    } catch (NumberFormatException e) {
+                        System.err.println("error: invalid --port " + args[i]);
+                        System.exit(2);
+                    }
+                    if (port < 1 || port > 65535) {
+                        System.err.println("error: --port out of range: " + port);
+                        System.exit(2);
+                    }
+                }
+                case "--bind" -> {
+                    if (++i >= args.length) usage();
+                    bindAddr = args[i];
                 }
                 case "--token" -> {
                     if (++i >= args.length) usage();
@@ -171,7 +226,13 @@ public final class CodeMCP {
                 case "--id" -> {
                     if (++i >= args.length) usage();
                     assignedDeviceId = args[i];
-                    break;
+                }
+                case "--disallowed-tools" -> {
+                    if (++i >= args.length) usage();
+                    for (String t : args[i].split(",")) {
+                        String name = t.trim();
+                        if (!name.isEmpty()) disallowedTools.add(name);
+                    }
                 }
                 case "-h", "--help" -> {
                     System.out.println(USAGE);
@@ -180,9 +241,13 @@ public final class CodeMCP {
                 default -> usage();
             }
         }
-        
+
         if (makePublic && domain != null) {
             System.err.println("error: --public and --domain are mutually exclusive");
+            System.exit(2);
+        }
+        if (domain != null && !domain.matches("[A-Za-z0-9.\\-]+(:[0-9]{1,5})?")) {
+            System.err.println("error: invalid --domain: " + domain);
             System.exit(2);
         }
     }
@@ -194,17 +259,19 @@ public final class CodeMCP {
     
     private static final String USAGE = """
         Usage: java CodeMCP.java [options]
-        
+
         Options:
-          --port <n>             Listen port (default: 7777)
-          --token <s>            Require ?token=<s> on every request (default: no auth)
-          --enable-memory        Enable remember/forget/recall tools
-          --public               Expose via a Cloudflare quick tunnel (requires cloudflared)
-          --domain <host>        Use the given public hostname (tunnel must already route it here)
-          --mcp <path>           Aggregate tools from external MCP servers defined in JSON config
-          --gateway <domain>     Connect to a gateway server and tunnel requests (wss://{domain}/ws)
-          --id <uuid>           Use specific device ID for gateway connection
-          -h, --help            Show this help and exit
+          --port <n>                  Listen port (default: 7777 or $PORT)
+          --bind <addr>               Bind address (default: 127.0.0.1)
+          --token <s>                 Require ?token=<s> or Bearer auth on every request
+          --enable-memory             Enable remember/forget/recall tools
+          --public                    Expose via Cloudflare quick tunnel (requires cloudflared)
+          --domain <host>             Use given public hostname (mutually exclusive with --public)
+          --mcp <path>                Aggregate tools from external MCP servers (JSON config)
+          --gateway <domain>          Connect to gateway server (wss://{domain}/ws)
+          --id <uuid>                 Use specific device ID for gateway connection
+          --disallowed-tools <list>   Comma-separated tools to disable
+          -h, --help                  Show this help and exit
         """;
     
     // ===== SECURITY: PATH VALIDATION =====
@@ -218,6 +285,15 @@ public final class CodeMCP {
         Path resolved = base.resolve(userPath).normalize();
         if (!resolved.startsWith(base)) {
             throw new IOException("Access denied: path outside working directory");
+        }
+        // If the target exists, follow symlinks via toRealPath so a symlink can't escape `base`.
+        if (Files.exists(resolved, LinkOption.NOFOLLOW_LINKS) && Files.isSymbolicLink(resolved)) {
+            Path real = resolved.toRealPath();
+            Path realBase = base.toRealPath();
+            if (!real.startsWith(realBase)) {
+                throw new IOException("Access denied: symlink escapes working directory");
+            }
+            return real;
         }
         return resolved;
     }
@@ -259,13 +335,15 @@ public final class CodeMCP {
     // Escape string for cmd.exe /c
     private static String escapeCmd(String cmd) {
         if (cmd == null) return "";
-        return cmd.replace("%", "^%")
+        // cmd.exe escapes " by doubling ("") inside quoted strings, NOT with backslash.
+        // We escape shell metacharacters with caret; we wrap the command in /c so the entire
+        // string is interpreted by cmd.exe directly without our quoting.
+        return cmd.replace("^", "^^")
+                  .replace("%", "^%")
                   .replace("&", "^&")
                   .replace("|", "^|")
                   .replace("<", "^<")
-                  .replace(">", "^>")
-                  .replace("^", "^^")
-                  .replace("\"", "\\\"");
+                  .replace(">", "^>");
     }
     
     // Escape string for PowerShell -Command
@@ -280,8 +358,8 @@ public final class CodeMCP {
             if (System.getenv("PSModulePath") != null) return ShellType.POWERSHELL;
             return ShellType.CMD;
         }
-        String shell = System.getenv("SHELL");
-        if (shell != null && shell.endsWith("bash")) return ShellType.BASH;
+        // Prefer bash when available regardless of $SHELL (matches Python/TS behavior).
+        if (hasOnPath("bash")) return ShellType.BASH;
         return ShellType.SH;
     }
     
@@ -313,12 +391,15 @@ public final class CodeMCP {
     private static boolean hasOnPath(String bin) {
         String probe = isWindows ? "where " + bin : "command -v " + bin;
         try {
-            ProcessBuilder pb = new ProcessBuilder(isWindows ? new String[]{"cmd.exe", "/d", "/s", "/c", probe} : new String[]{"sh", "-c", probe});
-            pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-            pb.redirectError(ProcessBuilder.Redirect.INHERIT);
+            ProcessBuilder pb = new ProcessBuilder(isWindows
+                ? new String[]{"cmd.exe", "/d", "/s", "/c", probe}
+                : new String[]{"sh", "-c", probe});
+            pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             Process p = pb.start();
-            int exit = p.waitFor();
-            return exit == 0;
+            try { p.getOutputStream().close(); } catch (IOException ignored) {}
+            return p.waitFor() == 0;
         } catch (Exception e) {
             return false;
         }
@@ -446,59 +527,53 @@ public final class CodeMCP {
     private static ProcessResult runCommand(String[] cmd, String cwd, long timeoutMs) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.directory(new File(cwd));
-        pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-        
+        pb.redirectErrorStream(true);              // merge stderr into stdout (matches Python/TS combined output)
+        pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+        scrubEnv(pb);
+
         Process p = pb.start();
-        ExecutorService exec = Executors.newCachedThreadPool();
-        try {
-            Future<String> outFuture = exec.submit(() -> {
-                StringBuilder sb = new StringBuilder();
-                try (var stdout = p.getInputStream();
-                     var reader = new BufferedReader(new InputStreamReader(stdout, StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
+        try { p.getOutputStream().close(); } catch (IOException ignored) {}
+
+        Thread reader = null;
+        StringBuilder sb = new StringBuilder();
+        reader = new Thread(() -> {
+            try (var in = p.getInputStream();
+                 var br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    synchronized (sb) {
                         sb.append(line).append('\n');
                         if (sb.length() > OUTPUT_CAP_MAX) {
-                            return capOutput(sb.toString());
+                            String capped = capOutput(sb.toString());
+                            sb.setLength(0);
+                            sb.append(capped);
                         }
                     }
                 }
-                return sb.toString();
-            });
-            
-            Future<String> errFuture = exec.submit(() -> {
-                StringBuilder sb = new StringBuilder();
-                try (var stderr = p.getErrorStream();
-                     var reader = new BufferedReader(new InputStreamReader(stderr, StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        sb.append(line).append('\n');
-                    }
-                }
-                return sb.toString();
-            });
-            
-            long timeout = timeoutMs > 0 ? timeoutMs : Long.MAX_VALUE;
-            try {
-                boolean finished = p.waitFor(timeout, TimeUnit.MILLISECONDS);
-                if (!finished) {
-                    p.destroyForcibly();
-                    return new ProcessResult(-1, "TIMEOUT");
-                }
-            } catch (InterruptedException e) {
-                p.destroyForcibly();
-                Thread.currentThread().interrupt();
-                return new ProcessResult(-1, "INTERRUPTED");
-            }
-            
-            String stdoutText = outFuture.get(1, TimeUnit.SECONDS);
-            String stderrText = errFuture.get(1, TimeUnit.SECONDS);
-            
-            String result = stdoutText + stderrText;
-            return new ProcessResult(p.exitValue(), capOutput(result));
-        } finally {
-            exec.shutdownNow();
+            } catch (IOException ignored) {}
+        }, "proc-stdout-" + p.pid());
+        reader.setDaemon(true);
+        reader.start();
+
+        long timeout = timeoutMs > 0 ? timeoutMs : Long.MAX_VALUE;
+        boolean finished;
+        try {
+            finished = p.waitFor(timeout, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            p.descendants().forEach(ProcessHandle::destroyForcibly);
+            p.destroyForcibly();
+            Thread.currentThread().interrupt();
+            reader.join(500);
+            return new ProcessResult(-1, capOutput(sb.toString()) + "\n[INTERRUPTED]");
         }
+        if (!finished) {
+            p.descendants().forEach(ProcessHandle::destroyForcibly);
+            p.destroyForcibly();
+            reader.join(500);
+            return new ProcessResult(124, capOutput(sb.toString()) + "\n[TIMEOUT after " + timeoutMs + "ms]");
+        }
+        reader.join();                              // EOF → reader exits naturally
+        return new ProcessResult(p.exitValue(), capOutput(sb.toString()));
     }
     
     // ===== JOB MANAGEMENT =====
@@ -520,72 +595,64 @@ public final class CodeMCP {
     }
     
     private static Job startJob(String command, String cwd) {
-        if (jobs.size() >= MAX_CONCURRENT_JOBS) {
+        if (countRunningJobs() >= MAX_CONCURRENT_JOBS) {
             throw new RuntimeException("max concurrent jobs (" + MAX_CONCURRENT_JOBS + ") exceeded");
         }
         String id = "j" + jobSeq.incrementAndGet();
         ProcessBuilder pb = new ProcessBuilder(shellCmd(command));
         pb.directory(new File(cwd));
-        pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-        
+        pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+        pb.redirectErrorStream(true);
+        scrubEnv(pb);
+
         try {
             Process process = pb.start();
+            try { process.getOutputStream().close(); } catch (IOException ignored) {}
             Job job = new Job(id, command, process);
             jobs.put(id, job);
-            
-            // Pump output in background
+
+            // Use a thread-safe StringBuilder; cap on append. O(n) amortized vs O(n^2) string concat.
+            final StringBuilder sb = new StringBuilder();
             CompletableFuture.runAsync(() -> {
-                try ( var reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                    StringBuilder sb = new StringBuilder();
+                try (var reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        final String l = line;
-                        sb.append(l).append('\n');
-                        job.output.updateAndGet(curr -> {
-                            
-                            String updated = curr + l + '\n';
-                            return updated.length() > OUTPUT_CAP_MAX ? capOutput(updated) : updated;
-                        });
+                        synchronized (sb) {
+                            sb.append(line).append('\n');
+                            if (sb.length() > OUTPUT_CAP_MAX) {
+                                String capped = capOutput(sb.toString());
+                                sb.setLength(0);
+                                sb.append(capped);
+                            }
+                            job.output.set(sb.toString());
+                        }
                     }
                 } catch (IOException e) {
                     // Stream closed
                 }
             });
-            
-            CompletableFuture.runAsync(() -> {
-                try ( var reader = new BufferedReader(new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        final String l = line;
-                        sb.append(l).append('\n');
-                        job.output.updateAndGet(curr -> {
-                            
-                            String updated = curr + l + '\n';
-                            return updated.length() > OUTPUT_CAP_MAX ? capOutput(updated) : updated;
-                        });
-                    }
-                } catch (IOException e) {
-                    // Stream closed
-                }
-            });
-            
-            // Monitor exit
+
             CompletableFuture.runAsync(() -> {
                 try {
                     int code = process.waitFor();
                     job.status = "exited";
                     job.exitCode = code;
-                    jobs.remove(id);
+                    // Keep entry so view_job after exit still works (matches Python/TS).
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             });
-            
+
             return job;
         } catch (IOException e) {
             throw new RuntimeException("Failed to start job: " + e.getMessage(), e);
         }
+    }
+
+    private static int countRunningJobs() {
+        int n = 0;
+        for (Job j : jobs.values()) if ("running".equals(j.status)) n++;
+        return n;
     }
     
     // ===== MEMO MANAGEMENT =====
@@ -611,157 +678,276 @@ public final class CodeMCP {
     @SuppressWarnings("unchecked")
     private static Memo parseMemo(String json) {
         Map<String, Object> m = parseJsonObject(json);
+        List<String> tags = null;
+        if (m.containsKey("tags")) {
+            Object t = m.get("tags");
+            if (t instanceof List<?>) {
+                tags = new ArrayList<>();
+                for (Object item : (List<?>) t) {
+                    if (item instanceof String) tags.add((String) item);
+                    else tags.add(String.valueOf(item));
+                }
+            }
+        }
         return new Memo(
             ((Number) m.get("id")).intValue(),
             ((Number) m.get("ts")).longValue(),
             (String) m.get("memo"),
-            m.containsKey("tags") ? (List<String>) m.get("tags") : null
+            tags
         );
     }
     
-    private static Map<String, Object> parseJsonObject(String json) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        json = json.trim();
-        if (!json.startsWith("{") || !json.endsWith("}")) {
-            throw new RuntimeException("Not a JSON object");
+    // ----- JSON parser (FSM-based, RFC 8259 subset) -----
+    private static final class JsonParser {
+        private static final int MAX_DEPTH = 256;
+        private final String src;
+        private int pos;
+        private int depth = 0;
+        JsonParser(String s) { this.src = s; this.pos = 0; }
+
+        Object parse() {
+            skipWs();
+            Object v = readValue();
+            skipWs();
+            if (pos != src.length()) {
+                throw new RuntimeException("JSON: trailing data at pos " + pos);
+            }
+            return v;
         }
-        json = json.substring(1, json.length() - 1);
-        
-        int depth = 0;
-        StringBuilder current = new StringBuilder();
-        List<String> tokens = new ArrayList<>();
-        
-        for (int i = 0; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '{' || c == '[') depth++;
-            if (c == '}' || c == ']') depth--;
-            if (c == ',' && depth == 0) {
-                tokens.add(current.toString().trim());
-                current = new StringBuilder();
-            } else {
-                current.append(c);
+
+        private void skipWs() {
+            while (pos < src.length()) {
+                char c = src.charAt(pos);
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') pos++;
+                else break;
             }
         }
-        if (current.length() > 0) {
-            tokens.add(current.toString().trim());
+
+        private Object readValue() {
+            skipWs();
+            if (pos >= src.length()) throw new RuntimeException("JSON: unexpected EOF");
+            char c = src.charAt(pos);
+            if (c == '{') return readObject();
+            if (c == '[') return readArray();
+            if (c == '"') return readString();
+            if (c == 't' || c == 'f') return readBool();
+            if (c == 'n') return readNull();
+            if (c == '-' || (c >= '0' && c <= '9')) return readNumber();
+            throw new RuntimeException("JSON: unexpected char '" + c + "' at pos " + pos);
         }
-        
-        for (String token : tokens) {
-            int colonIdx = token.indexOf(':');
-            if (colonIdx == -1) continue;
-            
-            String key = token.substring(0, colonIdx).trim();
-            String value = token.substring(colonIdx + 1).trim();
-            
-            if (key.startsWith("\"") && key.endsWith("\"")) {
-                key = key.substring(1, key.length() - 1);
+
+        private Map<String, Object> readObject() {
+            if (++depth > MAX_DEPTH) throw new RuntimeException("JSON: too deeply nested (>" + MAX_DEPTH + ")");
+            expect('{');
+            Map<String, Object> m = new LinkedHashMap<>();
+            skipWs();
+            if (peek() == '}') { pos++; depth--; return m; }
+            while (true) {
+                skipWs();
+                if (peek() != '"') throw new RuntimeException("JSON: expected string key at pos " + pos);
+                String key = readString();
+                skipWs();
+                expect(':');
+                Object value = readValue();
+                m.put(key, value);
+                skipWs();
+                char c = peek();
+                if (c == ',') { pos++; continue; }
+                if (c == '}') { pos++; depth--; return m; }
+                throw new RuntimeException("JSON: expected ',' or '}' at pos " + pos);
             }
-            
-            if (value.startsWith("\"")) {
-                value = value.substring(1, value.length() - 1);
-                result.put(key, value);
-            } else if (value.equals("null")) {
-                result.put(key, null);
-            } else if (value.equals("true")) {
-                result.put(key, true);
-            } else if (value.equals("false")) {
-                result.put(key, false);
-            } else if (value.startsWith("[")) {
-                result.put(key, parseJsonArray(value));
-            } else if (value.startsWith("{")) {
-                result.put(key, parseJsonObject(value));
-            } else {
-                try {
-                    if (value.contains(".")) {
-                        result.put(key, Double.parseDouble(value));
-                    } else {
-                        result.put(key, Long.parseLong(value));
+        }
+
+        private List<Object> readArray() {
+            if (++depth > MAX_DEPTH) throw new RuntimeException("JSON: too deeply nested (>" + MAX_DEPTH + ")");
+            expect('[');
+            List<Object> list = new ArrayList<>();
+            skipWs();
+            if (peek() == ']') { pos++; depth--; return list; }
+            while (true) {
+                list.add(readValue());
+                skipWs();
+                char c = peek();
+                if (c == ',') { pos++; continue; }
+                if (c == ']') { pos++; depth--; return list; }
+                throw new RuntimeException("JSON: expected ',' or ']' at pos " + pos);
+            }
+        }
+
+        private String readString() {
+            expect('"');
+            StringBuilder sb = new StringBuilder();
+            while (pos < src.length()) {
+                char c = src.charAt(pos++);
+                if (c == '"') return sb.toString();
+                if (c == '\\') {
+                    if (pos >= src.length()) throw new RuntimeException("JSON: dangling escape");
+                    char esc = src.charAt(pos++);
+                    switch (esc) {
+                        case '"': sb.append('"'); break;
+                        case '\\': sb.append('\\'); break;
+                        case '/': sb.append('/'); break;
+                        case 'b': sb.append('\b'); break;
+                        case 'f': sb.append('\f'); break;
+                        case 'n': sb.append('\n'); break;
+                        case 'r': sb.append('\r'); break;
+                        case 't': sb.append('\t'); break;
+                        case 'u':
+                            if (pos + 4 > src.length()) throw new RuntimeException("JSON: bad unicode escape");
+                            int code = Integer.parseInt(src.substring(pos, pos + 4), 16);
+                            pos += 4;
+                            // Surrogate pair handling
+                            if (code >= 0xD800 && code <= 0xDBFF && pos + 6 <= src.length()
+                                    && src.charAt(pos) == '\\' && src.charAt(pos + 1) == 'u') {
+                                int low = Integer.parseInt(src.substring(pos + 2, pos + 6), 16);
+                                if (low >= 0xDC00 && low <= 0xDFFF) {
+                                    sb.appendCodePoint(0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00)));
+                                    pos += 6;
+                                    break;
+                                }
+                            }
+                            sb.append((char) code);
+                            break;
+                        default: throw new RuntimeException("JSON: bad escape '\\" + esc + "'");
                     }
-                } catch (NumberFormatException e) {
-                    result.put(key, value);
+                } else if (c < 0x20) {
+                    throw new RuntimeException("JSON: unescaped control char 0x" + Integer.toHexString(c));
+                } else {
+                    sb.append(c);
                 }
             }
+            throw new RuntimeException("JSON: unterminated string");
         }
-        return result;
+
+        private Object readNumber() {
+            int start = pos;
+            if (peek() == '-') pos++;
+            while (pos < src.length()) {
+                char c = src.charAt(pos);
+                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') pos++;
+                else break;
+            }
+            String num = src.substring(start, pos);
+            if (num.contains(".") || num.contains("e") || num.contains("E")) {
+                return Double.parseDouble(num);
+            }
+            try {
+                return Long.parseLong(num);
+            } catch (NumberFormatException e) {
+                return Double.parseDouble(num);
+            }
+        }
+
+        private Boolean readBool() {
+            if (src.regionMatches(pos, "true", 0, 4)) { pos += 4; return Boolean.TRUE; }
+            if (src.regionMatches(pos, "false", 0, 5)) { pos += 5; return Boolean.FALSE; }
+            throw new RuntimeException("JSON: invalid literal at pos " + pos);
+        }
+
+        private Object readNull() {
+            if (src.regionMatches(pos, "null", 0, 4)) { pos += 4; return null; }
+            throw new RuntimeException("JSON: invalid literal at pos " + pos);
+        }
+
+        private char peek() {
+            if (pos >= src.length()) throw new RuntimeException("JSON: unexpected EOF");
+            return src.charAt(pos);
+        }
+
+        private void expect(char c) {
+            if (pos >= src.length() || src.charAt(pos) != c) {
+                throw new RuntimeException("JSON: expected '" + c + "' at pos " + pos);
+            }
+            pos++;
+        }
     }
-    
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> parseJsonObject(String json) {
+        Object v = new JsonParser(json).parse();
+        if (!(v instanceof Map)) throw new RuntimeException("JSON: expected object, got " + (v == null ? "null" : v.getClass().getSimpleName()));
+        return (Map<String, Object>) v;
+    }
+
+    @SuppressWarnings("unchecked")
     private static List<Object> parseJsonArray(String json) {
-        List<Object> result = new ArrayList<>();
-        json = json.trim();
-        if (!json.startsWith("[") || !json.endsWith("]")) {
-            return result;
-        }
-        json = json.substring(1, json.length() - 1);
-        if (json.trim().isEmpty()) return result;
-        
-        int depth = 0;
-        StringBuilder current = new StringBuilder();
-        List<String> tokens = new ArrayList<>();
-        
-        for (int i = 0; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '{' || c == '[') depth++;
-            if (c == '}' || c == ']') depth--;
-            if (c == ',' && depth == 0) {
-                tokens.add(current.toString().trim());
-                current = new StringBuilder();
-            } else {
-                current.append(c);
-            }
-        }
-        if (current.length() > 0) {
-            tokens.add(current.toString().trim());
-        }
-        
-        for (String token : tokens) {
-            token = token.trim();
-            if (token.startsWith("\"")) {
-                result.add(token.substring(1, token.length() - 1));
-            } else if (token.equals("null")) {
-                result.add(null);
-            } else if (token.equals("true")) {
-                result.add(true);
-            } else if (token.equals("false")) {
-                result.add(false);
-            } else if (token.startsWith("[")) {
-                result.add(parseJsonArray(token));
-            } else if (token.startsWith("{")) {
-                result.add(parseJsonObject(token));
-            } else {
-                try {
-                    if (token.contains(".")) {
-                        result.add(Double.parseDouble(token));
-                    } else {
-                        result.add(Long.parseLong(token));
-                    }
-                } catch (NumberFormatException e) {
-                    result.add(token);
-                }
-            }
-        }
-        return result;
+        Object v = new JsonParser(json).parse();
+        if (!(v instanceof List)) throw new RuntimeException("JSON: expected array");
+        return (List<Object>) v;
+    }
+
+    private static Object parseJsonValue(String json) {
+        return new JsonParser(json).parse();
     }
     
     private static void writeMemos(String cwd, List<Memo> memos) throws IOException {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < memos.size(); i++) {
-            Memo m = memos.get(i);
-            sb.append("{\"id\":").append(m.id)
-              .append(",\"ts\":").append(m.ts)
-              .append(",\"memo\":\"").append(escapeJson(m.memo)).append("\"");
-            if (m.tags != null && !m.tags.isEmpty()) {
-                sb.append(",\"tags\":[");
-                sb.append(m.tags.stream().map(t -> "\"" + escapeJson(t) + "\"").collect(Collectors.joining(",")));
-                sb.append("]");
-            }
-            sb.append("}");
-            if (i < memos.size() - 1) sb.append("\n");
+        for (Memo m : memos) {
+            sb.append(memoToJsonLine(m)).append('\n');
         }
-        Files.writeString(Path.of(cwd, ".memo.jsonl"), sb.toString());
+        synchronized (memoLock) {
+            Path target = Path.of(cwd, ".memo.jsonl");
+            Path tmp = Path.of(cwd, ".memo.jsonl.tmp");
+            Files.writeString(tmp, sb.toString(),
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            try {
+                Files.move(tmp, target,
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private static String memoToJsonLine(Memo m) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"id\":").append(m.id)
+          .append(",\"ts\":").append(m.ts)
+          .append(",\"memo\":\"").append(escapeJson(m.memo)).append("\"");
+        if (m.tags != null && !m.tags.isEmpty()) {
+            sb.append(",\"tags\":[");
+            boolean first = true;
+            for (String t : m.tags) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('"').append(escapeJson(t)).append('"');
+            }
+            sb.append(']');
+        }
+        sb.append('}');
+        return sb.toString();
     }
     
     private static String escapeJson(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '"':  sb.append("\\\""); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                default:
+                    if (Character.isHighSurrogate(c) && i + 1 < s.length() && Character.isLowSurrogate(s.charAt(i + 1))) {
+                        // Valid surrogate pair — pass through as two raw UTF-16 chars; UTF-8 encoder will produce 4 bytes.
+                        sb.append(c);
+                        sb.append(s.charAt(++i));
+                    } else if (Character.isSurrogate(c)) {
+                        // Lone surrogate — emit as \\uXXXX escape so resulting JSON is well-formed UTF-8.
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F) || c == 0x2028 || c == 0x2029) {
+                        // C0+C1 controls, DEL, and JS-hostile U+2028/U+2029.
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
     }
     
     private static int lastMemoId(String cwd) throws IOException {
@@ -802,12 +988,17 @@ public final class CodeMCP {
     private static String handleRead(String cwd, String path, int[] range, boolean noTruncate) throws IOException {
         Path file = safeResolveFile(cwd, path);
         String content = Files.readString(file);
+        if (range != null) {
+            if (range.length != 2) throw new RuntimeException("range must be [start, end]");
+            if (range[0] < 1 || range[1] < range[0]) throw new RuntimeException("invalid range [" + range[0] + ", " + range[1] + "]");
+            // Preserve trailing CR if present so original line endings round-trip.
+            String[] lines = content.split("\n", -1);
+            int start = Math.min(range[0] - 1, lines.length);
+            int end = Math.min(range[1], lines.length);
+            content = String.join("\n", Arrays.copyOfRange(lines, start, end));
+        }
         if (noTruncate) return content;
-        if (range == null) return content;
-        String[] lines = content.split("\n");
-        int start = Math.max(0, range[0] - 1);
-        int end = Math.min(lines.length, range[1]);
-        return String.join("\n", Arrays.copyOfRange(lines, start, end));
+        return maybeSpillText(content, "read");
     }
     
     // --- write tool ---
@@ -950,13 +1141,14 @@ public final class CodeMCP {
         if (hasRg) {
             cmd = new String[]{"rg", "--line-number", "--no-heading", "--color=never"};
             if (glob != null) cmd = append(cmd, "--glob", glob);
-            cmd = append(cmd, pattern, path != null ? path : ".");
+            // `--` so a pattern starting with `-` isn't parsed as a flag.
+            cmd = append(cmd, "--", pattern, path != null ? path : ".");
         } else if (isWindows && hasFindstr) {
             cmd = new String[]{"findstr", "/r", "/n", pattern, glob != null ? path + "\\" + glob.replace("*", "*") : (path != null ? path : ".")};
         } else {
             cmd = new String[]{"grep", "-rEn"};
             if (glob != null) cmd = append(cmd, "--include", glob);
-            cmd = append(cmd, pattern, path != null ? path : ".");
+            cmd = append(cmd, "--", pattern, path != null ? path : ".");
         }
         
         ProcessResult result = runCommand(cmd, cwd, 0);
@@ -1091,19 +1283,17 @@ public final class CodeMCP {
         if (mode.equals("stop")) {
             if (!j.status.equals("running")) return j.id + " already " + j.status;
             long timeout = timeoutMs != null ? timeoutMs : 500;
+            // Kill the process AND its descendants so shell children don't orphan.
+            j.process.descendants().forEach(ProcessHandle::destroy);
             j.process.destroy();
             try {
-                Thread.sleep(timeout);
+                if (!j.process.waitFor(timeout, TimeUnit.MILLISECONDS)) {
+                    j.process.descendants().forEach(ProcessHandle::destroyForcibly);
+                    j.process.destroyForcibly();
+                    j.process.waitFor();
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-            }
-            if (j.status.equals("running")) {
-                j.process.destroyForcibly();
-                try {
-                    j.process.waitFor();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
             }
             return j.id + " stopped";
         }
@@ -1112,6 +1302,15 @@ public final class CodeMCP {
     }
     
     // --- mcp tool ---
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> loadMcpServers(Path configFullPath) throws IOException {
+        String content = Files.readString(configFullPath, StandardCharsets.UTF_8);
+        Map<String, Object> parsed = parseJsonObject(content);
+        Object servers = parsed.get("mcpServers");
+        if (!(servers instanceof Map)) return Map.of();
+        return (Map<String, Object>) servers;
+    }
+
     private static String handleMcp(String cwd, String action, String server, String tool, Map<String, Object> args, String mcpCfgPath) {
         String cfgPath = mcpCfgPath != null ? mcpCfgPath : ".mcp.json";
         Path configFullPath = Path.of(cwd, cfgPath);
@@ -1119,63 +1318,77 @@ public final class CodeMCP {
         if (action.equals("list")) {
             try {
                 if (!Files.exists(configFullPath)) {
-                    return "{ \"servers\": [], \"mcpConfigPath\": \"" + escapeJson(cfgPath) + "\" }";
+                    return "{\"servers\":[],\"mcpConfigPath\":\"" + escapeJson(cfgPath) + "\"}";
                 }
-                String content = Files.readString(configFullPath);
-                // Extract server names using simple regex
-                List<String> serverNames = new ArrayList<>();
-                Pattern p = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\\{");
-                Matcher m = p.matcher(content);
-                while (m.find()) {
-                    String name = m.group(1);
-                    if (!name.equals("mcpServers")) serverNames.add(name);
-                }
+                Map<String, Object> servers = loadMcpServers(configFullPath);
                 List<String> result = new ArrayList<>();
-                for (String name : serverNames) {
+                for (String name : servers.keySet()) {
                     String key = cwd + ":" + name;
-                    boolean isLoaded = mcpProcesses.containsKey(key) && mcpProcesses.get(key).isAlive();
-                    result.add("{ \"name\": \"" + escapeJson(name) + "\", \"status\": \"" + (isLoaded ? "loaded" : "unloaded") + "\", \"tools\": [] }");
+                    Process p = mcpProcesses.get(key);
+                    boolean isLoaded = (p != null) && p.isAlive();
+                    result.add("{\"name\":\"" + escapeJson(name) + "\",\"status\":\"" + (isLoaded ? "loaded" : "unloaded") + "\",\"tools\":[]}");
                 }
-                return "{ \"servers\": [" + String.join(",", result) + "], \"mcpConfigPath\": \"" + escapeJson(cfgPath) + "\" }";
+                return "{\"servers\":[" + String.join(",", result) + "],\"mcpConfigPath\":\"" + escapeJson(cfgPath) + "\"}";
             } catch (Exception e) {
-                return "{ \"error\": \"" + escapeJson(e.getMessage()) + "\" }";
+                return "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}";
             }
         }
 
         if (action.equals("call")) {
-            if (server == null || server.isEmpty()) return "{ \"error\": \"server name required for call action\" }";
-            if (tool == null || tool.isEmpty()) return "{ \"error\": \"tool name required for call action\" }";
+            if (server == null || server.isEmpty()) return "{\"error\":\"server name required for call action\"}";
+            if (tool == null || tool.isEmpty()) return "{\"error\":\"tool name required for call action\"}";
             try {
                 if (!Files.exists(configFullPath)) {
-                    return "{ \"error\": \".mcp.json not found at " + escapeJson(cfgPath) + "\" }";
+                    return "{\"error\":\".mcp.json not found at " + escapeJson(cfgPath) + "\"}";
                 }
-                String content = Files.readString(configFullPath);
-                // Find server command
-                Pattern serverPat = Pattern.compile("\"" + Pattern.quote(server) + "\"\\s*:\\s*\\{[^}]*\"command\"\\s*:\\s*\"([^\"]+)\"");
-                Matcher serverMat = serverPat.matcher(content);
-                if (!serverMat.find()) {
-                    return "{ \"error\": \"server '" + escapeJson(server) + "' not found in .mcp.json\" }";
+                Map<String, Object> servers = loadMcpServers(configFullPath);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> serverCfg = (Map<String, Object>) servers.get(server);
+                if (serverCfg == null) {
+                    return "{\"error\":\"server '" + escapeJson(server) + "' not found in .mcp.json\"}";
                 }
-                String cmd = serverMat.group(1);
+                String cmd = (String) serverCfg.get("command");
+                if (cmd == null) return "{\"error\":\"server '" + escapeJson(server) + "' missing 'command'\"}";
+                List<String> cmdArgs = new ArrayList<>();
+                cmdArgs.add(cmd);
+                Object cfgArgs = serverCfg.get("args");
+                if (cfgArgs instanceof List) {
+                    for (Object a : (List<?>) cfgArgs) cmdArgs.add(String.valueOf(a));
+                }
                 String key = cwd + ":" + server;
-
-                if (!mcpProcesses.containsKey(key) || mcpProcesses.get(key).isAlive() == false) {
-                    ProcessBuilder pb = new ProcessBuilder(cmd.split("\\s+"));
-                    pb.directory(Path.of(cwd).toFile());
-                    pb.redirectErrorStream(true);
-                    Process proc = pb.start();
-                    mcpProcesses.put(key, proc);
-                    mcpServerTools.put(key, List.of("placeholder"));
+                // Serialize spawn-and-handshake to avoid two concurrent calls each spawning.
+                Process proc;
+                synchronized (mcpProcesses) {
+                    proc = mcpProcesses.get(key);
+                    if (proc == null || !proc.isAlive()) {
+                        ProcessBuilder pb = new ProcessBuilder(cmdArgs);
+                        pb.directory(Path.of(cwd).toFile());
+                        pb.redirectErrorStream(true);
+                        scrubEnv(pb);
+                        proc = pb.start();
+                        mcpProcesses.put(key, proc);
+                    }
                 }
-
-                Process proc = mcpProcesses.get(key);
                 Map<String, Object> callArgs = new LinkedHashMap<>();
                 callArgs.put("name", tool);
                 callArgs.put("arguments", args != null ? args : Map.of());
-                Map<?, ?> result = mcpCall(key, proc, "tools/call", callArgs);
-                return toJson(result);
+                try {
+                    Map<?, ?> result = mcpCall(key, proc, "tools/call", callArgs);
+                    return toJson(result);
+                } catch (Exception callErr) {
+                    // Probe failed — clean up so the next attempt re-spawns fresh.
+                    synchronized (mcpProcesses) {
+                        Process tracked = mcpProcesses.get(key);
+                        if (tracked == proc) {
+                            mcpProcesses.remove(key);
+                            mcpServerTools.remove(key);
+                        }
+                    }
+                    try { proc.destroy(); } catch (Exception ignored) {}
+                    return "{\"error\":\"" + escapeJson(callErr.getMessage()) + "\"}";
+                }
             } catch (Exception e) {
-                return "{ \"error\": \"" + escapeJson(e.getMessage()) + "\" }";
+                return "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}";
             }
         }
 
@@ -1197,28 +1410,48 @@ public final class CodeMCP {
     }
 
     private static Map<?, ?> mcpCall(String key, Process proc, String method, Map<String, Object> params) throws Exception {
-        synchronized (mcpIdLock) { mcpNextId++; }
-        int reqId = mcpNextId;
+        // Allocate id under the lock so concurrent callers don't both read the same value.
+        int reqId;
+        synchronized (mcpIdLock) {
+            mcpNextId++;
+            reqId = mcpNextId;
+        }
         String json = "{\"jsonrpc\":\"2.0\",\"id\":" + reqId + ",\"method\":\"" + method + "\",\"params\":" + toJson(params) + "}\n";
-        proc.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
-        proc.getOutputStream().flush();
+        try {
+            proc.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
+            proc.getOutputStream().flush();
+        } catch (IOException e) {
+            throw new IOException("MCP server pipe broken: " + e.getMessage(), e);
+        }
 
+        BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
         long deadline = System.currentTimeMillis() + 30000;
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
         while (System.currentTimeMillis() < deadline) {
-            int available = proc.getInputStream().available();
-            if (available > 0) {
-                baos.write(proc.getInputStream().readAllBytes());
-                String output = baos.toString(StandardCharsets.UTF_8);
-                for (String line : output.split("\n")) {
-                    if (line.isEmpty()) continue;
-                    if (line.contains("\"id\":" + reqId)) {
-                        if (line.contains("\"error\"")) return Map.of("error", "MCP error");
-                        return Map.of("result", line);
-                    }
-                }
+            String line;
+            try {
+                line = reader.readLine();
+            } catch (IOException e) {
+                throw new IOException("MCP server read failed: " + e.getMessage(), e);
             }
-            Thread.sleep(50);
+            if (line == null) {
+                throw new EOFException("MCP server process ended");
+            }
+            if (line.isBlank()) continue;
+            // Match the id exactly by parsing the JSON response — substring contains() would
+            // match id=1 against id=10/11/100 etc.
+            try {
+                Map<String, Object> resp = parseJsonObject(line);
+                Object respId = resp.get("id");
+                if (respId == null) continue;
+                long respIdLong = (respId instanceof Number) ? ((Number) respId).longValue() : -1;
+                if (respIdLong != reqId) continue;
+                if (resp.containsKey("error")) return Map.of("error", resp.get("error"));
+                Object result = resp.get("result");
+                return result instanceof Map ? (Map<?, ?>) result : Map.of("result", result);
+            } catch (RuntimeException ex) {
+                // Not a valid JSON line — skip (could be stderr that leaked into stdout).
+                continue;
+            }
         }
         throw new RuntimeException("MCP server response timeout");
     }
@@ -1226,10 +1459,25 @@ public final class CodeMCP {
     private static String toJson(Object obj) {
         if (obj == null) return "null";
         if (obj instanceof String) return "\"" + escapeJson((String) obj) + "\"";
-        if (obj instanceof Number || obj instanceof Boolean) return String.valueOf(obj);
+        if (obj instanceof Boolean) return String.valueOf(obj);
+        if (obj instanceof Number) {
+            // Avoid NaN/Infinity which are not valid JSON.
+            Number n = (Number) obj;
+            if (n instanceof Double || n instanceof Float) {
+                double d = n.doubleValue();
+                if (Double.isNaN(d) || Double.isInfinite(d)) return "null";
+            }
+            return n.toString();
+        }
         if (obj instanceof List) {
             List<?> list = (List<?>) obj;
-            return "[" + list.stream().map(Object::toString).collect(Collectors.joining(",")) + "]";
+            StringBuilder sb = new StringBuilder("[");
+            String sep = "";
+            for (Object item : list) {
+                sb.append(sep).append(toJson(item));
+                sep = ",";
+            }
+            return sb.append("]").toString();
         }
         if (obj instanceof Map) {
             Map<?, ?> map = (Map<?, ?>) obj;
@@ -1272,15 +1520,13 @@ public final class CodeMCP {
     
     // --- memory tools (remember/forget/recall) ---
     private static String handleRemember(String cwd, String memo, List<String> tags) throws IOException {
-        int id = lastMemoId(cwd) + 1;
-        Memo m = new Memo(id, System.currentTimeMillis(), memo, tags);
-        String line = "{\"id\":" + id + ",\"ts\":" + m.ts + ",\"memo\":\"" + escapeJson(m.memo) + "\"}";
-        if (tags != null && !tags.isEmpty()) {
-            line = "{\"id\":" + id + ",\"ts\":" + m.ts + ",\"memo\":\"" + escapeJson(m.memo) + "\",\"tags\":[" +
-                tags.stream().map(t -> "\"" + escapeJson(t) + "\"").collect(Collectors.joining(",")) + "]}";
+        synchronized (memoLock) {
+            int id = lastMemoId(cwd) + 1;
+            Memo m = new Memo(id, System.currentTimeMillis(), memo, tags);
+            Files.writeString(Path.of(cwd, ".memo.jsonl"), memoToJsonLine(m) + "\n",
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            return "remembered #" + id;
         }
-        Files.writeString(Path.of(cwd, ".memo.jsonl"), line + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-        return "remembered #" + id;
     }
     
     private static String handleForget(String cwd, int memoId) throws IOException {
@@ -1304,7 +1550,7 @@ public final class CodeMCP {
                 }
             }
             return true;
-        }).sorted((a, b) -> b.id - a.id).collect(Collectors.toList());
+        }).sorted((a, b) -> Integer.compare(b.id, a.id)).collect(Collectors.toList());
         
         int fromIndex = Math.min(offset, memos.size());
         int toIndex = Math.min(offset + limit, memos.size());
@@ -1342,66 +1588,124 @@ public final class CodeMCP {
             Headers headers = exchange.getResponseHeaders();
             headers.add("Access-Control-Allow-Origin", "*");
             headers.add("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-            headers.add("Access-Control-Allow-Headers", "Content-Type");
-            
+            headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
             if (exchange.getRequestMethod().equals("OPTIONS")) {
                 exchange.sendResponseHeaders(204, -1);
                 exchange.close();
                 return;
             }
-            
-            // Token check
+
+            // Token check (constant-time compare, supports ?token=… and Authorization: Bearer …)
             if (token != null) {
                 String reqToken = parseQueryParam(exchange.getRequestURI(), "token");
-                if (!token.equals(reqToken)) {
-                    String response = "{\"error\":\"unauthorized\"}";
-                    exchange.sendResponseHeaders(401, response.length());
-                    exchange.getResponseBody().write(response.getBytes());
-                    exchange.close();
+                if (reqToken == null) {
+                    String authHdr = exchange.getRequestHeaders().getFirst("Authorization");
+                    if (authHdr != null && authHdr.startsWith("Bearer ")) {
+                        reqToken = authHdr.substring(7).trim();
+                    }
+                }
+                byte[] expected = token.getBytes(StandardCharsets.UTF_8);
+                byte[] given = reqToken == null ? new byte[0] : reqToken.getBytes(StandardCharsets.UTF_8);
+                if (!MessageDigest.isEqual(expected, given)) {
+                    writeJsonResponse(exchange, 401, "{\"error\":\"unauthorized\"}");
                     return;
                 }
             }
-            
-            String body;
-            try (var reader = new BufferedReader(new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8))) {
-                body = reader.lines().collect(Collectors.joining("\n"));
+
+            // Cap request body size
+            long contentLen = -1;
+            String clHdr = exchange.getRequestHeaders().getFirst("Content-Length");
+            if (clHdr != null) {
+                try { contentLen = Long.parseLong(clHdr); } catch (NumberFormatException ignored) {}
             }
-            
+            if (contentLen > MAX_REQUEST_BYTES) {
+                writeJsonResponse(exchange, 413, "{\"error\":\"request too large\"}");
+                return;
+            }
+            String body = readBodyCapped(exchange.getRequestBody(), MAX_REQUEST_BYTES);
+
+            String idStr;
             try {
                 Map<String, Object> request = parseJsonObject(body);
-                String idStr = request.containsKey("id") ? String.valueOf(request.get("id")) : null;
+                idStr = request.containsKey("id") ? toJson(request.get("id")) : "null";
                 String method = (String) request.get("method");
                 @SuppressWarnings("unchecked")
-                Map<String, Object> params = (Map<String, Object>) request.get("params");
-                
+                Object paramsObj = request.get("params");
+                if (paramsObj != null && !(paramsObj instanceof Map)) {
+                    String response = "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"error\":{\"code\":-32602,\"message\":\"Invalid params: expected object\"}}";
+                    writeJsonResponse(exchange, 400, response);
+                    return;
+                }
+                Map<String, Object> params = (Map<String, Object>) paramsObj;
+
+                // Notifications have no id and expect no response body.
+                if (method != null && method.startsWith("notifications/")) {
+                    exchange.sendResponseHeaders(204, -1);
+                    exchange.close();
+                    return;
+                }
+
                 Object result = handleMcpMethod(method, params);
-                
+
                 String response;
                 if (result instanceof String && ((String) result).startsWith("ERROR")) {
-                    response = "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"error\":{\"code\":-32603,\"message\":" + jsonQuote((String) result) + "}}";
+                    String errMsg = (String) result;
+                    int code = -32603;
+                    if (errMsg.startsWith("ERROR:-32601:")) {
+                        code = -32601;
+                        errMsg = errMsg.substring("ERROR:-32601:".length()).trim();
+                    } else if (errMsg.startsWith("ERROR:-32602:")) {
+                        code = -32602;
+                        errMsg = errMsg.substring("ERROR:-32602:".length()).trim();
+                    }
+                    response = "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"error\":{\"code\":" + code + ",\"message\":" + jsonQuote(errMsg) + "}}";
                 } else {
                     String resultJson = serializeResult(result);
                     response = "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"result\":" + resultJson + "}";
                 }
-                
-                headers.add("Content-Type", "application/json");
-                exchange.sendResponseHeaders(200, response.length());
-                exchange.getResponseBody().write(response.getBytes());
+                writeJsonResponse(exchange, 200, response);
             } catch (Exception e) {
-                String response = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":" + jsonQuote(e.getMessage()) + "}}";
-                headers.add("Content-Type", "application/json");
-                exchange.sendResponseHeaders(200, response.length());
-                exchange.getResponseBody().write(response.getBytes());
+                String response = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":" + jsonQuote(e.getMessage()) + "}}";
+                writeJsonResponse(exchange, 400, response);
             }
-            exchange.close();
+        }
+
+        private static void writeJsonResponse(HttpExchange exchange, int status, String body) throws IOException {
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+            exchange.sendResponseHeaders(status, bytes.length);
+            try (var os = exchange.getResponseBody()) {
+                os.write(bytes);
+            }
+        }
+
+        private static String readBodyCapped(InputStream in, long maxBytes) throws IOException {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            long total = 0;
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                total += n;
+                if (total > maxBytes) throw new IOException("request body exceeds " + maxBytes + " bytes");
+                out.write(buf, 0, n);
+            }
+            return out.toString(StandardCharsets.UTF_8);
         }
         
         private String parseQueryParam(URI uri, String param) {
-            String query = uri.getQuery();
+            String query = uri.getRawQuery();
             if (query == null) return null;
             for (String pair : query.split("&")) {
                 String[] kv = pair.split("=", 2);
-                if (kv.length == 2 && kv[0].equals(param)) {
+                String key;
+                try {
+                    key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
+                } catch (Exception e) {
+                    key = kv[0];
+                }
+                if (key.equals(param)) {
+                    if (kv.length < 2) return "";
                     try {
                         return URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
                     } catch (Exception e) {
@@ -1452,6 +1756,10 @@ public final class CodeMCP {
         }
         
         private static Object handleMcpMethod(String method, Map<String, Object> params) {
+            if (method == null) return "ERROR: missing method";
+            // Handshake notifications & ping
+            if (method.startsWith("notifications/")) return Map.of();
+            if (method.equals("ping")) return Map.of();
             return switch (method) {
                 case "initialize" -> Map.of(
                     "protocolVersion", "2024-11-05",
@@ -1558,7 +1866,12 @@ public final class CodeMCP {
                         tools.add(makeTool("get_upload_link", "Return an upload link.",
                             List.of()));
                     }
-                    
+
+                    // Strip any tool that was disabled via --disallowed-tools.
+                    if (!disallowedTools.isEmpty()) {
+                        tools.removeIf(t -> disallowedTools.contains((String) t.get("name")));
+                    }
+
                     yield Map.of("tools", tools);
                 }
                 case "tools/call" -> {
@@ -1569,7 +1882,19 @@ public final class CodeMCP {
                     if (name == null) {
                         yield "ERROR: tool name required";
                     }
-                    
+                    if (disallowedTools.contains(name)) {
+                        yield Map.of("content", List.of(Map.of("type", "text",
+                            "text", "ERROR: tool '" + name + "' disabled")));
+                    }
+                    // Only allow the shell tool matching the detected shell.
+                    if ((name.equals("bash") && detectedShell != ShellType.BASH)
+                            || (name.equals("shell") && detectedShell != ShellType.SH)
+                            || (name.equals("command") && detectedShell != ShellType.CMD)
+                            || (name.equals("powershell") && detectedShell != ShellType.POWERSHELL)) {
+                        yield Map.of("content", List.of(Map.of("type", "text",
+                            "text", "ERROR: tool '" + name + "' not available on this shell (" + detectedShell + ")")));
+                    }
+
                     String result;
                     try {
                         result = switch (name) {
@@ -1666,7 +1991,7 @@ public final class CodeMCP {
                     
                     yield Map.of("content", List.of(Map.of("type", "text", "text", result)));
                 }
-                default -> "ERROR: unknown method: " + method;
+                default -> "ERROR:-32601: unknown method: " + method;
             };
         }
         
@@ -1689,14 +2014,18 @@ public final class CodeMCP {
         
         private static int[] parseRange(Object range) {
             if (range == null) return null;
-            if (range instanceof List) {
-                @SuppressWarnings("unchecked")
-                List<Number> r = (List<Number>) range;
-                if (r.size() >= 2) {
-                    return new int[]{r.get(0).intValue(), r.get(1).intValue()};
-                }
+            if (!(range instanceof List)) {
+                throw new RuntimeException("range must be [start, end]");
             }
-            return null;
+            List<?> r = (List<?>) range;
+            if (r.size() != 2) {
+                throw new RuntimeException("range must have exactly 2 elements, got " + r.size());
+            }
+            Object a = r.get(0), b = r.get(1);
+            if (!(a instanceof Number) || !(b instanceof Number)) {
+                throw new RuntimeException("range must be [start, end] integers");
+            }
+            return new int[]{((Number) a).intValue(), ((Number) b).intValue()};
         }
         
         private static Long parseNumber(Object n) {
@@ -1737,10 +2066,10 @@ public final class CodeMCP {
             VerificationResult check = verifyUploadSessionId(sessionId);
             if (!check.ok()) {
                 String response = "{\"error\":" + jsonQuote(check.reason()) + "}";
-                headers.add("Content-Type", "application/json");
-                exchange.sendResponseHeaders(401, response.length());
-                exchange.getResponseBody().write(response.getBytes());
-                exchange.close();
+                byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+                headers.add("Content-Type", "application/json; charset=utf-8");
+                exchange.sendResponseHeaders(401, bytes.length);
+                try (var os = exchange.getResponseBody()) { os.write(bytes); }
                 return;
             }
             
@@ -1769,117 +2098,153 @@ public final class CodeMCP {
         }
         
         private void handleUpload(HttpExchange exchange, String sessionId) throws IOException {
-            Headers headers = exchange.getResponseHeaders();
-            headers.add("Content-Type", "application/json");
-            
+            Headers respHdr = exchange.getResponseHeaders();
+            respHdr.add("Content-Type", "application/json; charset=utf-8");
+
             try {
                 String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
                 if (contentType == null || !contentType.contains("multipart/form-data")) {
-                    String response = "{\"error\":\"expected multipart/form-data\"}";
-                    exchange.sendResponseHeaders(400, response.length());
-                    exchange.getResponseBody().write(response.getBytes());
-                    exchange.close();
+                    writeJson(exchange, 400, "{\"error\":\"expected multipart/form-data\"}");
                     return;
                 }
-                
-                byte[] body;
-                try ( var baos = new ByteArrayOutputStream()) {
-                    exchange.getRequestBody().transferTo(baos);
-                    body = baos.toByteArray();
+                long contentLen = -1;
+                String clHdr = exchange.getRequestHeaders().getFirst("Content-Length");
+                if (clHdr != null) {
+                    try { contentLen = Long.parseLong(clHdr); } catch (NumberFormatException ignored) {}
                 }
-                
-                Pattern boundaryPat = Pattern.compile("boundary=(.+?)(?:;|$)");
-                Matcher m = boundaryPat.matcher(contentType);
+                if (contentLen > MAX_UPLOAD_BYTES) {
+                    writeJson(exchange, 413, "{\"error\":\"upload exceeds " + MAX_UPLOAD_BYTES + " bytes\"}");
+                    return;
+                }
+
+                // Read body with hard byte cap.
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                byte[] buf = new byte[64 * 1024];
+                long total = 0;
+                try (InputStream in = exchange.getRequestBody()) {
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        total += n;
+                        if (total > MAX_UPLOAD_BYTES) {
+                            writeJson(exchange, 413, "{\"error\":\"upload exceeds " + MAX_UPLOAD_BYTES + " bytes\"}");
+                            return;
+                        }
+                        baos.write(buf, 0, n);
+                    }
+                }
+                byte[] body = baos.toByteArray();
+
+                Matcher m = Pattern.compile("boundary=\"?([^\";]+)\"?").matcher(contentType);
                 if (!m.find()) {
-                    String response = "{\"error\":\"no boundary\"}";
-                    exchange.sendResponseHeaders(400, response.length());
-                    exchange.getResponseBody().write(response.getBytes());
-                    exchange.close();
+                    writeJson(exchange, 400, "{\"error\":\"no boundary\"}");
                     return;
                 }
-                String boundary = "--" + m.group(1);
-                
-                Path uploadDir = Path.of(uploadRoot, sessionId);
-                Files.createDirectories(uploadDir);
-                
-                String bodyStr = new String(body, StandardCharsets.UTF_8);
-                String[] parts = bodyStr.split(Pattern.quote(boundary));
-                
+                byte[] boundary = ("--" + m.group(1)).getBytes(StandardCharsets.US_ASCII);
+
+                List<int[]> parts = splitMultipart(body, boundary);
                 String fileName = null;
                 byte[] fileContent = null;
-                
-                for (String part : parts) {
-                    if (part.trim().isEmpty() || part.equals("--")) continue;
-                    int headerEnd = part.indexOf("\r\n\r\n");
-                    if (headerEnd == -1) continue;
-                    
-                    String partHeader = part.substring(0, headerEnd);
-                    String partBody = part.substring(headerEnd + 4);
-                    
-                    if (partBody.endsWith("\r\n")) {
-                        partBody = partBody.substring(0, partBody.length() - 2);
+                for (int[] range : parts) {
+                    int hdrEnd = findBytes(body, range[0], range[1], new byte[]{'\r','\n','\r','\n'});
+                    if (hdrEnd < 0) continue;
+                    String partHeaders = new String(body, range[0], hdrEnd - range[0], StandardCharsets.ISO_8859_1);
+                    Matcher fn = Pattern.compile("filename=\"([^\"]+)\"").matcher(partHeaders);
+                    if (!fn.find()) continue;
+                    fileName = fn.group(1);
+                    int contentStart = hdrEnd + 4;
+                    int contentEnd = range[1];
+                    // Strip trailing CRLF before boundary delimiter.
+                    if (contentEnd - 2 >= contentStart && body[contentEnd - 2] == '\r' && body[contentEnd - 1] == '\n') {
+                        contentEnd -= 2;
                     }
-                    
-                    Pattern fnPat = Pattern.compile("filename=\"([^\"]+)\"");
-                    if (fnPat.matcher(partHeader).find()) {
-                        Matcher fnMatcher = fnPat.matcher(partHeader);
-                        if (fnMatcher.find()) {
-                            fileName = fnMatcher.group(1);
-                            int bodyStart = part.indexOf("\r\n\r\n") + 4;
-                            byte[] partBytes = Arrays.copyOfRange(body, bodyStart, body.length);
-                            int endMarkerStart = -1;
-                            for (int i = 0; i < partBytes.length - boundary.length() - 2; i++) {
-                                if (new String(partBytes, i, boundary.length() + 2, StandardCharsets.UTF_8).startsWith(boundary)) {
-                                    endMarkerStart = i;
-                                    break;
-                                }
-                            }
-                            if (endMarkerStart > 0) {
-                                fileContent = Arrays.copyOf(partBytes, endMarkerStart - 2);
-                            } else {
-                                fileContent = partBytes;
-                            }
-                        }
-                    }
+                    fileContent = Arrays.copyOfRange(body, contentStart, contentEnd);
+                    break;
                 }
-                
+
                 if (fileName == null || fileContent == null) {
-                    String response = "{\"error\":\"no file provided\"}";
-                    exchange.sendResponseHeaders(400, response.length());
-                    exchange.getResponseBody().write(response.getBytes());
-                    exchange.close();
+                    writeJson(exchange, 400, "{\"error\":\"no file provided\"}");
                     return;
                 }
-                
+
+                // Strip path components fully before sanitising — defends against `..` and `/`.
+                fileName = fileName.replace("\\", "/");
+                int slash = fileName.lastIndexOf('/');
+                if (slash >= 0) fileName = fileName.substring(slash + 1);
                 fileName = fileName.replaceAll("[^A-Za-z0-9._-]", "_");
-                
+                if (fileName.isEmpty() || fileName.equals(".") || fileName.equals("..")) {
+                    fileName = "upload-" + System.currentTimeMillis();
+                }
+
+                Path uploadDir = Path.of(uploadRoot, sessionId);
+                Files.createDirectories(uploadDir);
                 Path filePath = uploadDir.resolve(fileName);
-                Files.write(filePath, fileContent, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                
+                Files.write(filePath, fileContent,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
                 MessageDigest md = MessageDigest.getInstance("SHA-256");
                 byte[] hash = md.digest(fileContent);
                 StringBuilder hashHex = new StringBuilder();
                 for (byte b : hash) hashHex.append(String.format("%02x", b));
-                
+
                 String mime = Files.probeContentType(filePath);
                 if (mime == null) mime = "application/octet-stream";
-                
+
                 String response = String.format(
                     "{\"path\":%s,\"size\":%d,\"sha256\":%s,\"mime\":%s}",
                     jsonQuote(filePath.toString()),
                     fileContent.length,
                     jsonQuote(hashHex.toString()),
-                    jsonQuote(mime)
-                );
-                
-                exchange.sendResponseHeaders(200, response.length());
-                exchange.getResponseBody().write(response.getBytes());
+                    jsonQuote(mime));
+                writeJson(exchange, 200, response);
             } catch (Exception e) {
-                String response = "{\"error\":" + jsonQuote(e.getMessage()) + "}";
-                exchange.sendResponseHeaders(500, response.length());
-                exchange.getResponseBody().write(response.getBytes());
+                writeJson(exchange, 500, "{\"error\":" + jsonQuote(e.getMessage()) + "}");
             }
-            exchange.close();
+        }
+
+        private static void writeJson(HttpExchange exchange, int status, String body) throws IOException {
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(status, bytes.length);
+            try (var os = exchange.getResponseBody()) {
+                os.write(bytes);
+            }
+        }
+
+        private static List<int[]> splitMultipart(byte[] body, byte[] boundary) {
+            // Return list of [start, end) ranges per part, excluding leading boundary line and trailing CRLF.
+            List<int[]> ranges = new ArrayList<>();
+            int idx = 0;
+            int n = body.length;
+            int bLen = boundary.length;
+            while (idx < n) {
+                int b = findBytes(body, idx, n, boundary);
+                if (b < 0) break;
+                int partStart = b + bLen;
+                // Skip CRLF after boundary
+                if (partStart + 1 < n && body[partStart] == '\r' && body[partStart + 1] == '\n') partStart += 2;
+                // Check for final boundary marker "--"
+                if (partStart + 1 < n && body[partStart] == '-' && body[partStart + 1] == '-') break;
+                int next = findBytes(body, partStart, n, boundary);
+                if (next < 0) break;
+                // Trim the "\r\n" before the next boundary marker.
+                int partEnd = next;
+                if (partEnd - 2 >= partStart && body[partEnd - 2] == '\r' && body[partEnd - 1] == '\n') {
+                    partEnd -= 2;
+                }
+                ranges.add(new int[]{partStart, partEnd});
+                idx = next;
+            }
+            return ranges;
+        }
+
+        private static int findBytes(byte[] haystack, int from, int to, byte[] needle) {
+            outer:
+            for (int i = from; i <= to - needle.length; i++) {
+                for (int j = 0; j < needle.length; j++) {
+                    if (haystack[i + j] != needle[j]) continue outer;
+                }
+                return i;
+            }
+            return -1;
         }
         
         private String getUploadPageHtml(String sessionId) {
@@ -2071,208 +2436,271 @@ public final class CodeMCP {
         }
     }
 
-    // ===== GATEWAY CLIENT =====
-    private static void startGatewayClient(String domain, String deviceIdParam) throws Exception {
-        String deviceId = deviceIdParam != null ? deviceIdParam : UUID.randomUUID().toString();
-        int RECONNECT_DELAY_MS = 3000;
-        int MAX_RETRIES = 10;
-        int[] retries = {0};
+    private static final String WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    private static final SecureRandom WS_RNG = new SecureRandom();
 
-        new Thread(() -> {
-            System.err.println("[gateway] starting client for: " + domain + " with deviceId: " + deviceId);
-            while (true) {
+    // Shared HTTP client + dispatch pool for gateway tunnel — reused across all messages.
+    private static final HttpClient GATEWAY_HTTP = HttpClient.newBuilder()
+            .connectTimeout(java.time.Duration.ofSeconds(10))
+            .build();
+    // Bounded queue + caller-runs policy so a slow handler can't OOM the server
+    // by accumulating thousands of pending tunnel messages.
+    private static final ExecutorService GATEWAY_DISPATCH = new ThreadPoolExecutor(
+        4, 16, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(64),
+        r -> {
+            Thread t = new Thread(r, "gw-dispatch-" + System.nanoTime());
+            t.setDaemon(true);
+            return t;
+        },
+        new ThreadPoolExecutor.CallerRunsPolicy());
+
+    // ===== GATEWAY CLIENT =====
+    private static void startGatewayClient(String domain, String deviceIdParam) {
+        final String deviceId = deviceIdParam != null ? deviceIdParam : UUID.randomUUID().toString();
+
+        Thread t = new Thread(() -> {
+            int retries = 0;
+            System.err.println("[gateway] starting client for: " + domain + " (deviceId=" + deviceId + ")");
+            while (!shuttingDown) {
+                Socket sock = null;
                 try {
-                    // Determine scheme: ws for local, wss for production
                     boolean isLocal = domain.startsWith("localhost") || domain.startsWith("127.") ||
                             domain.startsWith("192.168.") || domain.startsWith("10.") ||
                             domain.startsWith("172.16.") || domain.startsWith("ws://") || domain.startsWith("http://");
                     String scheme = isLocal ? "ws" : "wss";
                     String baseUrl = domain.startsWith("wss://") || domain.startsWith("https://")
-                        ? domain.replace("https://", "wss://")
-                        : scheme + "://" + domain;
+                            ? domain.replace("https://", "wss://")
+                            : scheme + "://" + domain;
                     String url = deviceIdParam != null
-                        ? baseUrl + "/ws/" + deviceIdParam
-                        : baseUrl + "/ws";
-                    System.err.println("[gateway] connecting to " + url);
-
+                            ? baseUrl + "/ws/" + deviceIdParam
+                            : baseUrl + "/ws";
                     URI uri = URI.create(url);
                     String host = uri.getHost();
-                    int port = uri.getPort() > 0 ? uri.getPort() : (isLocal ? 80 : 443);
+                    int gatewayPort = uri.getPort() > 0 ? uri.getPort() : (isLocal ? 80 : 443);
                     String wsPath = uri.getPath();
 
                     if (isLocal) {
-                        // Plain socket for local connections
-                        try (Socket sock = new Socket(host, port)) {
-                            sock.setSoTimeout(60000);
-                            DataOutputStream out = new DataOutputStream(sock.getOutputStream());
-                            InputStream in = sock.getInputStream();
-
-                            byte[] keyBytes = new byte[16];
-                            new Random().nextBytes(keyBytes);
-                            String wsKey = Base64.getEncoder().encodeToString(keyBytes);
-                            String request = "GET " + wsPath + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
-                                    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-                                    "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n" +
-                                    "User-Agent: Mozilla/5.0\r\n\r\n";
-                            out.writeBytes(request);
-
-                            StringBuilder resp = new StringBuilder();
-                            int b;
-                            while ((b = in.read()) != -1) {
-                                resp.append((char) b);
-                                if (resp.toString().contains("\r\n\r\n")) break;
-                            }
-                            if (!resp.toString().contains("101")) {
-                                System.err.println("[gateway] WebSocket upgrade failed");
-                                return;
-                            }
-                            System.err.println("[gateway] connected, sending register...");
-
-                            retries[0] = 0;
-
-                            String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
-                            sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
-
-                            webSocketReadLoop(in, out, sock);
-                        }
+                        sock = new Socket(host, gatewayPort);
                     } else {
-                        // SSL socket for production
                         SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
-                        try (SSLSocket sslSocket = (SSLSocket) sf.createSocket(host, port)) {
-                            sslSocket.startHandshake();
-                            DataOutputStream out = new DataOutputStream(sslSocket.getOutputStream());
-                            InputStream in = sslSocket.getInputStream();
+                        SSLSocket ssl = (SSLSocket) sf.createSocket(host, gatewayPort);
+                        ssl.startHandshake();
+                        sock = ssl;
+                    }
+                    sock.setSoTimeout(60_000);
 
-                            byte[] keyBytes = new byte[16];
-                            new Random().nextBytes(keyBytes);
-                            String wsKey = Base64.getEncoder().encodeToString(keyBytes);
-                            String request = "GET " + wsPath + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
-                                    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-                                    "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
-                            out.writeBytes(request);
+                    DataOutputStream out = new DataOutputStream(sock.getOutputStream());
+                    InputStream in = sock.getInputStream();
 
-                            StringBuilder resp = new StringBuilder();
-                            int b;
-                            while ((b = in.read()) != -1) {
-                                resp.append((char) b);
-                                if (resp.toString().contains("\r\n\r\n")) break;
-                            }
-                            if (!resp.toString().contains("101")) {
-                                System.err.println("[gateway] WebSocket upgrade failed");
-                                return;
-                            }
-                            System.err.println("[gateway] connected, sending register...");
+                    byte[] keyBytes = new byte[16];
+                    WS_RNG.nextBytes(keyBytes);
+                    String wsKey = Base64.getEncoder().encodeToString(keyBytes);
+                    String hostHeader = (gatewayPort == 80 || gatewayPort == 443) ? host : host + ":" + gatewayPort;
+                    String request = "GET " + wsPath + " HTTP/1.1\r\n" +
+                            "Host: " + hostHeader + "\r\n" +
+                            "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+                            "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n" +
+                            "User-Agent: code-mcp/0.1.0\r\n\r\n";
+                    out.write(request.getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
 
-                            retries[0] = 0;
-
-                            String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
-                            sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
-
-                            sslSocket.setSoTimeout(60000);
-                            webSocketReadLoop(in, out, sslSocket);
+                    // Read response headers (byte-level until \r\n\r\n) with cap.
+                    ByteArrayOutputStream hdr = new ByteArrayOutputStream();
+                    int b;
+                    while ((b = in.read()) != -1) {
+                        hdr.write(b);
+                        if (hdr.size() > MAX_GATEWAY_HEADER_BYTES) {
+                            throw new IOException("gateway handshake too large");
+                        }
+                        byte[] cur = hdr.toByteArray();
+                        if (cur.length >= 4 && cur[cur.length - 4] == '\r' && cur[cur.length - 3] == '\n'
+                                && cur[cur.length - 2] == '\r' && cur[cur.length - 1] == '\n') {
+                            break;
                         }
                     }
+                    String headersText = hdr.toString(StandardCharsets.ISO_8859_1);
+                    String[] hdrLines = headersText.split("\r\n");
+                    if (hdrLines.length == 0 || !hdrLines[0].contains(" 101 ")) {
+                        throw new IOException("WebSocket upgrade failed: " + (hdrLines.length > 0 ? hdrLines[0] : "<empty>"));
+                    }
+                    String accept = null;
+                    for (int i = 1; i < hdrLines.length; i++) {
+                        int idx = hdrLines[i].indexOf(':');
+                        if (idx > 0) {
+                            String k = hdrLines[i].substring(0, idx).trim();
+                            String v = hdrLines[i].substring(idx + 1).trim();
+                            if (k.equalsIgnoreCase("Sec-WebSocket-Accept")) { accept = v; break; }
+                        }
+                    }
+                    String expected = Base64.getEncoder().encodeToString(
+                            MessageDigest.getInstance("SHA-1").digest((wsKey + WS_MAGIC).getBytes(StandardCharsets.US_ASCII)));
+                    if (accept == null || !MessageDigest.isEqual(
+                            accept.getBytes(StandardCharsets.US_ASCII),
+                            expected.getBytes(StandardCharsets.US_ASCII))) {
+                        throw new IOException("Sec-WebSocket-Accept mismatch");
+                    }
+
+                    retries = 0;
+                    System.err.println("[gateway] connected, registering as " + deviceId);
+                    String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
+                    sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
+
+                    webSocketReadLoop(in, out, sock);
                 } catch (Exception e) {
-                    System.err.println("[gateway] error: " + e.getClass().getName() + ": " + e.getMessage());
+                    System.err.println("[gateway] error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                } finally {
+                    if (sock != null) try { sock.close(); } catch (IOException ignored) {}
                 }
-                if (++retries[0] > MAX_RETRIES) {
-                    System.exit(1);
+                if (++retries > MAX_RETRIES) {
+                    // Backoff hard but keep HTTP server alive (do NOT System.exit).
+                    System.err.println("[gateway] max retries reached; backing off 60s");
+                    try { Thread.sleep(60_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                    retries = 0;
+                    continue;
                 }
-                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ignored) {}
+                try { Thread.sleep(RECONNECT_DELAY_MS); } catch (InterruptedException ignored) { return; }
             }
-        }).start();
+        }, "gw-client");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static void handleGatewayMessage(DataOutputStream out, String data) {
-        try {
-            Map<String, Object> json = parseJsonObject(data);
-            String id = String.valueOf(json.get("id"));
-            @SuppressWarnings("unchecked")
-            Map<String, Object> req = (Map<String, Object>) json.get("request");
-            Object reqId = req.get("id");
-            String token = json.containsKey("token") ? String.valueOf(json.get("token")) : null;
+        // Submit to dispatch pool so a slow tool call doesn't block the WebSocket read loop.
+        GATEWAY_DISPATCH.submit(() -> {
+            try {
+                Map<String, Object> json = parseJsonObject(data);
+                String id = String.valueOf(json.get("id"));
+                @SuppressWarnings("unchecked")
+                Map<String, Object> req = (Map<String, Object>) json.get("request");
+                String tok = json.containsKey("token") ? String.valueOf(json.get("token")) : null;
 
-            String tokenParam = (token != null && !token.isBlank()) ? "?token=" + token : "";
-            String localUrl = "http://localhost:" + port + "/mcp" + tokenParam;
+                String tokenParam = (tok != null && !tok.isBlank()) ? "?token=" + tok : "";
+                String localUrl = "http://127.0.0.1:" + port + "/mcp" + tokenParam;
 
-            HttpClient client = HttpClient.newHttpClient();
-            HttpRequest httpReq = HttpRequest.newBuilder()
-                    .uri(URI.create(localUrl))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(MCPRouteHandler.serializeResult(req)))
-                    .build();
+                HttpRequest httpReq = HttpRequest.newBuilder()
+                        .uri(URI.create(localUrl))
+                        .header("Content-Type", "application/json")
+                        .timeout(java.time.Duration.ofSeconds(60))
+                        .POST(HttpRequest.BodyPublishers.ofString(MCPRouteHandler.serializeResult(req), StandardCharsets.UTF_8))
+                        .build();
 
-            HttpResponse<String> httpRes = client.send(httpReq, HttpResponse.BodyHandlers.ofString());
+                Map<String, Object> mcpRes;
+                try {
+                    HttpResponse<String> httpRes = GATEWAY_HTTP.send(httpReq, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                    mcpRes = parseJsonObject(httpRes.body());
+                } catch (Exception e) {
+                    Map<String, Object> err = new LinkedHashMap<>();
+                    err.put("jsonrpc", "2.0");
+                    err.put("id", req.get("id"));
+                    err.put("error", Map.of("code", -32603, "message", e.getMessage()));
+                    mcpRes = err;
+                }
 
-            Map<String, Object> mcpRes = parseJsonObject(httpRes.body());
+                Map<String, Object> tunnelRes = new LinkedHashMap<>();
+                tunnelRes.put("id", id);
+                tunnelRes.put("response", mcpRes);
 
-            Map<String, Object> tunnelRes = new LinkedHashMap<>();
-            tunnelRes.put("id", id);
-            tunnelRes.put("response", mcpRes);
-
-            sendFrame(out, MCPRouteHandler.serializeResult(tunnelRes).getBytes(StandardCharsets.UTF_8), (byte) 0x81);
-        } catch (Exception e) {
-            System.err.println("[gateway] handle error: " + e.getMessage());
-        }
+                sendFrame(out, MCPRouteHandler.serializeResult(tunnelRes).getBytes(StandardCharsets.UTF_8), (byte) 0x81);
+            } catch (Exception e) {
+                System.err.println("[gateway] dispatch error: " + e.getMessage());
+            }
+        });
     }
 
     private static void webSocketReadLoop(InputStream in, DataOutputStream out, Socket sock) throws IOException {
+        ByteArrayOutputStream messageBuf = new ByteArrayOutputStream();
         while (true) {
-            int opcode;
+            int b0;
             try {
-                opcode = in.read();
+                b0 = in.read();
             } catch (SocketTimeoutException e) {
                 continue;
             }
-            if (opcode == -1) break;
+            if (b0 == -1) break;
+            boolean fin = (b0 & 0x80) != 0;
+            int opcode = b0 & 0x0F;
 
-            int lenByte = in.read();
-
-            boolean masked = (lenByte & 0x80) != 0;
-            int len = lenByte & 0x7F;
+            int b1 = in.read();
+            if (b1 == -1) break;
+            boolean masked = (b1 & 0x80) != 0;
+            long len = b1 & 0x7F;
             if (len == 126) {
-                len = (in.read() << 8) | in.read();
+                int h = in.read();
+                int l = in.read();
+                if (h == -1 || l == -1) break;
+                len = ((h & 0xFFL) << 8) | (l & 0xFFL);
             } else if (len == 127) {
                 len = 0;
-                for (int j = 0; j < 8; j++) len = (len << 8) | (in.read() & 0xFF);
+                for (int j = 0; j < 8; j++) {
+                    int x = in.read();
+                    if (x == -1) return;
+                    len = (len << 8) | (x & 0xFFL);
+                }
             }
-
+            if (len < 0 || len > MAX_WS_FRAME_BYTES) {
+                throw new IOException("ws frame too large: " + len);
+            }
             byte[] mask = new byte[4];
             if (masked) {
-                if (in.read(mask) != 4) break;
+                if (readFully(in, mask, 0, 4) != 4) break;
             }
-
-            byte[] payload = new byte[len];
-            int read = 0;
-            while (read < len) {
-                try {
-                    int n = in.read(payload, read, len - read);
-                    if (n == -1) break;
-                    read += n;
-                } catch (SocketTimeoutException e) {
-                    break;
-                }
+            byte[] payload = new byte[(int) len];
+            if (len > 0) {
+                int got = readFully(in, payload, 0, (int) len);
+                if (got != (int) len) break;
             }
-
             if (masked) {
-                for (int j = 0; j < len; j++) {
-                    payload[j] = (byte) (payload[j] ^ mask[j % 4]);
+                for (int j = 0; j < payload.length; j++) {
+                    payload[j] = (byte) (payload[j] ^ mask[j & 3]);
                 }
             }
 
-            if ((opcode & 0x0F) == 0x01) {
-                String msg = new String(payload, StandardCharsets.UTF_8);
-                System.err.println("[gateway] received: " + msg);
-                if (msg.contains("\"request\"")) {
-                    handleGatewayMessage(out, msg);
-                }
+            switch (opcode) {
+                case 0x8: // close
+                    try { sendFrame(out, payload.length > 0 ? Arrays.copyOf(payload, Math.min(payload.length, 125)) : new byte[0], (byte) 0x88); } catch (IOException ignored) {}
+                    return;
+                case 0x9: // ping → pong
+                    try { sendFrame(out, payload, (byte) 0x8A); } catch (IOException ignored) {}
+                    continue;
+                case 0xA: // pong
+                    continue;
+                case 0x0: case 0x1: case 0x2:
+                    messageBuf.write(payload);
+                    if (fin) {
+                        String msg = messageBuf.toString(StandardCharsets.UTF_8);
+                        messageBuf.reset();
+                        if (msg.contains("\"request\"")) {
+                            handleGatewayMessage(out, msg);
+                        }
+                    }
+                    break;
+                default:
+                    throw new IOException("ws: unknown opcode " + opcode);
             }
         }
     }
 
-    private static void sendFrame(DataOutputStream out, byte[] data, byte opcode) throws IOException {
+    private static int readFully(InputStream in, byte[] buf, int off, int len) throws IOException {
+        int total = 0;
+        while (total < len) {
+            int n;
+            try {
+                n = in.read(buf, off + total, len - total);
+            } catch (SocketTimeoutException e) {
+                continue;
+            }
+            if (n == -1) break;
+            total += n;
+        }
+        return total;
+    }
+
+    private static void sendFrame(DataOutputStream out, byte[] data, byte opcodeByte) throws IOException {
+        // opcodeByte already encodes FIN + opcode (eg. 0x81 = FIN | text).
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        baos.write(0x81);
+        baos.write(opcodeByte & 0xFF);
         if (data.length < 126) {
             baos.write(data.length | 0x80);
         } else if (data.length < 65536) {
@@ -2281,10 +2709,11 @@ public final class CodeMCP {
             baos.write(data.length & 0xFF);
         } else {
             baos.write(127 | 0x80);
-            for (int i = 7; i >= 0; i--) baos.write((data.length >> (i * 8)) & 0xFF);
+            long n = data.length;
+            for (int i = 7; i >= 0; i--) baos.write((int) ((n >> (i * 8)) & 0xFF));
         }
         byte[] mask = new byte[4];
-        new Random().nextBytes(mask);
+        WS_RNG.nextBytes(mask);
         baos.write(mask[0] & 0xFF);
         baos.write(mask[1] & 0xFF);
         baos.write(mask[2] & 0xFF);
