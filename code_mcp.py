@@ -602,6 +602,23 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
 
         req_id, method, params = parse_jsonrpc_request(request)
 
+        if method == "initialize":
+            # MCP handshake: return server info
+            self.send_json(jsonrpc_response(req_id, {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "code-mcp", "version": "0.1.0"}
+            }))
+            return
+
+        if method == "notifications/initialized":
+            # MCP handshake: client notification, no response needed
+            return
+
+        if method == "ping":
+            self.send_json(jsonrpc_response(req_id, {}))
+            return
+
         if method == "tools/list":
             tools = [
                 {"name": "read", "description": "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
