@@ -635,8 +635,9 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
             if has_cloudflared:
                 tools.append({"name": "preview", "description": "Start a Cloudflare quick tunnel.",
                  "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}})
-            tools.append({"name": "mcp", "description": "Manage MCP servers.",
-             "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "action": {"type": "string", "enum": ["list", "call", "unload"]}, "server": {"type": "string"}, "tool": {"type": "string"}, "args": {"type": "object"}, "mcpConfigPath": {"type": "string"}}, "required": ["cwd", "action"]}})
+            # mcp tool disabled - not yet implemented in Python
+            # tools.append({"name": "mcp", "description": "Manage MCP servers.",
+            #  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "action": {"type": "string", "enum": ["list", "call", "unload"]}, "server": {"type": "string"}, "tool": {"type": "string"}, "args": {"type": "object"}, "mcpConfigPath": {"type": "string"}}, "required": ["cwd", "action"]}})
             self.send_json(jsonrpc_response(req_id, {"tools": tools}))
             return
 
@@ -709,12 +710,7 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                                        tool_params.get("offset", 0))
             elif tool_name == "preview":
                 result = handle_preview(tool_params.get("url", ""))
-            elif tool_name == "mcp":
-                result = handle_mcp(tool_params.get("action", ""),
-                                    tool_params.get("server", ""),
-                                    tool_params.get("tool", ""),
-                                    tool_params.get("args", {}),
-                                    tool_params.get("mcpConfigPath", mcp_config_path or ".mcp.json"))
+            # mcp tool not implemented in Python
             else:
                 result = {"error": f"Unknown tool: {tool_name}", "success": False}
 
