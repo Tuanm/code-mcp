@@ -49,6 +49,12 @@ public final class CodeMCP {
     private static final AtomicInteger jobSeq = new AtomicInteger(0);
     private static final Semaphore shellSemaphore = new Semaphore(MAX_SHELL_SEMAPHORE_PERMITS, true);
     private static volatile boolean shuttingDown = false;
+
+    // ===== MCP SERVER STATE =====
+    private static final Map<String, Process> mcpProcesses = new ConcurrentHashMap<>(); // key: "cwd:serverName"
+    private static final Map<String, List<String>> mcpServerTools = new ConcurrentHashMap<>(); // key: "cwd:serverName"
+    private static int mcpNextId = 0;
+    private static final Object mcpIdLock = new Object();
     
     // ===== CONFIGURATION =====
     private static int port = DEFAULT_PORT;
@@ -1107,12 +1113,137 @@ public final class CodeMCP {
     
     // --- mcp tool ---
     private static String handleMcp(String cwd, String action, String server, String tool, Map<String, Object> args, String mcpCfgPath) {
+        String cfgPath = mcpCfgPath != null ? mcpCfgPath : ".mcp.json";
+        Path configFullPath = Path.of(cwd, cfgPath);
+
         if (action.equals("list")) {
-            return "{ \"servers\": [], \"mcpConfigPath\": \"" + (mcpCfgPath != null ? mcpCfgPath : ".mcp.json") + "\" }";
+            try {
+                if (!Files.exists(configFullPath)) {
+                    return "{ \"servers\": [], \"mcpConfigPath\": \"" + escapeJson(cfgPath) + "\" }";
+                }
+                String content = Files.readString(configFullPath);
+                // Extract server names using simple regex
+                List<String> serverNames = new ArrayList<>();
+                Pattern p = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\\{");
+                Matcher m = p.matcher(content);
+                while (m.find()) {
+                    String name = m.group(1);
+                    if (!name.equals("mcpServers")) serverNames.add(name);
+                }
+                List<String> result = new ArrayList<>();
+                for (String name : serverNames) {
+                    String key = cwd + ":" + name;
+                    boolean isLoaded = mcpProcesses.containsKey(key) && mcpProcesses.get(key).isAlive();
+                    result.add("{ \"name\": \"" + escapeJson(name) + "\", \"status\": \"" + (isLoaded ? "loaded" : "unloaded") + "\", \"tools\": [] }");
+                }
+                return "{ \"servers\": [" + String.join(",", result) + "], \"mcpConfigPath\": \"" + escapeJson(cfgPath) + "\" }";
+            } catch (Exception e) {
+                return "{ \"error\": \"" + escapeJson(e.getMessage()) + "\" }";
+            }
         }
-        throw new RuntimeException("MCP tool requires --mcp <path> configuration");
+
+        if (action.equals("call")) {
+            if (server == null || server.isEmpty()) return "{ \"error\": \"server name required for call action\" }";
+            if (tool == null || tool.isEmpty()) return "{ \"error\": \"tool name required for call action\" }";
+            try {
+                if (!Files.exists(configFullPath)) {
+                    return "{ \"error\": \".mcp.json not found at " + escapeJson(cfgPath) + "\" }";
+                }
+                String content = Files.readString(configFullPath);
+                // Find server command
+                Pattern serverPat = Pattern.compile("\"" + Pattern.quote(server) + "\"\\s*:\\s*\\{[^}]*\"command\"\\s*:\\s*\"([^\"]+)\"");
+                Matcher serverMat = serverPat.matcher(content);
+                if (!serverMat.find()) {
+                    return "{ \"error\": \"server '" + escapeJson(server) + "' not found in .mcp.json\" }";
+                }
+                String cmd = serverMat.group(1);
+                String key = cwd + ":" + server;
+
+                if (!mcpProcesses.containsKey(key) || mcpProcesses.get(key).isAlive() == false) {
+                    ProcessBuilder pb = new ProcessBuilder(cmd.split("\\s+"));
+                    pb.directory(Path.of(cwd).toFile());
+                    pb.redirectErrorStream(true);
+                    Process proc = pb.start();
+                    mcpProcesses.put(key, proc);
+                    mcpServerTools.put(key, List.of("placeholder"));
+                }
+
+                Process proc = mcpProcesses.get(key);
+                Map<String, Object> callArgs = new LinkedHashMap<>();
+                callArgs.put("name", tool);
+                callArgs.put("arguments", args != null ? args : Map.of());
+                Map<?, ?> result = mcpCall(key, proc, "tools/call", callArgs);
+                return toJson(result);
+            } catch (Exception e) {
+                return "{ \"error\": \"" + escapeJson(e.getMessage()) + "\" }";
+            }
+        }
+
+        if (action.equals("unload")) {
+            String key = server != null ? cwd + ":" + server : null;
+            if (key != null) {
+                Process proc = mcpProcesses.remove(key);
+                if (proc != null) proc.destroy();
+                mcpServerTools.remove(key);
+            } else {
+                mcpProcesses.keySet().stream().filter(k -> k.startsWith(cwd + ":")).toList()
+                    .forEach(k -> { Process p = mcpProcesses.remove(k); if (p != null) p.destroy(); });
+                mcpServerTools.keySet().removeIf(k -> k.startsWith(cwd + ":"));
+            }
+            return "{ \"success\": true }";
+        }
+
+        return "{ \"error\": \"unknown action: " + escapeJson(action) + "\" }";
     }
-    
+
+    private static Map<?, ?> mcpCall(String key, Process proc, String method, Map<String, Object> params) throws Exception {
+        synchronized (mcpIdLock) { mcpNextId++; }
+        int reqId = mcpNextId;
+        String json = "{\"jsonrpc\":\"2.0\",\"id\":" + reqId + ",\"method\":\"" + method + "\",\"params\":" + toJson(params) + "}\n";
+        proc.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
+        proc.getOutputStream().flush();
+
+        long deadline = System.currentTimeMillis() + 30000;
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        while (System.currentTimeMillis() < deadline) {
+            int available = proc.getInputStream().available();
+            if (available > 0) {
+                baos.write(proc.getInputStream().readAllBytes());
+                String output = baos.toString(StandardCharsets.UTF_8);
+                for (String line : output.split("\n")) {
+                    if (line.isEmpty()) continue;
+                    if (line.contains("\"id\":" + reqId)) {
+                        if (line.contains("\"error\"")) return Map.of("error", "MCP error");
+                        return Map.of("result", line);
+                    }
+                }
+            }
+            Thread.sleep(50);
+        }
+        throw new RuntimeException("MCP server response timeout");
+    }
+
+    private static String toJson(Object obj) {
+        if (obj == null) return "null";
+        if (obj instanceof String) return "\"" + escapeJson((String) obj) + "\"";
+        if (obj instanceof Number || obj instanceof Boolean) return String.valueOf(obj);
+        if (obj instanceof List) {
+            List<?> list = (List<?>) obj;
+            return "[" + list.stream().map(Object::toString).collect(Collectors.joining(",")) + "]";
+        }
+        if (obj instanceof Map) {
+            Map<?, ?> map = (Map<?, ?>) obj;
+            StringBuilder sb = new StringBuilder("{");
+            String sep = "";
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                sb.append(sep).append("\"").append(escapeJson(String.valueOf(e.getKey()))).append("\":").append(toJson(e.getValue()));
+                sep = ",";
+            }
+            return sb.append("}").toString();
+        }
+        return "\"" + escapeJson(String.valueOf(obj)) + "\"";
+    }
+
     // --- preview tool ---
     private static String handlePreview(String url) {
         if (!hasCloudflared) throw new RuntimeException("cloudflared not found on PATH");
@@ -1517,6 +1648,13 @@ public final class CodeMCP {
                                     args.containsKey("limit") ? ((Number) args.get("limit")).intValue() : 20,
                                     args.containsKey("offset") ? ((Number) args.get("offset")).intValue() : 0);
                             }
+                            case "mcp" -> handleMcp(
+                                (String) args.get("cwd"),
+                                (String) args.get("action"),
+                                (String) args.get("server"),
+                                (String) args.get("tool"),
+                                args.get("args") != null ? (Map<String, Object>) args.get("args") : Map.of(),
+                                (String) args.get("mcpConfigPath"));
                             case "get_upload_link" -> handleGetUploadLink();
                             default -> "ERROR: unknown tool: " + name;
                         };
