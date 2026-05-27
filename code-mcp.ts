@@ -2678,7 +2678,11 @@ async function handle(msg: Json): Promise<Json | null> {
       if (!t) return err(-32601, `unknown tool: ${name}`);
       const result = await t.handler(args ?? {});
       const text = typeof result === "string" ? result : JSON.stringify(result);
-      return ok({ content: [{ type: "text", text: await maybeSpillText(text, name) }] });
+      // `read` honors a no_truncate flag end-to-end: the handler already returned
+      // the full content, so don't re-spill it here.
+      const skipSpill = name === "read" && (args as any)?.no_truncate === true;
+      const finalText = skipSpill ? text : await maybeSpillText(text, name);
+      return ok({ content: [{ type: "text", text: finalText }] });
     }
     return err(-32601, `unknown method: ${method}`);
   } catch (e: any) {
