@@ -348,9 +348,11 @@ def execute_shell(command: str, cwd: str = ".") -> str:
 
 
 def execute_powershell(command: str, cwd: str = ".") -> str:
+    # Try pwsh first, fallback to powershell.exe on Windows
+    pwsh_cmd = "pwsh" if sys.platform != "win32" else "powershell"
     try:
         result = subprocess.run(
-            ["pwsh", "-Command", command],
+            [pwsh_cmd, "-Command", command],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -365,7 +367,7 @@ def execute_powershell(command: str, cwd: str = ".") -> str:
     except subprocess.TimeoutExpired:
         return "ERROR: Timeout"
     except FileNotFoundError:
-        return "ERROR: PowerShell (pwsh) not found on PATH"
+        return f"ERROR: PowerShell ({pwsh_cmd}) not found on PATH"
     except Exception as e:
         return f"ERROR: {e}"
 
