@@ -481,8 +481,9 @@ public final class CodeMCP {
         int lastNl = head.lastIndexOf('\n');
         if (lastNl > 0) head = head.substring(0, lastNl);
         
-        // Generate filename
-        String ts = java.time.Instant.now().toString().replaceAll("[-:.Z]", "").replaceAll("T.*", "");
+        // Generate filename: keep full timestamp incl. time so files spilled in
+        // the same second don't collide on the prefix (parity with Python/TS).
+        String ts = java.time.Instant.now().toString().replaceAll("[-:.Z]", "");
         String safeTool = (toolName != null ? toolName : "unknown").replaceAll("[^A-Za-z0-9_.-]", "_");
         String shortId = String.format("%08x", new SecureRandom().nextInt());
         String fname = ts + "-" + safeTool + "-" + shortId + ".txt";

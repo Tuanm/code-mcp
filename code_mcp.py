@@ -51,6 +51,48 @@ MAX_WS_FRAME_BYTES = 64 * 1024 * 1024  # cap WS frame payload (DoS guard)
 DEFAULT_BASH_TIMEOUT = 120
 UPLOAD_TTL_S = 10 * 60  # session id valid for 10 minutes
 
+# ---------- result spill ----------
+# Tool results larger than RESULT_SPILL_THRESHOLD bytes are written to a file
+# under RESULT_SPILL_ROOT and replaced in the response with a head + pointer.
+# Matches Java/TS behaviour byte-for-byte so the three impls produce
+# interchangeable output.
+import tempfile as _tempfile
+RESULT_SPILL_THRESHOLD = 10_000
+RESULT_SPILL_HEAD = 3_000
+RESULT_SPILL_ROOT = Path(_tempfile.gettempdir()) / "code-mcp"
+try:
+    RESULT_SPILL_ROOT.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
+
+def maybe_spill_text(text: str, tool_name: str = "") -> str:
+    """If text exceeds RESULT_SPILL_THRESHOLD bytes, write it to a spill file
+    and return a head preview + pointer. Otherwise return text unchanged.
+    Mirrors maybeSpillText() in CodeMCP.java and code-mcp.ts."""
+    if not isinstance(text, str):
+        return text
+    raw = text.encode("utf-8")
+    if len(raw) <= RESULT_SPILL_THRESHOLD:
+        return text
+    head = raw[:RESULT_SPILL_HEAD].decode("utf-8", errors="replace")
+    last_nl = head.rfind("\n")
+    if last_nl > 0:
+        head = head[:last_nl]
+    ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"{int((time.time() % 1) * 1000):03d}"
+    safe_tool = re.sub(r"[^A-Za-z0-9_.-]", "_", tool_name or "unknown")
+    short_id = secrets.token_hex(4)
+    fname = f"{ts}-{safe_tool}-{short_id}.txt"
+    path = RESULT_SPILL_ROOT / fname
+    total_lines = text.count("\n") + (0 if text.endswith("\n") else 1)
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        return (head + f"\n[TRUNCATED: full output is {len(raw)} bytes "
+                f"({total_lines} lines); spill to disk FAILED ({e})]\n")
+    return (head + f"\n[TRUNCATED: {len(raw)} bytes ({total_lines} lines) "
+            f"saved to {path} — use read with range or grep to view the remaining content]\n")
+
 # Global state
 jobs: dict[str, dict] = {}
 job_seq = 0
@@ -301,9 +343,9 @@ def read_file(path: str, cwd: str = ".",
             start_idx = min(start - 1, len(lines))
             end_idx = min(end, len(lines))
             content = "".join(lines[start_idx:end_idx])
-        if not no_truncate and len(content) > MAX_OUTPUT:
-            content = content[:OUTPUT_CAP_KEEP] + f"\n[TRUNCATED: {len(content)} bytes; pass no_truncate=true to view all]"
-        return content
+        if no_truncate:
+            return content
+        return maybe_spill_text(content, "read")
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -1108,7 +1150,10 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
             tool_params = params.get("arguments", {})
             result = dispatch_tool(tool_name, tool_params)
             text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-            self.send_json(jsonrpc_response(req_id, {"content": [{"type": "text", "text": text}]}))
+            # read+no_truncate: caller explicitly asked for full content; don't re-spill.
+            skip_spill = tool_name == "read" and isinstance(tool_params, dict) and bool(tool_params.get("no_truncate"))
+            final_text = text if skip_spill else maybe_spill_text(text, tool_name)
+            self.send_json(jsonrpc_response(req_id, {"content": [{"type": "text", "text": final_text}]}))
             return
 
         # Handle raw methods directly (like Java/TypeScript MCP servers)
@@ -1331,16 +1376,20 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
 
         is_tools_call = method == "tools/call"
         if is_tools_call:
-            tool_name = params.get("name", "") if params else ""
-            tool_params = params.get("arguments", {}) if params else {}
+            if not isinstance(params, dict):
+                return jsonrpc_error(req_id, -32602, "Invalid params: expected object")
+            tool_name = params.get("name", "")
+            tool_params = params.get("arguments", {})
         else:
             tool_name = method
-            tool_params = params if params else {}
+            tool_params = params if isinstance(params, dict) else {}
 
         result = dispatch_tool(tool_name, tool_params)
         if is_tools_call:
-            text = result if isinstance(result, str) else json.dumps(result)
-            result = {"content": [{"type": "text", "text": text}]}
+            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            skip_spill = tool_name == "read" and isinstance(tool_params, dict) and bool(tool_params.get("no_truncate"))
+            final_text = text if skip_spill else maybe_spill_text(text, tool_name)
+            result = {"content": [{"type": "text", "text": final_text}]}
         return jsonrpc_response(req_id, result)
 
     WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
