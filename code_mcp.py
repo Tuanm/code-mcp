@@ -58,6 +58,19 @@ gateway_device_id: Optional[str] = None
 gateway_lock = threading.Lock()
 assigned_device_id: Optional[str] = None
 memory_enabled = False
+has_cloudflared = False
+mcp_config_path: Optional[str] = None
+cloudflare_tunnel_url: Optional[str] = None
+
+def check_cloudflared() -> bool:
+    try:
+        result = subprocess.run(
+            ["cloudflared", "--version"],
+            capture_output=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 class ShellType(Enum):
@@ -104,13 +117,15 @@ shell_type = detect_shell_type()
 
 
 def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None]:
-    """Returns (port, token, gateway_domain, device_id). memory_enabled is set globally."""
-    global memory_enabled
+    """Returns (port, token, gateway_domain, device_id). memory_enabled and has_cloudflared are set globally."""
+    global memory_enabled, has_cloudflared, mcp_config_path
     port = DEFAULT_PORT
     token = None
     gateway_domain = None
     device_id = None
     memory_enabled = False
+    has_cloudflared = check_cloudflared()
+    mcp_config_path = None
     i = 0
     while i < len(args):
         arg = args[i]
@@ -129,6 +144,9 @@ def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None
         elif arg == "--enable-memory":
             memory_enabled = True
             i += 1
+        elif arg == "--mcp" and i + 1 < len(args):
+            mcp_config_path = args[i + 1]
+            i += 2
         elif arg == "-h" or arg == "--help":
             print(USAGE)
             sys.exit(0)
@@ -302,6 +320,52 @@ def execute_bash(command: str, cwd: str = ".") -> str:
         return stdout
     except subprocess.TimeoutExpired:
         return "ERROR: Timeout"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def execute_shell(command: str, cwd: str = ".") -> str:
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            executable="/bin/sh",
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "HOME": os.path.expanduser("~")}
+        )
+        stdout = result.stdout[-MAX_OUTPUT:] if len(result.stdout) > MAX_OUTPUT else result.stdout
+        stderr = result.stderr[-OUTPUT_CAP_KEEP:] if len(result.stderr) > OUTPUT_CAP_KEEP else result.stderr
+        if stderr:
+            return stdout + "\n" + stderr
+        return stdout
+    except subprocess.TimeoutExpired:
+        return "ERROR: Timeout"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def execute_powershell(command: str, cwd: str = ".") -> str:
+    try:
+        result = subprocess.run(
+            ["pwsh", "-Command", command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "HOME": os.path.expanduser("~")}
+        )
+        stdout = result.stdout[-MAX_OUTPUT:] if len(result.stdout) > MAX_OUTPUT else result.stdout
+        stderr = result.stderr[-OUTPUT_CAP_KEEP:] if len(result.stderr) > OUTPUT_CAP_KEEP else result.stderr
+        if stderr:
+            return stdout + "\n" + stderr
+        return stdout
+    except subprocess.TimeoutExpired:
+        return "ERROR: Timeout"
+    except FileNotFoundError:
+        return "ERROR: PowerShell (pwsh) not found on PATH"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -545,7 +609,8 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["cwd", "path", "old_str", "new_str"]}},
                 {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files. Validates every edit first; if any fails, nothing is written. Edits to the same file are applied in order.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "edits": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}, "required": ["cwd", "edits"]}},
-                {"name": "bash", "description": "Run a bash command. Block until exit, return combined stdout+stderr.",
+                # Shell tool based on detected OS
+                {"name": "bash" if shell_type == ShellType.BASH else "shell" if shell_type == ShellType.SH else "command" if shell_type == ShellType.CMD else "powershell", "description": "Run a command in the detected shell. Block until exit, return combined stdout+stderr.",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "command"]}},
                 {"name": "grep", "description": "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, "required": ["cwd", "pattern"]}},
@@ -565,6 +630,11 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                     {"name": "recall", "description": "Search memos by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
                      "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "query": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "number"}, "offset": {"type": "number"}}, "required": ["cwd"]}},
                 ])
+            if has_cloudflared:
+                tools.append({"name": "preview", "description": "Start a Cloudflare quick tunnel.",
+                 "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}})
+            tools.append({"name": "mcp", "description": "Manage MCP servers.",
+             "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "action": {"type": "string", "enum": ["list", "call", "unload"]}, "server": {"type": "string"}, "tool": {"type": "string"}, "args": {"type": "object"}, "mcpConfigPath": {"type": "string"}}, "required": ["cwd", "action"]}})
             self.send_json(jsonrpc_response(req_id, {"tools": tools}))
             return
 
@@ -585,6 +655,10 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                 result = multi_edit_files(tool_params.get("edits", []), cwd)
             elif tool_name == "bash":
                 result = execute_bash(tool_params.get("command", ""), cwd)
+            elif tool_name == "shell":
+                result = execute_shell(tool_params.get("command", ""), cwd)
+            elif tool_name == "powershell":
+                result = execute_powershell(tool_params.get("command", ""), cwd)
             elif tool_name == "grep":
                 result = grep_files(tool_params.get("pattern", ""),
                                    [tool_params.get("path", ".")], cwd,
@@ -631,8 +705,20 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                                        tool_params.get("tags"),
                                        tool_params.get("limit", 20),
                                        tool_params.get("offset", 0))
+            elif tool_name == "preview":
+                result = handle_preview(tool_params.get("url", ""))
+            elif tool_name == "mcp":
+                result = handle_mcp(tool_params.get("action", ""),
+                                    tool_params.get("server", ""),
+                                    tool_params.get("tool", ""),
+                                    tool_params.get("args", {}),
+                                    tool_params.get("mcpConfigPath", mcp_config_path or ".mcp.json"))
             else:
                 result = {"error": f"Unknown tool: {tool_name}", "success": False}
+
+            # Wrap in content format for tools/call (MCP standard)
+            text = result if isinstance(result, str) else json.dumps(result)
+            result = {"content": [{"type": "text", "text": text}]}
 
             self.send_json(jsonrpc_response(req_id, result))
             return
@@ -785,9 +871,16 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
     def handle_request(req: dict) -> dict:
         """Handle incoming request from gateway, relay to local MCP."""
         req_id, method, params = parse_jsonrpc_request(req)
-        print(f"[gateway] DEBUG handle_request req_id={req_id} method={method}", file=sys.stderr)
-        tool_name = method  # Tool name is in the JSON-RPC method field
-        tool_params = params if params else {}
+
+        # Support both raw method names and tools/call pattern
+        is_tools_call = method == "tools/call"
+        if is_tools_call:
+            tool_name = params.get("name", "") if params else ""
+            tool_params = params.get("arguments", {}) if params else {}
+        else:
+            tool_name = method
+            tool_params = params if params else {}
+
         cwd = tool_params.get("cwd", ".") if tool_params else "."
 
         if tool_name == "read":
@@ -834,6 +927,11 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                                    tool_params.get("limit", 20), tool_params.get("offset", 0))
         else:
             result = f"ERROR: Unknown tool: {tool_name}"
+
+        # Wrap in content format for tools/call (MCP standard)
+        if is_tools_call:
+            text = result if isinstance(result, str) else json.dumps(result)
+            result = {"content": [{"type": "text", "text": text}]}
 
         return jsonrpc_response(req_id, result)
 
@@ -1054,6 +1152,38 @@ def handle_recall(cwd: str, query: str | None = None, tags: list | None = None,
     if end < total:
         footer += f" (next: offset={end})"
     return "\n".join(lines) + "\n" + footer
+
+
+def handle_preview(url: str) -> str:
+    if not has_cloudflared:
+        return "ERROR: cloudflared not found on PATH"
+    global cloudflare_tunnel_url
+    if cloudflare_tunnel_url:
+        return f"tunnel already running: {cloudflare_tunnel_url}"
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", url, "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    return "ERROR: cloudflared exited"
+                continue
+            m = re.match(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+            if m:
+                cloudflare_tunnel_url = m.group(0)
+                return f"tunnel ready: {cloudflare_tunnel_url}"
+        proc.terminate()
+        return "ERROR: tunnel URL not received within 20s"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path: str) -> str:
+    return "ERROR: MCP aggregation not yet implemented in Python"
 
 
 def signal_handler(sig, frame):

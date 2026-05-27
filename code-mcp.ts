@@ -2735,7 +2735,10 @@ if (gatewayDomain) {
   let retries = 0;
 
   (function connect() {
-    const url = assignedDeviceId ? `wss://${gatewayDomain}/ws/${assignedDeviceId}` : `wss://${gatewayDomain}/ws`;
+    // Determine scheme: ws for local/dev, wss for production
+    const isLocal = gatewayDomain.startsWith("localhost") || gatewayDomain.startsWith("127.") || gatewayDomain.startsWith("192.168.") || gatewayDomain.startsWith("10.") || gatewayDomain.startsWith("172.16.") || gatewayDomain.startsWith("ws://") || gatewayDomain.startsWith("http://");
+    const scheme = isLocal ? "ws" : "wss";
+    const url = assignedDeviceId ? `${scheme}://${gatewayDomain}/ws/${assignedDeviceId}` : `${scheme}://${gatewayDomain}/ws`;
     console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
     const ws = new WebSocket(url);
 

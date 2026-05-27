@@ -1348,25 +1348,24 @@ public final class CodeMCP {
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "edits", "type", "array", "items", Map.of("type", "object"), "required", true))));
 
-                    tools.add(makeTool("bash", "Run a bash command. Block until exit, return combined stdout+stderr.",
-                        List.of(Map.of("name", "cwd", "type", "string", "required", true),
-                               Map.of("name", "command", "type", "string", "required", true),
-                               Map.of("name", "timeout_ms", "type", "number"))));
-
-                    tools.add(makeTool("shell", "Run a POSIX sh command.",
-                        List.of(Map.of("name", "cwd", "type", "string", "required", true),
-                               Map.of("name", "command", "type", "string", "required", true),
-                               Map.of("name", "timeout_ms", "type", "number"))));
-
-                    tools.add(makeTool("command", "Run a Windows CMD command.",
-                        List.of(Map.of("name", "cwd", "type", "string", "required", true),
-                               Map.of("name", "command", "type", "string", "required", true),
-                               Map.of("name", "timeout_ms", "type", "number"))));
-
-                    tools.add(makeTool("powershell", "Run a PowerShell command.",
-                        List.of(Map.of("name", "cwd", "type", "string", "required", true),
-                               Map.of("name", "command", "type", "string", "required", true),
-                               Map.of("name", "timeout_ms", "type", "number"))));
+                    tools.add(switch (detectedShell) {
+                        case BASH -> makeTool("bash", "Run a bash command. Block until exit, return combined stdout+stderr.",
+                            List.of(Map.of("name", "cwd", "type", "string", "required", true),
+                                   Map.of("name", "command", "type", "string", "required", true),
+                                   Map.of("name", "timeout_ms", "type", "number")));
+                        case SH -> makeTool("shell", "Run a POSIX sh command.",
+                            List.of(Map.of("name", "cwd", "type", "string", "required", true),
+                                   Map.of("name", "command", "type", "string", "required", true),
+                                   Map.of("name", "timeout_ms", "type", "number")));
+                        case CMD -> makeTool("command", "Run a Windows CMD command.",
+                            List.of(Map.of("name", "cwd", "type", "string", "required", true),
+                                   Map.of("name", "command", "type", "string", "required", true),
+                                   Map.of("name", "timeout_ms", "type", "number")));
+                        case POWERSHELL -> makeTool("powershell", "Run a PowerShell command.",
+                            List.of(Map.of("name", "cwd", "type", "string", "required", true),
+                                   Map.of("name", "command", "type", "string", "required", true),
+                                   Map.of("name", "timeout_ms", "type", "number")));
+                    });
 
                     tools.add(makeTool("grep", "Search files by regex.",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
@@ -1391,16 +1390,13 @@ public final class CodeMCP {
                                Map.of("name", "timeout_ms", "type", "number"))));
 
                     
-                    if (mcpConfigPath != null) {
-                        tools.add(makeTool("mcp", "Manage MCP servers.",
-                            List.of(Map.of("name", "cwd", "type", "string", "required", true),
-                                   Map.of("name", "action", "type", "string", "enum", List.of("list", "call", "unload"), "required", true),
-                                   Map.of("name", "server", "type", "string"),
-                                   Map.of("name", "tool", "type", "string"),
-                                   Map.of("name", "args", "type", "object"),
-                                   Map.of("name", "mcpConfigPath", "type", "string"))));
-
-                    }
+                    tools.add(makeTool("mcp", "Manage MCP servers.",
+                        List.of(Map.of("name", "cwd", "type", "string", "required", true),
+                               Map.of("name", "action", "type", "string", "enum", List.of("list", "call", "unload"), "required", true),
+                               Map.of("name", "server", "type", "string"),
+                               Map.of("name", "tool", "type", "string"),
+                               Map.of("name", "args", "type", "object"),
+                               Map.of("name", "mcpConfigPath", "type", "string"))));
                     
                     if (hasCloudflared) {
                         tools.add(makeTool("preview", "Start a Cloudflare quick tunnel.",
@@ -1948,9 +1944,14 @@ public final class CodeMCP {
             System.err.println("[gateway] starting client for: " + domain + " with deviceId: " + deviceId);
             while (true) {
                 try {
+                    // Determine scheme: ws for local, wss for production
+                    boolean isLocal = domain.startsWith("localhost") || domain.startsWith("127.") ||
+                            domain.startsWith("192.168.") || domain.startsWith("10.") ||
+                            domain.startsWith("172.16.") || domain.startsWith("ws://") || domain.startsWith("http://");
+                    String scheme = isLocal ? "ws" : "wss";
                     String baseUrl = domain.startsWith("wss://") || domain.startsWith("https://")
-                        ? domain
-                        : "wss://" + domain;
+                        ? domain.replace("https://", "wss://")
+                        : scheme + "://" + domain;
                     String url = deviceIdParam != null
                         ? baseUrl + "/ws/" + deviceIdParam
                         : baseUrl + "/ws";
@@ -1958,92 +1959,79 @@ public final class CodeMCP {
 
                     URI uri = URI.create(url);
                     String host = uri.getHost();
-                    int port = uri.getPort() > 0 ? uri.getPort() : 443;
+                    int port = uri.getPort() > 0 ? uri.getPort() : (isLocal ? 80 : 443);
                     String wsPath = uri.getPath();
 
-                    SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
-                    try (SSLSocket sslSocket = (SSLSocket) sf.createSocket(host, port)) {
-                        sslSocket.startHandshake();
-                        DataOutputStream out = new DataOutputStream(sslSocket.getOutputStream());
-                        InputStream in = sslSocket.getInputStream();
+                    if (isLocal) {
+                        // Plain socket for local connections
+                        try (Socket sock = new Socket(host, port)) {
+                            sock.setSoTimeout(60000);
+                            DataOutputStream out = new DataOutputStream(sock.getOutputStream());
+                            InputStream in = sock.getInputStream();
 
-                        byte[] keyBytes = new byte[16];
-                        new Random().nextBytes(keyBytes);
-                        String wsKey = Base64.getEncoder().encodeToString(keyBytes);
-                        String request = "GET " + wsPath + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
-                                "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-                                "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
-                        out.writeBytes(request);
+                            byte[] keyBytes = new byte[16];
+                            new Random().nextBytes(keyBytes);
+                            String wsKey = Base64.getEncoder().encodeToString(keyBytes);
+                            String request = "GET " + wsPath + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
+                                    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+                                    "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n" +
+                                    "User-Agent: Mozilla/5.0\r\n\r\n";
+                            out.writeBytes(request);
 
-                        StringBuilder resp = new StringBuilder();
-                        int b;
-                        while ((b = in.read()) != -1) {
-                            resp.append((char) b);
-                            if (resp.toString().contains("\r\n\r\n")) break;
+                            StringBuilder resp = new StringBuilder();
+                            int b;
+                            while ((b = in.read()) != -1) {
+                                resp.append((char) b);
+                                if (resp.toString().contains("\r\n\r\n")) break;
+                            }
+                            if (!resp.toString().contains("101")) {
+                                System.err.println("[gateway] WebSocket upgrade failed");
+                                return;
+                            }
+                            System.err.println("[gateway] connected, sending register...");
+
+                            retries[0] = 0;
+
+                            String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
+                            sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
+
+                            webSocketReadLoop(in, out, sock);
                         }
-                        if (!resp.toString().contains("101")) {
-                            System.err.println("[gateway] WebSocket upgrade failed");
-                            return;
-                        }
-                        System.err.println("[gateway] connected, sending register...");
+                    } else {
+                        // SSL socket for production
+                        SSLSocketFactory sf = SSLContext.getDefault().getSocketFactory();
+                        try (SSLSocket sslSocket = (SSLSocket) sf.createSocket(host, port)) {
+                            sslSocket.startHandshake();
+                            DataOutputStream out = new DataOutputStream(sslSocket.getOutputStream());
+                            InputStream in = sslSocket.getInputStream();
 
-                        retries[0] = 0;
+                            byte[] keyBytes = new byte[16];
+                            new Random().nextBytes(keyBytes);
+                            String wsKey = Base64.getEncoder().encodeToString(keyBytes);
+                            String request = "GET " + wsPath + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" +
+                                    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+                                    "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+                            out.writeBytes(request);
 
-                        String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
-                        sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
-
-                        sslSocket.setSoTimeout(60000);
-
-                        while (true) {
-                            int opcode;
-                            try {
-                                opcode = in.read();
-                            } catch (SocketTimeoutException e) {
-                                continue;
+                            StringBuilder resp = new StringBuilder();
+                            int b;
+                            while ((b = in.read()) != -1) {
+                                resp.append((char) b);
+                                if (resp.toString().contains("\r\n\r\n")) break;
                             }
-                            if (opcode == -1) break;
-
-                            int lenByte = in.read();
-
-                            boolean masked = (lenByte & 0x80) != 0;
-                            int len = lenByte & 0x7F;
-                            if (len == 126) {
-                                len = (in.read() << 8) | in.read();
-                            } else if (len == 127) {
-                                len = 0;
-                                for (int j = 0; j < 8; j++) len = (len << 8) | (in.read() & 0xFF);
+                            if (!resp.toString().contains("101")) {
+                                System.err.println("[gateway] WebSocket upgrade failed");
+                                return;
                             }
+                            System.err.println("[gateway] connected, sending register...");
 
-                            byte[] mask = new byte[4];
-                            if (masked) {
-                                if (in.read(mask) != 4) break;
-                            }
+                            retries[0] = 0;
 
-                            byte[] payload = new byte[len];
-                            int read = 0;
-                            while (read < len) {
-                                try {
-                                    int n = in.read(payload, read, len - read);
-                                    if (n == -1) break;
-                                    read += n;
-                                } catch (SocketTimeoutException e) {
-                                    break;
-                                }
-                            }
+                            String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
+                            sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
 
-                            if (masked) {
-                                for (int j = 0; j < len; j++) {
-                                    payload[j] = (byte) (payload[j] ^ mask[j % 4]);
-                                }
-                            }
-
-                            if ((opcode & 0x0F) == 0x01) {
-                                String msg = new String(payload, StandardCharsets.UTF_8);
-                                System.err.println("[gateway] received: " + msg);
-                                if (msg.contains("\"request\"")) {
-                                    handleGatewayMessage(out, msg);
-                                }
-                            }
+                            sslSocket.setSoTimeout(60000);
+                            webSocketReadLoop(in, out, sslSocket);
                         }
                     }
                 } catch (Exception e) {
@@ -2087,6 +2075,60 @@ public final class CodeMCP {
             sendFrame(out, MCPRouteHandler.serializeResult(tunnelRes).getBytes(StandardCharsets.UTF_8), (byte) 0x81);
         } catch (Exception e) {
             System.err.println("[gateway] handle error: " + e.getMessage());
+        }
+    }
+
+    private static void webSocketReadLoop(InputStream in, DataOutputStream out, Socket sock) throws IOException {
+        while (true) {
+            int opcode;
+            try {
+                opcode = in.read();
+            } catch (SocketTimeoutException e) {
+                continue;
+            }
+            if (opcode == -1) break;
+
+            int lenByte = in.read();
+
+            boolean masked = (lenByte & 0x80) != 0;
+            int len = lenByte & 0x7F;
+            if (len == 126) {
+                len = (in.read() << 8) | in.read();
+            } else if (len == 127) {
+                len = 0;
+                for (int j = 0; j < 8; j++) len = (len << 8) | (in.read() & 0xFF);
+            }
+
+            byte[] mask = new byte[4];
+            if (masked) {
+                if (in.read(mask) != 4) break;
+            }
+
+            byte[] payload = new byte[len];
+            int read = 0;
+            while (read < len) {
+                try {
+                    int n = in.read(payload, read, len - read);
+                    if (n == -1) break;
+                    read += n;
+                } catch (SocketTimeoutException e) {
+                    break;
+                }
+            }
+
+            if (masked) {
+                for (int j = 0; j < len; j++) {
+                    payload[j] = (byte) (payload[j] ^ mask[j % 4]);
+                }
+            }
+
+            if ((opcode & 0x0F) == 0x01) {
+                String msg = new String(payload, StandardCharsets.UTF_8);
+                System.err.println("[gateway] received: " + msg);
+                if (msg.contains("\"request\"")) {
+                    handleGatewayMessage(out, msg);
+                }
+            }
         }
     }
 
