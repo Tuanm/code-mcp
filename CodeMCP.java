@@ -359,9 +359,29 @@ public final class CodeMCP {
     }
     
     // ===== SHELL DETECTION =====
+    private static volatile String powerShellBinary = null;
+    private static volatile boolean powerShellChecked = false;
+
+    private static String detectPowerShellBinary() {
+        if (!powerShellChecked) {
+            synchronized (CodeMCP.class) {
+                if (!powerShellChecked) {
+                    if (hasOnPath("pwsh")) powerShellBinary = "pwsh";
+                    else if (hasOnPath("powershell")) powerShellBinary = "powershell";
+                    powerShellChecked = true;
+                }
+            }
+        }
+        return powerShellBinary;
+    }
+
     private static ShellType detectShell() {
         if (isWindows) {
-            if (System.getenv("PSModulePath") != null) return ShellType.POWERSHELL;
+            // PSModulePath is set inside any PowerShell session (5.1 or 7+). Use that
+            // as the authoritative signal AND require a usable powershell binary.
+            if (System.getenv("PSModulePath") != null && detectPowerShellBinary() != null) {
+                return ShellType.POWERSHELL;
+            }
             return ShellType.CMD;
         }
         // Prefer bash when available regardless of $SHELL (matches Python/TS behavior).
@@ -382,7 +402,11 @@ public final class CodeMCP {
     }
     
     private static String[] pwshCmd(String command) {
-        return new String[]{"pwsh", "-Command", escapePowerShell(command)};
+        // Fall back to literal "pwsh" if neither is on PATH so the caller gets a
+        // useful "command not found" error instead of an NPE.
+        String bin = detectPowerShellBinary();
+        if (bin == null) bin = "pwsh";
+        return new String[]{bin, "-NoProfile", "-Command", escapePowerShell(command)};
     }
     
     private static String[] shellCmd(String command) {

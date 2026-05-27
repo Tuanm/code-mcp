@@ -52,15 +52,42 @@ function bashCmd(command: string): string[] { return ["bash", "-c", command]; }
 function shCmd(command: string): string[] { return ["sh", "-c", command]; }
 function cmdCmd(command: string): string[] { return ["cmd.exe", "/d", "/s", "/c", command]; }
 function pwshCmd(command: string): string[] {
-  return ["pwsh", "-Command", command];
+  // Fall back to "pwsh" name if neither variant is on PATH so spawn surfaces a
+  // clear "command not found" rather than throwing earlier.
+  const bin = POWERSHELL_BIN ?? "pwsh";
+  return [bin, "-NoProfile", "-Command", command];
 }
 
 // Detect running shell at startup.
 type ShellType = "bash" | "sh" | "cmd" | "powershell";
 const IS_WINDOWS = process.platform === "win32";
+
+// Detect which PowerShell binary is available, using raw spawn (don't go through
+// shellCmd → chicken-and-egg with DETECTED_SHELL).
+function detectPowerShellBinary(): string | null {
+  const probe = (bin: string) => {
+    try {
+      return spawnSync({
+        cmd: IS_WINDOWS
+          ? ["cmd.exe", "/d", "/s", "/c", `where ${bin}`]
+          : ["sh", "-c", `command -v ${bin}`],
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exitCode === 0;
+    } catch { return false; }
+  };
+  if (probe("pwsh")) return "pwsh";
+  if (probe("powershell")) return "powershell";
+  return null;
+}
+const POWERSHELL_BIN = detectPowerShellBinary();
+
 function detectShell(): ShellType {
   if (IS_WINDOWS) {
-    if (process.env.PSModulePath) return "powershell";
+    // PSModulePath is set inside any PowerShell session (5.1 or 7+). Use that as
+    // the authoritative signal AND require a usable powershell binary; otherwise
+    // fall back to cmd (which is always present).
+    if (process.env.PSModulePath && POWERSHELL_BIN) return "powershell";
     return "cmd";
   }
   // Prefer bash if present (matches Python/Java); fall back to $SHELL hint then sh.

@@ -165,9 +165,34 @@ def has_findstr() -> bool:
     return find_on_path("findstr")
 
 
+def detect_powershell_binary() -> Optional[str]:
+    """Return the PowerShell executable to invoke ('pwsh' for 7+, 'powershell' for 5.1), or None."""
+    if find_on_path("pwsh"):
+        return "pwsh"
+    if find_on_path("powershell"):
+        return "powershell"
+    return None
+
+
+_powershell_binary_cache: Optional[str] = None
+_powershell_binary_checked = False
+
+
+def get_powershell_binary() -> Optional[str]:
+    global _powershell_binary_cache, _powershell_binary_checked
+    if not _powershell_binary_checked:
+        _powershell_binary_cache = detect_powershell_binary()
+        _powershell_binary_checked = True
+    return _powershell_binary_cache
+
+
 def detect_shell_type() -> ShellType:
     if sys.platform == "win32":
-        return ShellType.POWERSHELL if find_on_path("pwsh") else ShellType.CMD
+        # PSModulePath is set inside any PowerShell session (5.1 or 7+). Use that
+        # as the authoritative signal AND require a usable powershell binary.
+        if os.environ.get("PSModulePath") and get_powershell_binary():
+            return ShellType.POWERSHELL
+        return ShellType.CMD
     if find_on_path("bash"):
         return ShellType.BASH
     return ShellType.SH
@@ -697,11 +722,10 @@ def execute_shell(command: str, cwd: str = ".", timeout_ms: int | None = None) -
 
 
 def execute_powershell(command: str, cwd: str = ".", timeout_ms: int | None = None) -> str:
-    pwsh_cmd = "pwsh" if sys.platform != "win32" else "powershell"
-    try:
-        return _run_proc([pwsh_cmd, "-Command", command], cwd, timeout_ms, shell=False)
-    except FileNotFoundError:
-        return f"exit=-1\nERROR: PowerShell ({pwsh_cmd}) not found on PATH"
+    binary = get_powershell_binary()
+    if not binary:
+        return "exit=-1\nERROR: PowerShell (pwsh / powershell.exe) not found on PATH"
+    return _run_proc([binary, "-NoProfile", "-Command", command], cwd, timeout_ms, shell=False)
 
 
 def execute_command(command: str, cwd: str = ".", timeout_ms: int | None = None) -> str:
