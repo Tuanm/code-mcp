@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -636,7 +637,57 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
             self.send_json(jsonrpc_response(req_id, result))
             return
 
-        self.send_json(jsonrpc_error(req_id, -32601, "Method not found"))
+        # Handle raw methods directly (like Java/TypeScript MCP servers)
+        tool_name = method
+        tool_params = params if params else {}
+        cwd = tool_params.get("cwd", ".") if tool_params else "."
+
+        if tool_name == "read":
+            result = read_file(tool_params.get("path", ""), cwd)
+        elif tool_name == "write":
+            result = write_file(tool_params.get("path", ""), tool_params.get("content", ""), cwd)
+        elif tool_name == "edit":
+            result = edit_file(tool_params.get("path", ""), tool_params.get("old_str", ""),
+                              tool_params.get("new_str", ""), cwd)
+        elif tool_name == "multi_edit":
+            result = multi_edit_files(tool_params.get("edits", []), cwd)
+        elif tool_name == "bash":
+            result = execute_bash(tool_params.get("command", ""), cwd)
+        elif tool_name == "grep":
+            result = grep_files(tool_params.get("pattern", ""),
+                               [tool_params.get("path", ".")], cwd,
+                               tool_params.get("glob"))
+        elif tool_name == "find":
+            result = find_files(tool_params.get("pattern", ""), cwd, tool_params.get("include_hidden", False))
+        elif tool_name == "ls":
+            result = list_directory(tool_params.get("path", "."), cwd)
+        elif tool_name == "job":
+            mode = tool_params.get("mode", "list")
+            if mode == "list":
+                result = list_jobs()
+            elif mode == "start":
+                cmd = tool_params.get("command")
+                result = start_job(cmd, cwd) if cmd else {"error": "command required"}
+            elif mode == "stop":
+                result = stop_job(tool_params.get("command", ""), tool_params.get("timeout_ms", 500))
+            elif mode == "view":
+                result = view_job(tool_params.get("command", ""))
+            else:
+                result = f"ERROR: unknown mode: {mode}"
+        elif tool_name == "remember":
+            result = handle_remember(cwd, tool_params.get("memo", ""), tool_params.get("tags"))
+        elif tool_name == "forget":
+            try:
+                result = handle_forget(cwd, tool_params.get("memo_id", 0))
+            except ValueError as e:
+                result = f"ERROR: {e}"
+        elif tool_name == "recall":
+            result = handle_recall(cwd, tool_params.get("query"), tool_params.get("tags"),
+                                   tool_params.get("limit", 20), tool_params.get("offset", 0))
+        else:
+            result = f"ERROR: Unknown tool: {tool_name}"
+
+        self.send_json(jsonrpc_response(req_id, result))
 
     def do_GET(self):
         if not self.authenticate():
@@ -734,6 +785,7 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
     def handle_request(req: dict) -> dict:
         """Handle incoming request from gateway, relay to local MCP."""
         req_id, method, params = parse_jsonrpc_request(req)
+        print(f"[gateway] DEBUG handle_request req_id={req_id} method={method}", file=sys.stderr)
         tool_name = method  # Tool name is in the JSON-RPC method field
         tool_params = params if params else {}
         cwd = tool_params.get("cwd", ".") if tool_params else "."
@@ -792,18 +844,18 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
 
             uri = urllib.parse.urlparse(url)
             host = uri.hostname or domain
-            port = uri.port or (443 if uri.scheme == "wss" else 80)
+            gateway_port = uri.port or (443 if uri.scheme == "wss" else 80)
 
             use_ssl = url.startswith("wss://") or url.startswith("https://")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            print(f"[gateway] connecting socket to {host}:{port}...", file=sys.stderr)
+            print(f"[gateway] connecting socket to {host}:{gateway_port}...", file=sys.stderr)
             if use_ssl:
                 context = ssl.create_default_context()
                 ssock = context.wrap_socket(sock, server_hostname=host)
-                ssock.connect((host, port))
+                ssock.connect((host, gateway_port))
             else:
                 ssock = sock
-                ssock.connect((host, port))
+                ssock.connect((host, gateway_port))
             print(f"[gateway] socket connected", file=sys.stderr)
             ssock.settimeout(60)
 
@@ -871,9 +923,25 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                         break
                     msg = json.loads(payload.decode())
                     if "request" in msg:
-                        resp = handle_request(msg["request"])
+                        # Forward to local MCP HTTP server like Java/TS clients do
+                        tunnel_req = msg["request"]
+                        tunnel_id = msg["id"]
+                        token = msg.get("token")
+
+                        # Call local MCP server via HTTP
+                        token_param = f"?token={token}" if token else ""
+                        local_url = f"http://localhost:{port}/mcp{token_param}"
+
+                        req_data = json.dumps(tunnel_req).encode()
+                        http_req = urllib.request.Request(local_url, data=req_data, headers={"Content-Type": "application/json"})
+                        try:
+                            http_resp = urllib.request.urlopen(http_req, timeout=30)
+                            resp = json.loads(http_resp.read().decode())
+                        except Exception as e:
+                            resp = {"jsonrpc": "2.0", "id": tunnel_req.get("id"), "error": {"code": -32603, "message": str(e)}}
+
                         # Wrap in TunnelResponse format expected by gateway
-                        tunnel_resp = {"id": msg["id"], "response": resp}
+                        tunnel_resp = {"id": tunnel_id, "response": resp}
                         send_ws_frame(ssock, json.dumps(tunnel_resp).encode())
                 except socket.timeout:
                     continue
