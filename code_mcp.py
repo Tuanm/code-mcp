@@ -14,6 +14,7 @@ import os
 import random
 import re
 import secrets
+import select
 import shlex
 import signal
 import socket
@@ -1180,8 +1181,133 @@ def handle_preview(url: str) -> str:
         return f"ERROR: {e}"
 
 
-def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path: str) -> str:
-    return "ERROR: MCP aggregation not yet implemented in Python"
+# MCP server state management
+mcp_servers: dict[str, dict] = {}  # key: "cwd:servername"
+mcp_processes: dict[str, subprocess.Popen] = {}  # key: "cwd:servername"
+mcp_next_id = 0
+mcp_lock = threading.Lock()
+
+
+def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path: str, cwd: str = ".") -> str:
+    """Handle mcp tool actions: list, call, unload."""
+    config_path = mcp_config_path or ".mcp.json"
+
+    if action == "list":
+        # List available servers from config
+        try:
+            config_full_path = Path(cwd) / config_path
+            if not config_full_path.exists():
+                return json.dumps({"servers": [], "mcpConfigPath": config_path})
+            with open(config_full_path) as f:
+                config = json.load(f)
+            servers = config.get("mcpServers", {})
+            result = []
+            for name in servers:
+                key = f"{cwd}:{name}"
+                is_loaded = key in mcp_servers
+                result.append({
+                    "name": name,
+                    "status": "loaded" if is_loaded else "unloaded",
+                    "tools": mcp_servers.get(key, {}).get("tools", []) if is_loaded else []
+                })
+            return json.dumps({"servers": result, "mcpConfigPath": config_path})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    if action == "call":
+        if not server:
+            return json.dumps({"error": "server name required for call action"})
+        if not tool:
+            return json.dumps({"error": "tool name required for call action"})
+
+        try:
+            config_full_path = Path(cwd) / config_path
+            with open(config_full_path) as f:
+                config = json.load(f)
+            servers = config.get("mcpServers", {})
+            if server not in servers:
+                return json.dumps({"error": f"server '{server}' not found in .mcp.json"})
+            server_config = servers[server]
+
+            # Ensure server is spawned
+            key = f"{cwd}:{server}"
+            if key not in mcp_processes or mcp_processes[key].poll() is not None:
+                # Spawn new server
+                cmd = server_config.get("command")
+                args_list = server_config.get("args", [])
+                if isinstance(cmd, str):
+                    cmd = cmd.split()
+                proc = subprocess.Popen(
+                    cmd + args_list,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=cwd
+                )
+                mcp_processes[key] = proc
+
+                # Get initial tools/list
+                tools_result = mcp_call(key, "tools/list", {})
+                mcp_servers[key] = {
+                    "tools": [t["name"] for t in tools_result.get("tools", [])]
+                }
+
+            # Make the tool call
+            result = mcp_call(key, "tools/call", {"name": tool, "arguments": args or {}})
+            return json.dumps(result)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    if action == "unload":
+        key = f"{cwd}:{server}" if server else None
+        if server:
+            if key in mcp_processes:
+                mcp_processes[key].terminate()
+                del mcp_processes[key]
+                if key in mcp_servers:
+                    del mcp_servers[key]
+            return json.dumps({"success": True})
+        else:
+            # Unload all for cwd
+            keys_to_remove = [k for k in mcp_processes.keys() if k.startswith(f"{cwd}:")]
+            for k in keys_to_remove:
+                mcp_processes[k].terminate()
+                del mcp_processes[k]
+                if k in mcp_servers:
+                    del mcp_servers[k]
+            return json.dumps({"success": True})
+
+    return json.dumps({"error": f"unknown action: {action}"})
+
+
+def mcp_call(key: str, method: str, params: dict) -> dict:
+    """Make a JSON-RPC call to an MCP server over stdio."""
+    global mcp_next_id
+    with mcp_lock:
+        mcp_next_id += 1
+        req_id = mcp_next_id
+
+    proc = mcp_processes[key]
+    request = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+    proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+    proc.stdin.flush()
+
+    # Read response
+    while True:
+        ready, _, _ = select.select([proc.stdout], [], [], 30)
+        if not ready:
+            raise TimeoutError("MCP server response timeout")
+        line = proc.stdout.readline()
+        if not line:
+            raise EOFError("MCP server process ended")
+        try:
+            response = json.loads(line.decode("utf-8"))
+            if isinstance(response, dict) and response.get("id") == req_id:
+                if "error" in response:
+                    return {"error": response["error"]}
+                return response.get("result", {})
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
 
 
 def signal_handler(sig, frame):
