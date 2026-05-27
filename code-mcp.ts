@@ -304,6 +304,69 @@ function verifyUploadSessionId(id: string): { ok: true } | { ok: false; reason: 
 // long-running background job that floods output.
 const OUTPUT_CAP_MAX = 1_000_000;
 const OUTPUT_CAP_KEEP = 500_000;
+const DEFAULT_SHELL_TIMEOUT_MS = 30_000;
+
+function timeoutMarker(ms: number): string {
+  return `\n[TIMEOUT after ${ms}ms — long-running? use the \`job\` tool: `
+    + `mode=start to launch, mode=view to check progress]`;
+}
+
+// Kill a process and all its descendants. Bun's proc.kill() only signals the
+// direct child; orphaned grandchildren (e.g. `sleep` spawned by a killed
+// `bash`) keep stdout pipes open and stall proc.exited. Use pgrep -P to walk
+// the tree and SIGKILL each pid.
+function killProcessTree(pid: number) {
+  if (process.platform === "win32") {
+    try { spawnSync({ cmd: ["taskkill", "/F", "/T", "/PID", String(pid)], stdout: "ignore", stderr: "ignore" }); } catch {}
+    return;
+  }
+  // Walk descendants depth-first so children die before parents (cleaner).
+  let children: number[] = [];
+  try {
+    const out = spawnSync({ cmd: ["pgrep", "-P", String(pid)], stdout: "pipe", stderr: "ignore" })
+      .stdout.toString().trim();
+    if (out) children = out.split("\n").map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
+  } catch {}
+  for (const c of children) killProcessTree(c);
+  try { process.kill(pid, "SIGKILL"); } catch {}
+}
+
+// Shared runner for bash/shell/command/powershell tools. Handles default timeout,
+// explicit kill on abort (Bun's `signal:` integration doesn't always SIGKILL fast
+// enough, and `proc.exited` only resolves on real exit), process-group kill so shell
+// children die too, and uniform exit=124 + marker on timeout.
+async function runShell(cmd: string[], cwd: string, timeout_ms?: number): Promise<string> {
+  const effective = typeof timeout_ms === "number" && timeout_ms > 0 ? timeout_ms : DEFAULT_SHELL_TIMEOUT_MS;
+  let timedOut = false;
+  const proc = spawn({
+    cmd,
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+    env: buildChildEnv({}),
+  });
+  const t = setTimeout(() => {
+    timedOut = true;
+    const pid = (proc as any)?.pid;
+    if (pid) killProcessTree(pid);
+  }, effective);
+  try {
+    const outSink = { text: "" };
+    const errSink = { text: "" };
+    const [, , exitCode] = await Promise.all([
+      pumpCapped(proc.stdout as any, outSink),
+      pumpCapped(proc.stderr as any, errSink),
+      proc.exited,
+    ]);
+    if (timedOut) {
+      return `exit=124\n${outSink.text}${errSink.text}${timeoutMarker(effective)}`;
+    }
+    return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 // Spawn-time env allow-list. Used for both .mcp.json children AND user-invoked
 // shell tools. The MCP token is itself sensitive (full RCE on hand-off), so we
@@ -1888,29 +1951,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      const ctrl = new AbortController();
-      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      try {
-        const proc = spawn({
-          cmd: bashCmd(command),
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: "ignore",
-          signal: ctrl.signal,
-          env: buildChildEnv({}),
-        });
-        const outSink = { text: "" };
-        const errSink = { text: "" };
-        const [, , exitCode] = await Promise.all([
-          pumpCapped(proc.stdout as any, outSink),
-          pumpCapped(proc.stderr as any, errSink),
-          proc.exited,
-        ]);
-        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
-      } finally {
-        if (t) clearTimeout(t);
-      }
+      return runShell(bashCmd(command), cwd, timeout_ms);
     },
   },
 
@@ -1926,29 +1967,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      const ctrl = new AbortController();
-      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      try {
-        const proc = spawn({
-          cmd: shCmd(command),
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: "ignore",
-          signal: ctrl.signal,
-          env: buildChildEnv({}),
-        });
-        const outSink = { text: "" };
-        const errSink = { text: "" };
-        const [, , exitCode] = await Promise.all([
-          pumpCapped(proc.stdout as any, outSink),
-          pumpCapped(proc.stderr as any, errSink),
-          proc.exited,
-        ]);
-        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
-      } finally {
-        if (t) clearTimeout(t);
-      }
+      return runShell(shCmd(command), cwd, timeout_ms);
     },
   },
 
@@ -1964,29 +1983,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      const ctrl = new AbortController();
-      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      try {
-        const proc = spawn({
-          cmd: cmdCmd(command),
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: "ignore",
-          signal: ctrl.signal,
-          env: buildChildEnv({}),
-        });
-        const outSink = { text: "" };
-        const errSink = { text: "" };
-        const [, , exitCode] = await Promise.all([
-          pumpCapped(proc.stdout as any, outSink),
-          pumpCapped(proc.stderr as any, errSink),
-          proc.exited,
-        ]);
-        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
-      } finally {
-        if (t) clearTimeout(t);
-      }
+      return runShell(cmdCmd(command), cwd, timeout_ms);
     },
   },
 
@@ -2002,29 +1999,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      const ctrl = new AbortController();
-      const t = typeof timeout_ms === "number" ? setTimeout(() => ctrl.abort(), timeout_ms) : null;
-      try {
-        const proc = spawn({
-          cmd: pwshCmd(command),
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-          stdin: "ignore",
-          signal: ctrl.signal,
-          env: buildChildEnv({}),
-        });
-        const outSink = { text: "" };
-        const errSink = { text: "" };
-        const [, , exitCode] = await Promise.all([
-          pumpCapped(proc.stdout as any, outSink),
-          pumpCapped(proc.stderr as any, errSink),
-          proc.exited,
-        ]);
-        return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
-      } finally {
-        if (t) clearTimeout(t);
-      }
+      return runShell(pwshCmd(command), cwd, timeout_ms);
     },
   },
 

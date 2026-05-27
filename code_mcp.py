@@ -48,8 +48,13 @@ MAX_CONCURRENT_JOBS = 10
 MAX_REQUEST_BYTES = 100 * 1024 * 1024  # cap request body to 100MB (DoS guard)
 MAX_GATEWAY_HEADER_BYTES = 64 * 1024   # cap WS handshake response headers
 MAX_WS_FRAME_BYTES = 64 * 1024 * 1024  # cap WS frame payload (DoS guard)
-DEFAULT_BASH_TIMEOUT = 120
+DEFAULT_SHELL_TIMEOUT_MS = 30_000  # default kill-after for shell tools when caller doesn't pass timeout_ms
 UPLOAD_TTL_S = 10 * 60  # session id valid for 10 minutes
+
+
+def _timeout_marker(timeout_ms: int) -> str:
+    return (f"\n[TIMEOUT after {timeout_ms}ms — long-running? use the `job` tool: "
+            f"mode=start to launch, mode=view to check progress]")
 
 # ---------- result spill ----------
 # Tool results larger than RESULT_SPILL_THRESHOLD bytes are written to a file
@@ -637,29 +642,49 @@ def build_child_env(extra: dict | None = None) -> dict:
 
 
 def _run_proc(cmd, cwd: str, timeout_ms: int | None, executable: str | None = None, shell: bool = True) -> str:
-    timeout_s = (timeout_ms / 1000.0) if (timeout_ms and timeout_ms > 0) else DEFAULT_BASH_TIMEOUT
+    effective_ms = timeout_ms if (timeout_ms and timeout_ms > 0) else DEFAULT_SHELL_TIMEOUT_MS
+    timeout_s = effective_ms / 1000.0
+    popen_kwargs = dict(
+        shell=shell,
+        executable=executable,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=build_child_env(),
+    )
+    if sys.platform != "win32":
+        # Own process group so we can SIGKILL all descendants (sleep etc.) on timeout.
+        popen_kwargs["start_new_session"] = True
     try:
-        # encoding="utf-8" decouples decoding from server's locale so Vietnamese
-        # (and any non-ASCII subprocess output) survives even if LANG is unset.
-        result = subprocess.run(
-            cmd,
-            shell=shell,
-            executable=executable,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s,
-            env=build_child_env(),
-        )
-        return _format_exec_result(result.returncode, result.stdout or "", result.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        partial_out = (e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
-        partial_err = (e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
-        body = _format_exec_result(124, partial_out, partial_err)
-        return body + f"\n[TIMEOUT after {int(timeout_s)}s]"
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as e:
+        return f"exit=-1\nERROR: {e}"
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+            return _format_exec_result(proc.returncode, stdout or "", stderr or "")
+        except subprocess.TimeoutExpired:
+            # Tree-kill: signal the whole session so shell children die too.
+            if sys.platform != "win32":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+            else:
+                proc.kill()
+            try:
+                stdout, stderr = proc.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            body = _format_exec_result(124, stdout or "", stderr or "")
+            return body + _timeout_marker(effective_ms)
+    except Exception as e:
+        try: proc.kill()
+        except Exception: pass
         return f"exit=-1\nERROR: {e}"
 
 

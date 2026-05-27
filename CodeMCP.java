@@ -51,6 +51,12 @@ public final class CodeMCP {
     private static final String DEFAULT_BIND = "127.0.0.1";
     private static final int MAX_RETRIES = 30;
     private static final long RECONNECT_DELAY_MS = 3000L;
+    private static final long DEFAULT_SHELL_TIMEOUT_MS = 30_000L;
+
+    private static String timeoutMarker(long ms) {
+        return "\n[TIMEOUT after " + ms + "ms — long-running? use the `job` tool: "
+            + "mode=start to launch, mode=view to check progress]";
+    }
 
     // Allow-list of env vars to forward to spawned children. Limits blast radius
     // of MCP token compromise: even if the token leaks, AWS_*/OPENAI_API_KEY/etc.
@@ -556,7 +562,7 @@ public final class CodeMCP {
         reader.setDaemon(true);
         reader.start();
 
-        long timeout = timeoutMs > 0 ? timeoutMs : Long.MAX_VALUE;
+        long timeout = timeoutMs > 0 ? timeoutMs : DEFAULT_SHELL_TIMEOUT_MS;
         boolean finished;
         try {
             finished = p.waitFor(timeout, TimeUnit.MILLISECONDS);
@@ -571,7 +577,7 @@ public final class CodeMCP {
             p.descendants().forEach(ProcessHandle::destroyForcibly);
             p.destroyForcibly();
             reader.join(500);
-            return new ProcessResult(124, capOutput(sb.toString()) + "\n[TIMEOUT after " + timeoutMs + "ms]");
+            return new ProcessResult(124, capOutput(sb.toString()) + timeoutMarker(timeout));
         }
         reader.join();                              // EOF → reader exits naturally
         return new ProcessResult(p.exitValue(), capOutput(sb.toString()));
