@@ -284,12 +284,22 @@ public final class CodeMCP {
     
     // Resolve path and verify it stays within allowed directory (prevents path traversal)
     private static Path safeResolve(String cwd, String userPath) throws IOException {
+        return safeResolve(cwd, userPath, false);
+    }
+
+    private static Path safeResolve(String cwd, String userPath, boolean allowSpill) throws IOException {
         if (userPath == null || userPath.contains("\0")) {
             throw new IOException("Invalid path");
         }
         Path base = Path.of(cwd).toAbsolutePath().normalize();
         Path resolved = base.resolve(userPath).normalize();
         if (!resolved.startsWith(base)) {
+            // Spill files live under spillRoot, outside cwd. read/grep must reach
+            // them because spill markers point callers at that path.
+            if (allowSpill && spillRoot != null
+                    && resolved.startsWith(Path.of(spillRoot).toAbsolutePath().normalize())) {
+                return resolved;
+            }
             throw new IOException("Access denied: path outside working directory");
         }
         // If the target exists, follow symlinks via toRealPath so a symlink can't escape `base`.
@@ -306,7 +316,11 @@ public final class CodeMCP {
     
     // Same as safeResolve but also verifies result is a file (not directory)
     private static Path safeResolveFile(String cwd, String userPath) throws IOException {
-        Path p = safeResolve(cwd, userPath);
+        return safeResolveFile(cwd, userPath, false);
+    }
+
+    private static Path safeResolveFile(String cwd, String userPath, boolean allowSpill) throws IOException {
+        Path p = safeResolve(cwd, userPath, allowSpill);
         if (Files.isDirectory(p)) {
             throw new IOException("Expected file, got directory: " + userPath);
         }
@@ -1017,7 +1031,7 @@ public final class CodeMCP {
     
     // --- read tool ---
     private static String handleRead(String cwd, String path, int[] range, boolean noTruncate) throws IOException {
-        Path file = safeResolveFile(cwd, path);
+        Path file = safeResolveFile(cwd, path, true);
         String content = Files.readString(file);
         if (range != null) {
             if (range.length != 2) throw new RuntimeException("range must be [start, end]");

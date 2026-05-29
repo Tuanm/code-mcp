@@ -1034,11 +1034,17 @@ const SUBPROCESS_CALL_TIMEOUT_MS = 90_000;
 const MAX_CONSECUTIVE_SPAWN_FAILS = 3;
 const MAX_JOBS = 100;
 
-function safeResolve(cwd: string, userPath: string): { ok: true; path: string } | { ok: false; reason: string } {
+function safeResolve(cwd: string, userPath: string, allowSpill = false): { ok: true; path: string } | { ok: false; reason: string } {
   const cwdResolved = resolve(cwd).replace(/\\/g, "/");
   try {
     const p = resolve(cwdResolved, userPath).replace(/\\/g, "/");
     if (!p.startsWith(cwdResolved + "/") && p !== cwdResolved) {
+      // Spill files live under RESULT_SPILL_ROOT, outside cwd. read/grep must
+      // reach them because spill markers point callers at that path.
+      if (allowSpill) {
+        const spillRoot = RESULT_SPILL_ROOT.replace(/\\/g, "/");
+        if (p === spillRoot || p.startsWith(spillRoot + "/")) return { ok: true, path: p };
+      }
       return { ok: false, reason: `path escapes cwd: ${userPath}` };
     }
     return { ok: true, path: p };
@@ -1832,7 +1838,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "path"],
     },
     handler: async ({ cwd, path, range, no_truncate }) => {
-      const r = safeResolve(cwd, path);
+      const r = safeResolve(cwd, path, true);
       if (!r.ok) throw new Error(r.reason);
       const text = await file(r.path).text();
       if (no_truncate) return text;
@@ -2043,7 +2049,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "pattern"],
     },
     handler: async ({ cwd, pattern, path = ".", glob }) => {
-      const sr = safeResolve(cwd, path);
+      const sr = safeResolve(cwd, path, true);
       if (!sr.ok) throw new Error(sr.reason);
       let cmd: string[];
       if (hasRg) {
@@ -2063,7 +2069,8 @@ const tools: Record<string, Tool> = {
       }
       const proc = spawn({
         cmd,
-        cwd: sr.path,
+        // sr.path may be a spill file (not a dir); spawn cwd must be a directory.
+        cwd: resolve(cwd),
         stdout: "pipe",
         stderr: "pipe",
         stdin: "ignore",

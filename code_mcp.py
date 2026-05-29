@@ -333,7 +333,7 @@ def parse_jsonrpc_request(data: dict) -> tuple[str, str, dict | None]:
     return req_id, method, params
 
 
-def safe_resolve(cwd: str, user_path: str) -> tuple[bool, Path, str]:
+def safe_resolve(cwd: str, user_path: str, allow_spill: bool = False) -> tuple[bool, Path, str]:
     """Resolve path safely, ensuring it stays within cwd. Returns (ok, resolved_path, error_msg)."""
     try:
         cwd_path = Path(cwd).resolve()
@@ -347,6 +347,14 @@ def safe_resolve(cwd: str, user_path: str) -> tuple[bool, Path, str]:
         try:
             full_path.relative_to(cwd_path)
         except ValueError:
+            # Spill files live under RESULT_SPILL_ROOT, outside cwd. read/grep
+            # must reach them because spill markers point callers at that path.
+            if allow_spill:
+                try:
+                    full_path.relative_to(RESULT_SPILL_ROOT.resolve())
+                    return True, full_path, ""
+                except ValueError:
+                    pass
             return False, full_path, f"path escapes cwd: {user_path}"
         return True, full_path, ""
     except Exception as e:
@@ -357,7 +365,7 @@ def read_file(path: str, cwd: str = ".",
               range: list[int] | None = None,
               no_truncate: bool = False) -> str:
     try:
-        ok, full_path, err = safe_resolve(cwd, path)
+        ok, full_path, err = safe_resolve(cwd, path, allow_spill=True)
         if not ok:
             return f"ERROR: {err}"
         content = full_path.read_text(encoding="utf-8", errors="replace")
@@ -740,7 +748,7 @@ def grep_files(pattern: str, paths: list[str], cwd: str = ".", glob: str | None 
     try:
         valid_paths = []
         for p in paths:
-            ok, full_path, err = safe_resolve(cwd, p)
+            ok, full_path, err = safe_resolve(cwd, p, allow_spill=True)
             if not ok:
                 return f"ERROR: {err}"
             valid_paths.append(str(full_path))
