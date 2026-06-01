@@ -2591,7 +2591,40 @@ public final class CodeMCP {
                     String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
                     sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
 
-                    webSocketReadLoop(in, out, sock);
+                    // Proactive app-layer keepalive every 25s.
+                    // HTTP/2 tunnels (cloudflared) can swallow WS control ping/pong;
+                    // data frames always propagate. Send failure breaks TCP and
+                    // closes the socket so the read loop reconnects.
+                    final AtomicBoolean stopKa = new AtomicBoolean(false);
+                    final Socket sockRef = sock;
+                    final DataOutputStream outRef = out;
+                    Thread keepalive = new Thread(() -> {
+                        byte[] payload = "{\"type\":\"keepalive\"}".getBytes(StandardCharsets.UTF_8);
+                        while (!stopKa.get()) {
+                            try { Thread.sleep(25_000); }
+                            catch (InterruptedException ie) { return; }
+                            if (stopKa.get()) return;
+                            try {
+                                sendFrame(outRef, payload, (byte) 0x81);
+                            } catch (IOException ioe) {
+                                System.err.println("[gateway] keepalive send failed: " + ioe.getMessage());
+                                try { sockRef.close(); } catch (IOException ignored) {}
+                                return;
+                            }
+                        }
+                    }, "gw-keepalive");
+                    keepalive.setDaemon(true);
+                    keepalive.start();
+
+                    try {
+                        webSocketReadLoop(in, out, sock);
+                    } finally {
+                        stopKa.set(true);
+                        keepalive.interrupt();
+                        // Brief join so a mid-flight sendFrame finishes before the
+                        // outer finally closes the socket; bounded to stay responsive.
+                        try { keepalive.join(100); } catch (InterruptedException ignored) {}
+                    }
                 } catch (Exception e) {
                     System.err.println("[gateway] error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 } finally {
@@ -2656,14 +2689,24 @@ public final class CodeMCP {
 
     private static void webSocketReadLoop(InputStream in, DataOutputStream out, Socket sock) throws IOException {
         ByteArrayOutputStream messageBuf = new ByteArrayOutputStream();
+        // If nothing inbound for this long, treat the connection as dead and force
+        // reconnect. Client sends a keepalive every 25s and the gateway replies
+        // with keepalive-ack, so 75s of total silence means the path is broken
+        // (e.g. half-open TCP behind a tunnel that didn't propagate FIN).
+        long lastInboundMs = System.currentTimeMillis();
+        final long INBOUND_DEADLINE_MS = 75_000L;
         while (true) {
             int b0;
             try {
                 b0 = in.read();
             } catch (SocketTimeoutException e) {
+                if (System.currentTimeMillis() - lastInboundMs > INBOUND_DEADLINE_MS) {
+                    throw new IOException("ws: no inbound for " + INBOUND_DEADLINE_MS + "ms, forcing reconnect");
+                }
                 continue;
             }
             if (b0 == -1) break;
+            lastInboundMs = System.currentTimeMillis();
             boolean fin = (b0 & 0x80) != 0;
             int opcode = b0 & 0x0F;
 

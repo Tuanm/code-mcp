@@ -37,20 +37,33 @@ bun code-mcp.ts     --gateway wss://gateway.example.workers.dev --port 7777
 java CodeMCP.java   --gateway wss://gateway.example.workers.dev --port 7777
 ```
 
+All three clients implement the same gateway WebSocket protocol with proactive
+liveness detection:
+
+- **App-layer keepalive**: client sends `{"type":"keepalive"}` every ~25 s; the
+  gateway replies `{"type":"keepalive-ack"}`. Data-frame heartbeat survives
+  HTTP/2 proxies (Cloudflare Zero Trust, etc.) that can swallow WebSocket
+  control ping/pong.
+- **Inbound watchdog (~75 s)**: if no frame arrives within the window the
+  socket is force-closed and the client reconnects with exponential backoff.
+- **Reconnect**: on any disconnect (error, close, watchdog, keepalive send
+  failure) the client retries with jittered backoff and preserves the same
+  `--id` so the gateway entry returns to the same device slot.
+
 ## Flags
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--port <n>` | Listen port | `7777` or `$PORT` |
-| `--bind <addr>` | Bind address | `127.0.0.1` |
-| `--token <s>` | Require `?token=<s>` or `Authorization: Bearer <s>` on every request | no auth |
-| `--enable-memory` | Enable remember/forget/recall tools | disabled |
-| `--disallowed-tools <list>` | Comma-separated list of tools to disable | none |
-| `--public` | Expose via Cloudflare quick tunnel (requires `cloudflared`) | disabled |
-| `--domain <host>` | Use existing public hostname (mutually exclusive with `--public`) | none |
-| `--mcp <path>` | Aggregate tools from external MCP servers (Claude Desktop JSON config) | none |
-| `--gateway <url>` | Connect to a gateway server and tunnel requests via WebSocket | none |
-| `--id <uuid>` | Use specific device ID for gateway connection | random UUID |
+| Flag                        | Description                                                            | Default           |
+| --------------------------- | ---------------------------------------------------------------------- | ----------------- |
+| `--port <n>`                | Listen port                                                            | `7777` or `$PORT` |
+| `--bind <addr>`             | Bind address                                                           | `127.0.0.1`       |
+| `--token <s>`               | Require `?token=<s>` or `Authorization: Bearer <s>` on every request   | no auth           |
+| `--enable-memory`           | Enable remember/forget/recall tools                                    | disabled          |
+| `--disallowed-tools <list>` | Comma-separated list of tools to disable                               | none              |
+| `--public`                  | Expose via Cloudflare quick tunnel (requires `cloudflared`)            | disabled          |
+| `--domain <host>`           | Use existing public hostname (mutually exclusive with `--public`)      | none              |
+| `--mcp <path>`              | Aggregate tools from external MCP servers (Claude Desktop JSON config) | none              |
+| `--gateway <url>`           | Connect to a gateway server and tunnel requests via WebSocket          | none              |
+| `--id <uuid>`               | Use specific device ID for gateway connection                          | random UUID       |
 
 ### MCP Config Format
 

@@ -2921,15 +2921,43 @@ if (gatewayDomain) {
     console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
     const ws = new WebSocket(url);
 
+    // App-layer keepalive: HTTP/2 tunnels (cloudflared) can swallow WS control
+    // frames, so a data-frame heartbeat is what actually proves liveness.
+    // Browser-style WebSocket API has no .ping() — we send JSON instead.
+    let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+    let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+    const WATCHDOG_MS = 75_000;
+    const armWatchdog = () => {
+      if (watchdogTimer) clearTimeout(watchdogTimer);
+      watchdogTimer = setTimeout(() => {
+        console.error(`[${deviceId}] no inbound for ${WATCHDOG_MS}ms; forcing reconnect`);
+        try { ws.close(); } catch {}
+      }, WATCHDOG_MS);
+    };
+    const cleanup = () => {
+      if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+      if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+    };
+
     ws.addEventListener("open", () => {
       console.error(`[${deviceId}] Connected to gateway`);
       retries = 0;
       ws.send(JSON.stringify({ type: "register", deviceId }));
+      armWatchdog();
+      keepaliveTimer = setInterval(() => {
+        try { ws.send(JSON.stringify({ type: "keepalive" })); }
+        catch (err) {
+          console.error(`[${deviceId}] keepalive send failed:`, (err as any)?.message ?? err);
+          try { ws.close(); } catch {}
+        }
+      }, 25_000);
     });
 
     ws.addEventListener("message", async (e) => {
+      armWatchdog();
       try {
-        const msg = JSON.parse(e.data as string) as { id?: string; request?: Json; token?: string };
+        const msg = JSON.parse(e.data as string) as { id?: string; request?: Json; token?: string; type?: string };
+        if (msg.type === "keepalive-ack") return;
         if (msg.id == null || !msg.request) return;
         const tokenParam = msg.token ? `?token=${msg.token}` : "";
         const res = await fetch(`${localMcpUrl}${tokenParam}`, {
@@ -2946,6 +2974,7 @@ if (gatewayDomain) {
     });
 
     ws.addEventListener("close", () => {
+      cleanup();
       // Exponential backoff with jitter — never kill the local server.
       const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** Math.min(retries, 6))
         + Math.floor(Math.random() * 500);

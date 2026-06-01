@@ -1464,6 +1464,7 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             send_ws_frame(sock, payload)
 
     while True:
+        stop_keepalive: Optional[threading.Event] = None
         try:
             url = build_url(domain, device_id)
             print(f"[gateway] connecting to {url}", file=sys.stderr)
@@ -1547,6 +1548,10 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                             break
                         raise
                 ssock.setblocking(True)
+                # setblocking(True) clears timeout to None (infinite). Restore it
+                # so recv() can detect silent half-open connections (e.g. cloudflared
+                # cutting the WS stream without forwarding TCP FIN).
+                ssock.settimeout(60)
             except Exception:
                 pass
 
@@ -1555,6 +1560,26 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             register = json.dumps({"type": "register", "deviceId": device_id}, ensure_ascii=False)
             safe_send(ssock, register.encode("utf-8"))
             print(f"[gateway] registered as {device_id}", file=sys.stderr)
+
+            # Proactive app-layer keepalive: sends {"type":"keepalive"} every 25s.
+            # Why app-layer not WS ping: HTTP/2 tunnels (cloudflared) can swallow
+            # control ping/pong frames. Data frames always reach origin.
+            # If send fails -> TCP is broken -> close socket -> recv loop breaks ->
+            # outer loop reconnects.
+            stop_keepalive = threading.Event()
+            def keepalive_loop(sock_ref):
+                payload = b'{"type":"keepalive"}'
+                while not stop_keepalive.wait(25):
+                    try:
+                        safe_send(sock_ref, payload)
+                    except Exception as e:
+                        print(f"[gateway] keepalive send failed: {e}", file=sys.stderr)
+                        try: sock_ref.close()
+                        except Exception: pass
+                        return
+            ka_thread = threading.Thread(target=keepalive_loop, args=(ssock,),
+                                         name="gw-keepalive", daemon=True)
+            ka_thread.start()
 
             def dispatch_async(msg, sock_ref):
                 try:
@@ -1578,22 +1603,27 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                 except Exception as e:
                     print(f"[gateway] dispatch error: {e}", file=sys.stderr)
 
-            while True:
-                try:
-                    payload = recv_ws_frame(ssock)
-                    if not payload:
-                        break
+            try:
+                while True:
                     try:
-                        msg = json.loads(payload.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError:
+                        payload = recv_ws_frame(ssock)
+                        if not payload:
+                            break
+                        try:
+                            msg = json.loads(payload.decode("utf-8", errors="replace"))
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(msg, dict) and msg.get("type") == "keepalive-ack":
+                            continue
+                        if "request" in msg:
+                            dispatch_pool.submit(dispatch_async, msg, ssock)
+                    except socket.timeout:
                         continue
-                    if "request" in msg:
-                        dispatch_pool.submit(dispatch_async, msg, ssock)
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    print(f"[gateway] read loop error: {e}", file=sys.stderr)
-                    break
+                    except Exception as e:
+                        print(f"[gateway] read loop error: {e}", file=sys.stderr)
+                        break
+            finally:
+                stop_keepalive.set()
             try:
                 ssock.close()
             except Exception:
@@ -1601,6 +1631,8 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
 
         except Exception as e:
             print(f"[gateway] error: {e}", file=sys.stderr)
+            if stop_keepalive is not None:
+                stop_keepalive.set()
             time.sleep(3)
 
 
