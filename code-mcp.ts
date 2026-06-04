@@ -331,11 +331,18 @@ function verifyUploadSessionId(id: string): { ok: true } | { ok: false; reason: 
 // long-running background job that floods output.
 const OUTPUT_CAP_MAX = 1_000_000;
 const OUTPUT_CAP_KEEP = 500_000;
-const DEFAULT_SHELL_TIMEOUT_MS = 30_000;
+const DEFAULT_SHELL_TIMEOUT_MS = 60_000;
 
 function timeoutMarker(ms: number): string {
   return `\n[TIMEOUT after ${ms}ms — long-running? use the \`job\` tool: `
     + `mode=start to launch, mode=view to check progress]`;
+}
+
+function backgroundedMarker(ms: number, jobId: string): string {
+  return `\n[BACKGROUNDED after ${ms}ms — process still running as job ${jobId}. `
+    + `Above output is a snapshot at handoff; further output continues into the job. `
+    + `Use \`job\` tool: mode=view command=${jobId} to read, mode=stop command=${jobId} to kill. `
+    + `Pass explicit timeout_ms to disable auto-background and force kill-on-timeout instead.]`;
 }
 
 // Kill a process and all its descendants. Bun's proc.kill() only signals the
@@ -358,13 +365,20 @@ function killProcessTree(pid: number) {
   try { process.kill(pid, "SIGKILL"); } catch {}
 }
 
-// Shared runner for bash/shell/command/powershell tools. Handles default timeout,
-// explicit kill on abort (Bun's `signal:` integration doesn't always SIGKILL fast
-// enough, and `proc.exited` only resolves on real exit), process-group kill so shell
-// children die too, and uniform exit=124 + marker on timeout.
-async function runShell(cmd: string[], cwd: string, timeout_ms?: number): Promise<string> {
-  const effective = typeof timeout_ms === "number" && timeout_ms > 0 ? timeout_ms : DEFAULT_SHELL_TIMEOUT_MS;
-  let timedOut = false;
+// Shared runner for bash/shell/command/powershell tools.
+//
+// Two paths depending on whether the caller passed timeout_ms:
+//   - explicit timeout_ms > 0: classic kill-on-timeout behaviour (exit=124 + timeoutMarker).
+//   - no timeout_ms: at DEFAULT_SHELL_TIMEOUT_MS (60s) the still-running process is
+//     adopted into the `job` system instead of being killed, and we return
+//     exit=running + backgroundedMarker so the agent can poll with the `job` tool.
+//
+// Uses a single combined sink (stdout+stderr interleaved by arrival, matching the
+// `job` tool's behaviour) so the sink can be handed off to the adopted Job
+// without merging buffers.
+async function runShell(cmd: string[], cwd: string, command: string, timeout_ms?: number): Promise<string> {
+  const explicit = typeof timeout_ms === "number" && timeout_ms > 0;
+  const effective = explicit ? (timeout_ms as number) : DEFAULT_SHELL_TIMEOUT_MS;
   const proc = spawn({
     cmd,
     cwd,
@@ -373,25 +387,49 @@ async function runShell(cmd: string[], cwd: string, timeout_ms?: number): Promis
     stdin: "ignore",
     env: buildChildEnv({}),
   });
-  const t = setTimeout(() => {
-    timedOut = true;
+  const sink = { text: "" };
+  // .catch on each inner promise: on the auto-background path the outer Promise.all
+  // is never awaited, so a pump rejection (reader error, decoder hiccup) would
+  // surface as an unhandledRejection and crash the server.
+  const pumps = Promise.all([
+    pumpCapped(proc.stdout as any, sink).catch(() => {}),
+    pumpCapped(proc.stderr as any, sink).catch(() => {}),
+  ]);
+  let timerHandle: ReturnType<typeof setTimeout> | null = null;
+  const timerPromise = new Promise<"timeout">((resolve) => {
+    timerHandle = setTimeout(() => resolve("timeout"), effective);
+  });
+  type ExitWin = { kind: "exit"; code: number };
+  const exitPromise: Promise<ExitWin> = proc.exited.then((code: number) => ({ kind: "exit", code }));
+
+  const winner = await Promise.race([exitPromise, timerPromise]);
+  if (winner !== "timeout") {
+    if (timerHandle) clearTimeout(timerHandle);
+    await pumps;
+    return `exit=${(winner as ExitWin).code}\n${sink.text}`;
+  }
+
+  // Timer fired. Process still running (or just exited within race window).
+  if (explicit) {
     const pid = (proc as any)?.pid;
     if (pid) killProcessTree(pid);
-  }, effective);
+    await proc.exited;
+    await pumps;
+    return `exit=124\n${sink.text}${timeoutMarker(effective)}`;
+  }
+
+  // No explicit timeout: hand off to the job system instead of killing.
   try {
-    const outSink = { text: "" };
-    const errSink = { text: "" };
-    const [, , exitCode] = await Promise.all([
-      pumpCapped(proc.stdout as any, outSink),
-      pumpCapped(proc.stderr as any, errSink),
-      proc.exited,
-    ]);
-    if (timedOut) {
-      return `exit=124\n${outSink.text}${errSink.text}${timeoutMarker(effective)}`;
-    }
-    return `exit=${exitCode}\n${outSink.text}${errSink.text}`;
-  } finally {
-    clearTimeout(t);
+    const job = adoptJob(command, proc as any, sink);
+    return `exit=running\n${sink.text}${backgroundedMarker(effective, job.id)}`;
+  } catch (e) {
+    // Adoption failed (MAX_JOBS reached, shutting down, …) — degrade to kill.
+    const pid = (proc as any)?.pid;
+    if (pid) killProcessTree(pid);
+    await proc.exited;
+    await pumps;
+    const reason = (e as Error).message || String(e);
+    return `exit=124\n${sink.text}\n[Auto-background failed: ${reason}; process killed.]`;
   }
 }
 
@@ -471,8 +509,34 @@ function startJob(command: string, cwd: string): Job {
   jobs.set(id, job);
 
   const sink = { get text() { return job.output; }, set text(v: string) { job.output = v; } };
-  pumpCapped(proc.stdout as any, sink);
-  pumpCapped(proc.stderr as any, sink);
+  // Fire-and-forget pumps — same unhandled-rejection guard as runShell.
+  pumpCapped(proc.stdout as any, sink).catch(() => {});
+  pumpCapped(proc.stderr as any, sink).catch(() => {});
+  proc.exited.then((code: number) => {
+    totalJobs--;
+    job.status = "exited";
+    job.exitCode = code;
+  });
+  return job;
+}
+
+// Adopt an already-spawned process (whose stdout/stderr are being pumped into `sink`)
+// into the job registry. Reuses the existing sink so in-flight pump writes continue
+// to land in job.output without dropping data; the sink's `text` accessor is rebound
+// to delegate to job.output so subsequent reads and appends stay coherent.
+function adoptJob(command: string, proc: any, sink: { text: string }): Job {
+  if (totalJobs >= MAX_JOBS) throw new Error(`max concurrent jobs (${MAX_JOBS}) exceeded`);
+  if (shuttingDown) throw new Error("server is shutting down");
+  totalJobs++;
+  const id = `j${++jobSeq}`;
+  const job: Job = { id, command, proc, output: sink.text, status: "running", startedAt: Date.now() };
+  jobs.set(id, job);
+  Object.defineProperty(sink, "text", {
+    get: () => job.output,
+    set: (v: string) => { job.output = v; },
+    configurable: true,
+    enumerable: true,
+  });
   proc.exited.then((code: number) => {
     totalJobs--;
     job.status = "exited";
@@ -2230,7 +2294,7 @@ const tools: Record<string, Tool> = {
   },
 
   bash: {
-    description: "Run a bash command. Block until exit, return combined stdout+stderr.",
+    description: "Run a bash command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2241,12 +2305,12 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      return runShell(bashCmd(command), cwd, timeout_ms);
+      return runShell(bashCmd(command), cwd, command, timeout_ms);
     },
   },
 
   shell: {
-    description: "Run a POSIX sh command. Block until exit, return combined stdout+stderr.",
+    description: "Run a POSIX sh command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2257,12 +2321,12 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      return runShell(shCmd(command), cwd, timeout_ms);
+      return runShell(shCmd(command), cwd, command, timeout_ms);
     },
   },
 
   command: {
-    description: "Run a Windows CMD command. Block until exit, return combined stdout+stderr.",
+    description: "Run a Windows CMD command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2273,12 +2337,12 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      return runShell(cmdCmd(command), cwd, timeout_ms);
+      return runShell(cmdCmd(command), cwd, command, timeout_ms);
     },
   },
 
   powershell: {
-    description: "Run a PowerShell command. Block until exit, return combined stdout+stderr.",
+    description: "Run a PowerShell command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2289,7 +2353,7 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "command"],
     },
     handler: async ({ command, cwd, timeout_ms }) => {
-      return runShell(pwshCmd(command), cwd, timeout_ms);
+      return runShell(pwshCmd(command), cwd, command, timeout_ms);
     },
   },
 

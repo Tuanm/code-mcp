@@ -17,7 +17,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.*;
 import java.util.stream.*;
 
@@ -52,11 +51,18 @@ public final class CodeMCP {
     private static final String DEFAULT_BIND = "127.0.0.1";
     private static final int MAX_RETRIES = 30;
     private static final long RECONNECT_DELAY_MS = 3000L;
-    private static final long DEFAULT_SHELL_TIMEOUT_MS = 30_000L;
+    private static final long DEFAULT_SHELL_TIMEOUT_MS = 60_000L;
 
     private static String timeoutMarker(long ms) {
         return "\n[TIMEOUT after " + ms + "ms — long-running? use the `job` tool: "
             + "mode=start to launch, mode=view to check progress]";
+    }
+
+    private static String backgroundedMarker(long ms, String jobId) {
+        return "\n[BACKGROUNDED after " + ms + "ms — process still running as job " + jobId + ". "
+            + "Above output is a snapshot at handoff; further output continues into the job. "
+            + "Use `job` tool: mode=view command=" + jobId + " to read, mode=stop command=" + jobId + " to kill. "
+            + "Pass explicit timeout_ms to disable auto-background and force kill-on-timeout instead.]";
     }
 
     // Allow-list of env vars to forward to spawned children. Limits blast radius
@@ -576,17 +582,22 @@ public final class CodeMCP {
     }
     
     // ===== PROCESS EXECUTION =====
-    private static class ProcessResult {
-        final int exitCode;
-        final String output;
-        
-        ProcessResult(int exitCode, String output) {
-            this.exitCode = exitCode;
-            this.output = output;
-        }
-    }
-    
-    private static ProcessResult runCommand(String[] cmd, String cwd, long timeoutMs) throws Exception {
+    /**
+     * Run a process for the bash/shell/command/powershell tools.
+     *
+     * Two paths depending on whether the caller passed timeoutMs:
+     *   - explicit timeoutMs > 0: classic kill-on-timeout (exit=124 + timeoutMarker).
+     *   - no timeoutMs: at DEFAULT_SHELL_TIMEOUT_MS (60s) the still-running process is
+     *     adopted into the `job` system instead of being killed, returning
+     *     exit=running + backgroundedMarker so the agent can poll with the `job` tool.
+     *
+     * Returns the full formatted body (already includes the "exit=...\n" prefix).
+     * `displayCommand` is the original command string used as the job name on adoption.
+     */
+    private static String runCommand(String[] cmd, String displayCommand, String cwd, long timeoutMs) throws Exception {
+        boolean explicit = timeoutMs > 0;
+        long effective = explicit ? timeoutMs : DEFAULT_SHELL_TIMEOUT_MS;
+
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.directory(new File(cwd));
         pb.redirectErrorStream(true);              // merge stderr into stdout (matches Python/TS combined output)
@@ -596,9 +607,8 @@ public final class CodeMCP {
         Process p = pb.start();
         try { p.getOutputStream().close(); } catch (IOException ignored) {}
 
-        Thread reader = null;
         StringBuilder sb = new StringBuilder();
-        reader = new Thread(() -> {
+        Thread reader = new Thread(() -> {
             try (var in = p.getInputStream();
                  var br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
                 String line;
@@ -617,25 +627,46 @@ public final class CodeMCP {
         reader.setDaemon(true);
         reader.start();
 
-        long timeout = timeoutMs > 0 ? timeoutMs : DEFAULT_SHELL_TIMEOUT_MS;
         boolean finished;
         try {
-            finished = p.waitFor(timeout, TimeUnit.MILLISECONDS);
+            finished = p.waitFor(effective, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             p.descendants().forEach(ProcessHandle::destroyForcibly);
             p.destroyForcibly();
             Thread.currentThread().interrupt();
-            reader.join(500);
-            return new ProcessResult(-1, capOutput(sb.toString()) + "\n[INTERRUPTED]");
+            try { reader.join(500); } catch (InterruptedException ignored) {}
+            String body;
+            synchronized (sb) { body = capOutput(sb.toString()); }
+            return "exit=-1\n" + body + "\n[INTERRUPTED]";
         }
         if (!finished) {
-            p.descendants().forEach(ProcessHandle::destroyForcibly);
-            p.destroyForcibly();
-            reader.join(500);
-            return new ProcessResult(124, capOutput(sb.toString()) + timeoutMarker(timeout));
+            if (explicit) {
+                p.descendants().forEach(ProcessHandle::destroyForcibly);
+                p.destroyForcibly();
+                try { reader.join(500); } catch (InterruptedException ignored) {}
+                String body;
+                synchronized (sb) { body = capOutput(sb.toString()); }
+                return "exit=124\n" + body + timeoutMarker(effective);
+            }
+            // Auto-background: hand off the still-running process + reader + buffer to the job system.
+            try {
+                Job adopted = adoptJob(displayCommand, p, sb, reader);
+                String snapshot;
+                synchronized (sb) { snapshot = capOutput(sb.toString()); }
+                return "exit=running\n" + snapshot + backgroundedMarker(effective, adopted.id);
+            } catch (RuntimeException adoptErr) {
+                p.descendants().forEach(ProcessHandle::destroyForcibly);
+                p.destroyForcibly();
+                try { reader.join(500); } catch (InterruptedException ignored) {}
+                String body;
+                synchronized (sb) { body = capOutput(sb.toString()); }
+                return "exit=124\n" + body + "\n[Auto-background failed: " + adoptErr.getMessage() + "; process killed.]";
+            }
         }
         reader.join();                              // EOF → reader exits naturally
-        return new ProcessResult(p.exitValue(), capOutput(sb.toString()));
+        String body;
+        synchronized (sb) { body = capOutput(sb.toString()); }
+        return "exit=" + p.exitValue() + "\n" + body;
     }
     
     // ===== JOB MANAGEMENT =====
@@ -643,19 +674,28 @@ public final class CodeMCP {
         final String id;
         final String command;
         final Process process;
-        final AtomicReference<String> output = new AtomicReference<>("");
+        // Shared with the reader/pumper thread. view_job reads through currentOutput()
+        // so the same buffer that is being appended to is observable as live output —
+        // and the buffer is trivially handoff-able from a foreground runCommand call
+        // into the job system without re-attaching streams.
+        final StringBuilder sb;
         volatile String status = "running";
         volatile Integer exitCode;
         final long startedAt;
-        
-        Job(String id, String command, Process process) {
+
+        Job(String id, String command, Process process, StringBuilder sb) {
             this.id = id;
             this.command = command;
             this.process = process;
+            this.sb = sb;
             this.startedAt = System.currentTimeMillis();
         }
+
+        String currentOutput() {
+            synchronized (sb) { return capOutput(sb.toString()); }
+        }
     }
-    
+
     private static Job startJob(String command, String cwd) {
         if (countRunningJobs() >= MAX_CONCURRENT_JOBS) {
             throw new RuntimeException("max concurrent jobs (" + MAX_CONCURRENT_JOBS + ") exceeded");
@@ -670,11 +710,11 @@ public final class CodeMCP {
         try {
             Process process = pb.start();
             try { process.getOutputStream().close(); } catch (IOException ignored) {}
-            Job job = new Job(id, command, process);
+            // Thread-safe StringBuilder; cap on append. O(n) amortized vs O(n^2) string concat.
+            final StringBuilder sb = new StringBuilder();
+            Job job = new Job(id, command, process, sb);
             jobs.put(id, job);
 
-            // Use a thread-safe StringBuilder; cap on append. O(n) amortized vs O(n^2) string concat.
-            final StringBuilder sb = new StringBuilder();
             CompletableFuture.runAsync(() -> {
                 try (var reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
@@ -686,7 +726,6 @@ public final class CodeMCP {
                                 sb.setLength(0);
                                 sb.append(capped);
                             }
-                            job.output.set(sb.toString());
                         }
                     }
                 } catch (IOException e) {
@@ -709,6 +748,32 @@ public final class CodeMCP {
         } catch (IOException e) {
             throw new RuntimeException("Failed to start job: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Adopt an already-running process (with its existing reader thread + buffer) as a job.
+     * Lets the foreground bash/shell/command/powershell tools hand off long-running children
+     * to the job system at the auto-background threshold without dropping in-flight output.
+     */
+    private static Job adoptJob(String command, Process process, StringBuilder sb, Thread reader) {
+        if (countRunningJobs() >= MAX_CONCURRENT_JOBS) {
+            throw new RuntimeException("max concurrent jobs (" + MAX_CONCURRENT_JOBS + ") exceeded");
+        }
+        String id = "j" + jobSeq.incrementAndGet();
+        Job job = new Job(id, command, process, sb);
+        jobs.put(id, job);
+        CompletableFuture.runAsync(() -> {
+            try {
+                int code = process.waitFor();
+                // Drain the reader so the final bytes are in `sb` before status flips.
+                try { reader.join(2000); } catch (InterruptedException ignored) {}
+                job.status = "exited";
+                job.exitCode = code;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        return job;
     }
 
     private static int countRunningJobs() {
@@ -1645,8 +1710,7 @@ public final class CodeMCP {
             throw new RuntimeException("Too many concurrent shell executions, please try again later");
         }
         try {
-            ProcessResult result = runCommand(bashCmd(command), cwd, timeoutMs != null ? timeoutMs : 0);
-            return "exit=" + result.exitCode + "\n" + result.output;
+            return runCommand(bashCmd(command), command, cwd, timeoutMs != null ? timeoutMs : 0);
         } finally {
             shellSemaphore.release();
         }
@@ -1657,8 +1721,7 @@ public final class CodeMCP {
             throw new RuntimeException("Too many concurrent shell executions, please try again later");
         }
         try {
-            ProcessResult result = runCommand(shCmd(command), cwd, timeoutMs != null ? timeoutMs : 0);
-            return "exit=" + result.exitCode + "\n" + result.output;
+            return runCommand(shCmd(command), command, cwd, timeoutMs != null ? timeoutMs : 0);
         } finally {
             shellSemaphore.release();
         }
@@ -1669,8 +1732,7 @@ public final class CodeMCP {
             throw new RuntimeException("Too many concurrent shell executions, please try again later");
         }
         try {
-            ProcessResult result = runCommand(cmdCmd(command), cwd, timeoutMs != null ? timeoutMs : 0);
-            return "exit=" + result.exitCode + "\n" + result.output;
+            return runCommand(cmdCmd(command), command, cwd, timeoutMs != null ? timeoutMs : 0);
         } finally {
             shellSemaphore.release();
         }
@@ -1681,8 +1743,7 @@ public final class CodeMCP {
             throw new RuntimeException("Too many concurrent shell executions, please try again later");
         }
         try {
-            ProcessResult result = runCommand(pwshCmd(command), cwd, timeoutMs != null ? timeoutMs : 0);
-            return "exit=" + result.exitCode + "\n" + result.output;
+            return runCommand(pwshCmd(command), command, cwd, timeoutMs != null ? timeoutMs : 0);
         } finally {
             shellSemaphore.release();
         }
@@ -1704,10 +1765,37 @@ public final class CodeMCP {
             cmd = append(cmd, "--", pattern, path != null ? path : ".");
         }
         
-        ProcessResult result = runCommand(cmd, cwd, 0);
-        if (!result.output.isEmpty()) return result.output;
-        if (result.exitCode == 1) return "(no matches)";
-        return "ERROR (exit=" + result.exitCode + "): " + result.output;
+        // grep uses the raw runCommand body and parses it back. We pass an explicit timeout
+        // (DEFAULT_SHELL_TIMEOUT_MS) so we get the classic kill path — grep should never
+        // auto-background into the job system.
+        String body = runCommand(cmd, joinArgs(cmd), cwd, DEFAULT_SHELL_TIMEOUT_MS);
+        int nl = body.indexOf('\n');
+        int exitCode;
+        String output;
+        if (nl < 0) {
+            exitCode = -1;
+            output = body;
+        } else {
+            String header = body.substring(0, nl);
+            output = body.substring(nl + 1);
+            try {
+                exitCode = Integer.parseInt(header.startsWith("exit=") ? header.substring(5) : header);
+            } catch (NumberFormatException nfe) {
+                exitCode = -1;
+            }
+        }
+        if (!output.isEmpty()) return output;
+        if (exitCode == 1) return "(no matches)";
+        return "ERROR (exit=" + exitCode + "): " + output;
+    }
+
+    private static String joinArgs(String[] args) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) b.append(' ');
+            b.append(args[i]);
+        }
+        return b.toString();
     }
     
     private static String[] append(String[] arr, String... elements) {
@@ -1830,7 +1918,7 @@ public final class CodeMCP {
         if (j == null) throw new RuntimeException("no such job: " + command);
         
         if (mode.equals("view")) {
-            return "[" + j.id + "] " + j.command + "\n[" + j.status + (j.exitCode != null ? " " + j.exitCode : "") + "]\n" + j.output.get();
+            return "[" + j.id + "] " + j.command + "\n[" + j.status + (j.exitCode != null ? " " + j.exitCode : "") + "]\n" + j.currentOutput();
         }
         
         if (mode.equals("stop")) {
@@ -2054,7 +2142,7 @@ public final class CodeMCP {
             long deadline = System.currentTimeMillis() + 20_000;
             
             while (System.currentTimeMillis() < deadline) {
-                String output = j.output.get();
+                String output = j.currentOutput();
                 Matcher m = pattern.matcher(output);
                 if (m.find()) {
                     return m.group() + " (job " + j.id + ")";
@@ -2368,19 +2456,19 @@ public final class CodeMCP {
                                Map.of("name", "edits", "type", "array", "items", Map.of("type", "object"), "required", true))));
 
                     tools.add(switch (detectedShell) {
-                        case BASH -> makeTool("bash", "Run a bash command. Block until exit, return combined stdout+stderr.",
+                        case BASH -> makeTool("bash", "Run a bash command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "command", "type", "string", "required", true),
                                    Map.of("name", "timeout_ms", "type", "number")));
-                        case SH -> makeTool("shell", "Run a POSIX sh command.",
+                        case SH -> makeTool("shell", "Run a POSIX sh command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "command", "type", "string", "required", true),
                                    Map.of("name", "timeout_ms", "type", "number")));
-                        case CMD -> makeTool("command", "Run a Windows CMD command.",
+                        case CMD -> makeTool("command", "Run a Windows CMD command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "command", "type", "string", "required", true),
                                    Map.of("name", "timeout_ms", "type", "number")));
-                        case POWERSHELL -> makeTool("powershell", "Run a PowerShell command.",
+                        case POWERSHELL -> makeTool("powershell", "Run a PowerShell command. Returns combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "command", "type", "string", "required", true),
                                    Map.of("name", "timeout_ms", "type", "number")));

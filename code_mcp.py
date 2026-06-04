@@ -5,6 +5,7 @@ Python 3.10+ only, no external dependencies.
 """
 
 import base64
+import codecs
 import concurrent.futures
 import hashlib
 import hmac
@@ -48,13 +49,20 @@ MAX_CONCURRENT_JOBS = 10
 MAX_REQUEST_BYTES = 100 * 1024 * 1024  # cap request body to 100MB (DoS guard)
 MAX_GATEWAY_HEADER_BYTES = 64 * 1024   # cap WS handshake response headers
 MAX_WS_FRAME_BYTES = 64 * 1024 * 1024  # cap WS frame payload (DoS guard)
-DEFAULT_SHELL_TIMEOUT_MS = 30_000  # default kill-after for shell tools when caller doesn't pass timeout_ms
+DEFAULT_SHELL_TIMEOUT_MS = 60_000  # auto-handoff threshold for shell tools when caller doesn't pass timeout_ms
 UPLOAD_TTL_S = 10 * 60  # session id valid for 10 minutes
 
 
 def _timeout_marker(timeout_ms: int) -> str:
     return (f"\n[TIMEOUT after {timeout_ms}ms — long-running? use the `job` tool: "
             f"mode=start to launch, mode=view to check progress]")
+
+
+def _backgrounded_marker(timeout_ms: int, job_id: str) -> str:
+    return (f"\n[BACKGROUNDED after {timeout_ms}ms — process still running as job {job_id}. "
+            f"Above output is a snapshot at handoff; further output continues into the job. "
+            f"Use `job` tool: mode=view command={job_id} to read, mode=stop command={job_id} to kill. "
+            f"Pass explicit timeout_ms to disable auto-background and force kill-on-timeout instead.]")
 
 # ---------- result spill ----------
 # Tool results larger than RESULT_SPILL_THRESHOLD bytes are written to a file
@@ -464,14 +472,74 @@ def multi_edit_files(edits: list[dict], cwd: str = ".") -> str:
         return f"ERROR: {e}"
 
 
-def _format_exec_result(exit_code: int, stdout: str, stderr: str) -> str:
-    """Format process output as 'exit=N\\n<combined>' (matches Java/TS)."""
-    combined = stdout
-    if stderr:
-        combined = combined + ("\n" if combined and not combined.endswith("\n") else "") + stderr
-    if len(combined) > MAX_OUTPUT:
-        combined = combined[:OUTPUT_CAP_KEEP] + f"\n[TRUNCATED: {len(combined)} bytes]"
-    return f"exit={exit_code}\n{combined}"
+def _start_pump_threads(proc):
+    """Spawn pumper threads for stdout+stderr that append into a shared, lockable buffer.
+
+    Output is interleaved by arrival (matches Java's redirectErrorStream and the TS impl),
+    so the same buffer is trivially handoff-able from a foreground bash call to the `job`
+    system without merging two streams. Tail-truncates above MAX_OUTPUT to bound memory.
+    Returns (buf_dict, buf_lock, threads_list).
+    """
+    buf = {"text": ""}
+    buf_lock = threading.Lock()
+    threads = []
+
+    def _pump(stream):
+        # Read raw bytes from the underlying fd so chunks become visible as soon as
+        # they arrive — readline() blocks until \n which makes progress-bar output
+        # (`pip install`, `curl --progress-bar`, `printf "..."`) invisible during run.
+        # Decode UTF-8 incrementally so a multibyte char split across chunks doesn't
+        # produce U+FFFD. Matches the TS ReadableStream chunked-read behaviour.
+        try:
+            fd = stream.fileno()
+        except (AttributeError, ValueError, OSError):
+            return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        with buf_lock:
+                            buf["text"] += tail
+                            if len(buf["text"]) > MAX_OUTPUT:
+                                buf["text"] = buf["text"][-OUTPUT_CAP_KEEP:]
+                    break
+                text = decoder.decode(chunk)
+                if not text:
+                    continue
+                with buf_lock:
+                    buf["text"] += text
+                    if len(buf["text"]) > MAX_OUTPUT:
+                        buf["text"] = buf["text"][-OUTPUT_CAP_KEEP:]
+        except (ValueError, OSError):
+            pass
+
+    for s in (proc.stdout, proc.stderr):
+        if s is not None:
+            t = threading.Thread(target=_pump, args=(s,), daemon=True)
+            t.start()
+            threads.append(t)
+    return buf, buf_lock, threads
+
+
+def _kill_proc_tree(proc):
+    """SIGKILL the whole process group on POSIX (so shell children die too),
+    fall back to single-pid kill if pgid signalling fails or on Windows."""
+    if sys.platform != "win32":
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 SPAWN_ENV_ALLOWLIST = {
@@ -675,7 +743,16 @@ def build_child_env(extra: dict | None = None) -> dict:
 
 
 def _run_proc(cmd, cwd: str, timeout_ms: int | None, executable: str | None = None, shell: bool = True) -> str:
-    effective_ms = timeout_ms if (timeout_ms and timeout_ms > 0) else DEFAULT_SHELL_TIMEOUT_MS
+    """Run a process for the bash/shell/command/powershell tools.
+
+    Two paths depending on whether the caller passed timeout_ms:
+      - explicit timeout_ms > 0: classic kill-on-timeout behaviour (exit=124 + _timeout_marker).
+      - no timeout_ms: at DEFAULT_SHELL_TIMEOUT_MS (60s) the still-running process is adopted
+        into the `job` system instead of being killed, and we return exit=running plus
+        _backgrounded_marker so the agent can poll with the `job` tool.
+    """
+    explicit = bool(timeout_ms and timeout_ms > 0)
+    effective_ms = timeout_ms if explicit else DEFAULT_SHELL_TIMEOUT_MS
     timeout_s = effective_ms / 1000.0
     popen_kwargs = dict(
         shell=shell,
@@ -696,29 +773,81 @@ def _run_proc(cmd, cwd: str, timeout_ms: int | None, executable: str | None = No
         proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as e:
         return f"exit=-1\nERROR: {e}"
+
+    buf, buf_lock, pump_threads = _start_pump_threads(proc)
     try:
+        exit_code = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        if explicit:
+            _kill_proc_tree(proc)
+            try: proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired: pass
+            for t in pump_threads: t.join(timeout=1.0)
+            with buf_lock: snapshot = buf["text"]
+            return f"exit=124\n{snapshot}" + _timeout_marker(effective_ms)
+        # Adopt as a background job rather than killing.
+        original_cmd = cmd if isinstance(cmd, str) else " ".join(cmd)
         try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-            return _format_exec_result(proc.returncode, stdout or "", stderr or "")
-        except subprocess.TimeoutExpired:
-            # Tree-kill: signal the whole session so shell children die too.
-            if sys.platform != "win32":
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    proc.kill()
-            else:
-                proc.kill()
-            try:
-                stdout, stderr = proc.communicate(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                stdout, stderr = "", ""
-            body = _format_exec_result(124, stdout or "", stderr or "")
-            return body + _timeout_marker(effective_ms)
+            job_id = _adopt_as_job(original_cmd, proc, buf, buf_lock)
+        except Exception as e:
+            _kill_proc_tree(proc)
+            try: proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired: pass
+            for t in pump_threads: t.join(timeout=1.0)
+            with buf_lock: snapshot = buf["text"]
+            return f"exit=124\n{snapshot}\n[Auto-background failed: {e}; process killed.]"
+        with buf_lock: snapshot = buf["text"]
+        return f"exit=running\n{snapshot}" + _backgrounded_marker(effective_ms, job_id)
     except Exception as e:
         try: proc.kill()
         except Exception: pass
         return f"exit=-1\nERROR: {e}"
+    # Normal exit. Drain pumpers before snapshotting so the final bytes are visible.
+    for t in pump_threads: t.join(timeout=2.0)
+    with buf_lock: snapshot = buf["text"]
+    return f"exit={exit_code}\n{snapshot}"
+
+
+def _adopt_as_job(command: str, proc, buf: dict, buf_lock) -> str:
+    """Register an already-running process as a job, reusing the caller's pumper buffer
+    so view_job continues to see live output without losing in-flight bytes.
+    Returns the assigned job_id. Raises on max-jobs / shutdown."""
+    global total_jobs, job_seq
+    with jobs_lock:
+        if total_jobs >= MAX_CONCURRENT_JOBS:
+            raise RuntimeError(f"max concurrent jobs ({MAX_CONCURRENT_JOBS}) exceeded")
+        if shutting_down:
+            raise RuntimeError("server is shutting down")
+        total_jobs += 1
+        job_seq += 1
+        job_id = f"j{job_seq}"
+    job = {
+        "id": job_id,
+        "command": command,
+        "proc": proc,
+        "_buf": buf,
+        "_buf_lock": buf_lock,
+        "output": "",  # finalized on exit; live reads go through _buf
+        "status": "running",
+        "started_at": time.time(),
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+
+    def _finalize():
+        global total_jobs
+        try:
+            proc.wait()
+        finally:
+            with buf_lock:
+                job["output"] = buf["text"]
+            job["status"] = "exited"
+            job["exit_code"] = proc.returncode
+            with jobs_lock:
+                total_jobs = max(0, total_jobs - 1)
+
+    threading.Thread(target=_finalize, daemon=True).start()
+    return job_id
 
 
 def execute_bash(command: str, cwd: str = ".", timeout_ms: int | None = None) -> str:
@@ -895,36 +1024,33 @@ def start_job(command: str, cwd: str) -> str:
             total_jobs = max(0, total_jobs - 1)
         return f"ERROR: failed to start job: {e}"
 
+    buf, buf_lock, _ = _start_pump_threads(proc)
     job = {
         "id": job_id,
         "command": command,
         "proc": proc,
-        "output": "",
+        "_buf": buf,
+        "_buf_lock": buf_lock,
+        "output": "",  # finalized on exit; live reads go through _buf
         "status": "running",
         "started_at": time.time(),
     }
     with jobs_lock:
         jobs[job_id] = job
 
-    def pump_and_finalize():
+    def _finalize():
         global total_jobs
         try:
-            stdout, stderr = proc.communicate()
-            combined = (stdout or "") + (stderr or "")
-            if len(combined) > MAX_OUTPUT:
-                combined = combined[:OUTPUT_CAP_KEEP] + f"\n[TRUNCATED: {len(combined)} bytes]"
-            job["output"] = combined
-        except Exception as e:
-            job["output"] = f"ERROR: {e}"
+            proc.wait()
         finally:
+            with buf_lock:
+                job["output"] = buf["text"]
             job["status"] = "exited"
             job["exit_code"] = proc.returncode
             with jobs_lock:
                 total_jobs = max(0, total_jobs - 1)
 
-    t = threading.Thread(target=pump_and_finalize, daemon=True)
-    t.start()
-
+    threading.Thread(target=_finalize, daemon=True).start()
     return f"started {job_id}"
 
 
@@ -965,7 +1091,13 @@ def view_job(job_id: str) -> str:
     job = jobs[job_id]
     status = job.get("status", "unknown")
     exit_code = job.get("exit_code")
-    output = job.get("output", "")
+    buf = job.get("_buf")
+    buf_lock = job.get("_buf_lock")
+    if buf is not None and buf_lock is not None:
+        with buf_lock:
+            output = buf["text"]
+    else:
+        output = job.get("output", "")
     exit_info = f" {exit_code}" if exit_code is not None else ""
     return f"[{job_id}] {job.get('command', '')}\n[{status}{exit_info}]\n{output}"
 
@@ -989,7 +1121,7 @@ def build_tools_list() -> list[dict]:
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["cwd", "path", "old_str", "new_str"]}},
         {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "edits": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}, "required": ["cwd", "edits"]}},
-        {"name": _shell_tool_name(), "description": "Run a command in the detected shell. Block until exit, returns 'exit=N\\n' + combined stdout+stderr.",
+        {"name": _shell_tool_name(), "description": "Run a command in the detected shell. Returns 'exit=N\\n' + combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "command"]}},
         {"name": "grep", "description": "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, "required": ["cwd", "pattern"]}},
