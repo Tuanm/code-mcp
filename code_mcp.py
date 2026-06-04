@@ -1014,6 +1014,14 @@ def build_tools_list() -> list[dict]:
     tools.append({"name": "guide",
                   "description": "Operating manual for this code-mcp server: live state, session-start ritual, when to remember, tool catalog. Call at session start.",
                   "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}}, "required": ["cwd"]}})
+    # Merge in aggregated external tools (boot-probed via --mcp).
+    with aggregator_lock:
+        for prefixed_name, info in aggregator_tools.items():
+            tools.append({
+                "name": prefixed_name,
+                "description": info.get("description", ""),
+                "inputSchema": info.get("inputSchema", {"type": "object"}),
+            })
     if has_cloudflared:
         tools.append({"name": "preview", "description": "Start a Cloudflare quick tunnel.",
                       "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}})
@@ -1109,6 +1117,8 @@ def dispatch_tool(tool_name: str, params: dict) -> Any:
                               cwd)
         if tool_name == "guide":
             return render_guide(cwd)
+        # Aggregated tools are handled directly in tools/call; raw-method dispatch
+        # falls through to error so the caller knows to use tools/call.
         return f"ERROR:-32601: unknown method: {tool_name}"
     except Exception as e:
         return f"ERROR: {e}"
@@ -1210,6 +1220,20 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
                 return
             tool_name = params.get("name", "")
             tool_params = params.get("arguments", {})
+            # Aggregated tools: forward MCP server's content blocks untouched (parity with TS).
+            with aggregator_lock:
+                is_aggregated = tool_name in aggregator_tools
+            if is_aggregated:
+                try:
+                    raw = call_aggregated_raw(tool_name, tool_params if isinstance(tool_params, dict) else {})
+                    if isinstance(raw, dict) and isinstance(raw.get("content"), list):
+                        self.send_json(jsonrpc_response(req_id, raw))
+                    else:
+                        text = json.dumps(raw, ensure_ascii=False) if not isinstance(raw, str) else raw
+                        self.send_json(jsonrpc_response(req_id, {"content": [{"type": "text", "text": text}]}))
+                except Exception as e:
+                    self.send_json(jsonrpc_response(req_id, {"content": [{"type": "text", "text": f"ERROR: {e}"}]}))
+                return
             result = dispatch_tool(tool_name, tool_params)
             text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             # read+no_truncate: caller explicitly asked for full content; don't re-spill.
@@ -1837,10 +1861,18 @@ def _list_external_servers(cwd: str) -> list[dict]:
     out = []
     with mcp_lock:
         loaded_snapshot = {k: dict(v) for k, v in mcp_servers.items()}
+    # Aggregator-probed tools: namespace -> [tool names]
+    aggr_by_ns: dict[str, list[str]] = {}
+    with aggregator_lock:
+        for info in aggregator_tools.values():
+            aggr_by_ns.setdefault(info["ns"], []).append(info["tool"])
     for name in sorted(servers.keys()):
         key = f"{cwd}:{name}"
-        tools = loaded_snapshot.get(key, {}).get("tools", []) or []
-        out.append({"ns": name, "tools": sorted(tools), "loaded": key in loaded_snapshot})
+        lazy_tools = loaded_snapshot.get(key, {}).get("tools", []) or []
+        probed_tools = aggr_by_ns.get(name, [])
+        tools = sorted(set(lazy_tools) | set(probed_tools))
+        loaded = key in loaded_snapshot or name in aggr_by_ns
+        out.append({"ns": name, "tools": tools, "loaded": loaded})
     return out
 
 
@@ -1895,7 +1927,9 @@ def render_guide(cwd: str) -> str:
 
     lines.append("")
     lines.append("<tools>")
-    builtin = sorted(t["name"] for t in build_tools_list())
+    with aggregator_lock:
+        aggregated_names = set(aggregator_tools.keys())
+    builtin = sorted(t["name"] for t in build_tools_list() if t["name"] not in aggregated_names)
     lines.append("built-in: " + ", ".join(builtin))
     externals = _list_external_servers(cwd)
     if externals:
@@ -2042,6 +2076,207 @@ mcp_servers: dict[str, dict] = {}  # key: "cwd:servername"
 mcp_processes: dict[str, subprocess.Popen] = {}  # key: "cwd:servername"
 mcp_next_id = 0
 mcp_lock = threading.Lock()
+
+# ----- Boot-time aggregator (parity with TS --mcp flag) -----
+# Servers from {process.cwd()}/{mcp_config_path} are spawned at startup, probed
+# in parallel, and their tools surface in the main tools/list under
+# `<ns>__<tool>` so the agent can call them as if they were built-in.
+NAMESPACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+aggregator_processes: dict[str, subprocess.Popen] = {}  # key: namespace
+aggregator_tools: dict[str, dict] = {}  # prefixed name -> {"ns","tool","description","inputSchema"}
+aggregator_lock = threading.Lock()  # protects aggregator_processes / aggregator_tools maps
+aggregator_io_locks: dict[str, threading.Lock] = {}  # per-namespace stdio lock
+_aggregator_next_id = 0
+
+
+def _aggregator_validate(ns: str, cfg: dict) -> str | None:
+    if not NAMESPACE_RE.match(ns):
+        return f"invalid namespace '{ns}'"
+    if not isinstance(cfg, dict):
+        return "config must be an object"
+    if cfg.get("type") == "http":
+        return "http transport not yet supported in Python aggregator"
+    cmd = cfg.get("command")
+    if not isinstance(cmd, str) or not cmd:
+        return "missing 'command'"
+    if re.search(r"[;|<>&\x00]", cmd):
+        return "command contains shell operators or NUL"
+    args = cfg.get("args", [])
+    if args is None:
+        args = []
+    if not isinstance(args, list):
+        return "'args' must be an array of strings"
+    for a in args:
+        if not isinstance(a, str):
+            return "all args must be strings"
+        if "\x00" in a:
+            return "args contain NUL"
+    return None
+
+
+def _aggregator_rpc(ns: str, method: str, params: dict, timeout_s: float = 30.0) -> dict:
+    """JSON-RPC over stdio to an aggregator subprocess.
+
+    Hold the per-ns io lock for the full write+read cycle so concurrent callers
+    don't steal each other's response lines.
+    """
+    global _aggregator_next_id
+    with aggregator_lock:
+        proc = aggregator_processes.get(ns)
+        io_lock = aggregator_io_locks.get(ns)
+    if proc is None or proc.poll() is not None or io_lock is None:
+        raise IOError(f"aggregator server '{ns}' not running")
+    with io_lock:
+        with aggregator_lock:
+            _aggregator_next_id += 1
+            req_id = _aggregator_next_id
+        request = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+        try:
+            proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise IOError(f"aggregator '{ns}' pipe broken: {e}")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if sys.platform == "win32":
+                line = proc.stdout.readline()
+            else:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([proc.stdout], [], [], remaining)
+                if not ready:
+                    raise TimeoutError(f"aggregator '{ns}' response timeout")
+                line = proc.stdout.readline()
+            if not line:
+                raise EOFError(f"aggregator '{ns}' ended")
+            try:
+                response = json.loads(line.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(response, dict) and response.get("id") == req_id:
+                if "error" in response:
+                    raise IOError(f"aggregator '{ns}' rpc error: {response['error']}")
+                return response.get("result", {})
+        raise TimeoutError(f"aggregator '{ns}' response timeout")
+
+
+def _aggregator_spawn(ns: str, cfg: dict) -> list[dict]:
+    """Spawn one aggregator server and probe its tools. Returns prefixed tool dicts."""
+    cmd = cfg["command"]
+    args = cfg.get("args", []) or []
+    extra_env = cfg.get("env") or {}
+    if not isinstance(extra_env, dict):
+        extra_env = {}
+    if isinstance(cmd, str):
+        cmd_list = [cmd] + list(args)
+    else:
+        cmd_list = list(cmd) + list(args)
+    proc = subprocess.Popen(
+        cmd_list,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=build_child_env({k: str(v) for k, v in extra_env.items()}),
+    )
+    with aggregator_lock:
+        aggregator_processes[ns] = proc
+        aggregator_io_locks[ns] = threading.Lock()
+    try:
+        _aggregator_rpc(ns, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "code-mcp-aggregator", "version": "0.1.0"},
+        })
+        try:
+            # Best-effort notification; many servers expect it before tools/list.
+            notif = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+            proc.stdin.write((json.dumps(notif) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+        except Exception:
+            pass
+        result = _aggregator_rpc(ns, "tools/list", {})
+        raw_tools = result.get("tools", []) if isinstance(result, dict) else []
+        prefixed = []
+        for t in raw_tools:
+            if not isinstance(t, dict) or not isinstance(t.get("name"), str):
+                continue
+            entry = {
+                "ns": ns,
+                "tool": t["name"],
+                "description": t.get("description", ""),
+                "inputSchema": t.get("inputSchema", {"type": "object"}),
+            }
+            prefixed.append(entry)
+        return prefixed
+    except Exception:
+        with aggregator_lock:
+            p = aggregator_processes.pop(ns, None)
+            aggregator_io_locks.pop(ns, None)
+        if p is not None:
+            try: p.terminate()
+            except Exception: pass
+        raise
+
+
+def load_aggregator(config_path: str) -> None:
+    """Parse --mcp config and probe all servers in parallel. Called once at boot."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        print(f"[mcp] config not found: {config_path}", file=sys.stderr)
+        return
+    except Exception as e:
+        print(f"[mcp] failed to parse {config_path}: {e}", file=sys.stderr)
+        return
+    servers = cfg.get("mcpServers") or {}
+    if not isinstance(servers, dict) or not servers:
+        print(f"[mcp] {config_path} has no 'mcpServers' object; aggregation disabled", file=sys.stderr)
+        return
+    valid: list[tuple[str, dict]] = []
+    for ns, scfg in servers.items():
+        err = _aggregator_validate(ns, scfg or {})
+        if err:
+            print(f"[mcp] skipping '{ns}': {err}", file=sys.stderr)
+            continue
+        valid.append((ns, scfg))
+    if not valid:
+        return
+    # Parallel probe so boot time is bounded by the slowest server.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(valid))) as pool:
+        futures = {pool.submit(_aggregator_spawn, ns, scfg): (ns, scfg) for ns, scfg in valid}
+        for fut in concurrent.futures.as_completed(futures):
+            ns, scfg = futures[fut]
+            try:
+                entries = fut.result()
+            except Exception as e:
+                print(f"[mcp] probe '{ns}' failed: {e}", file=sys.stderr)
+                continue
+            with aggregator_lock:
+                for entry in entries:
+                    prefixed_name = f"{ns}__{entry['tool']}"
+                    aggregator_tools[prefixed_name] = entry
+            print(f"[mcp] probed '{ns}' (stdio): {len(entries)} tool(s) cached", file=sys.stderr)
+
+
+def shutdown_aggregator() -> None:
+    with aggregator_lock:
+        procs = list(aggregator_processes.items())
+        aggregator_processes.clear()
+        aggregator_io_locks.clear()
+    for ns, p in procs:
+        try: p.terminate()
+        except Exception: pass
+
+
+def call_aggregated_raw(prefixed_name: str, args: dict):
+    """Return the raw result dict from the upstream MCP server (with content blocks)."""
+    with aggregator_lock:
+        info = aggregator_tools.get(prefixed_name)
+    if info is None:
+        raise ValueError(f"unknown aggregated tool: {prefixed_name}")
+    return _aggregator_rpc(info["ns"], "tools/call", {"name": info["tool"], "arguments": args or {}})
 
 
 def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path: str, cwd: str = ".") -> str:
@@ -2193,6 +2428,7 @@ def mcp_call(key: str, method: str, params: dict) -> dict:
 def signal_handler(sig, frame):
     global shutting_down
     shutting_down = True
+    shutdown_aggregator()
     sys.exit(0)
 
 
@@ -2203,6 +2439,9 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     port, token, gateway_domain, assigned_device_id = parse_args(sys.argv[1:])
+
+    if mcp_config_path:
+        load_aggregator(str(Path.cwd() / mcp_config_path))
 
     if gateway_domain:
         t = threading.Thread(target=start_gateway_client, args=(gateway_domain, assigned_device_id), daemon=True)

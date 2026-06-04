@@ -85,6 +85,15 @@ public final class CodeMCP {
     private static final Map<String, List<String>> mcpServerTools = new ConcurrentHashMap<>(); // key: "cwd:serverName"
     private static int mcpNextId = 0;
     private static final Object mcpIdLock = new Object();
+
+    // ===== AGGREGATOR STATE (boot-time --mcp probe, parity with TS) =====
+    private record AggregatedTool(String ns, String tool, String description, Map<String, Object> inputSchema) {}
+    private static final Map<String, Process> aggregatorProcesses = new ConcurrentHashMap<>(); // key: namespace
+    private static final Map<String, BufferedReader> aggregatorReaders = new ConcurrentHashMap<>();
+    private static final Map<String, Object> aggregatorLocks = new ConcurrentHashMap<>();
+    private static final Map<String, AggregatedTool> aggregatorTools = new ConcurrentHashMap<>(); // prefixed name -> info
+    private static final AtomicInteger aggregatorNextId = new AtomicInteger(0);
+    private static final Pattern AGGREGATOR_NS_RE = Pattern.compile("^[A-Za-z][A-Za-z0-9_-]{0,63}$");
     
     // ===== CONFIGURATION =====
     private static int port = DEFAULT_PORT;
@@ -168,8 +177,14 @@ public final class CodeMCP {
         // Handle shutdown
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             shuttingDown = true;
+            shutdownAggregator();
             server.stop(5);
         }));
+
+        // Load --mcp aggregator (boot-time probe, parity with TS).
+        if (mcpConfigPath != null) {
+            loadAggregator(Path.of(System.getProperty("user.dir"), mcpConfigPath).toString());
+        }
 
         // Start gateway client if --gateway is set
         if (gatewayDomain != null) {
@@ -861,6 +876,11 @@ public final class CodeMCP {
         List<Map<String, Object>> out = new ArrayList<>();
         List<String> names = new ArrayList<>(servers.keySet());
         names.sort(String::compareTo);
+        // Aggregator-probed tools: namespace -> list of tool names
+        Map<String, List<String>> aggrByNs = new HashMap<>();
+        for (AggregatedTool t : aggregatorTools.values()) {
+            aggrByNs.computeIfAbsent(t.ns(), k -> new ArrayList<>()).add(t.tool());
+        }
         for (String ns : names) {
             String key = cwd + ":" + ns;
             List<String> tools = new ArrayList<>();
@@ -869,6 +889,11 @@ public final class CodeMCP {
                 List<String> cached = mcpServerTools.get(key);
                 loaded = cached != null;
                 if (cached != null) tools.addAll(cached);
+            }
+            List<String> probed = aggrByNs.get(ns);
+            if (probed != null) {
+                for (String t : probed) if (!tools.contains(t)) tools.add(t);
+                loaded = true;
             }
             tools.sort(String::compareTo);
             out.add(Map.of("ns", ns, "tools", tools, "loaded", loaded));
@@ -897,6 +922,208 @@ public final class CodeMCP {
         names.removeAll(disallowedTools);
         names.sort(String::compareTo);
         return names;
+    }
+
+    // ===== AGGREGATOR (boot-time --mcp probe) =====
+
+    private static String validateAggregatorServer(String ns, Map<String, Object> cfg) {
+        if (!AGGREGATOR_NS_RE.matcher(ns).matches()) return "invalid namespace '" + ns + "'";
+        if (cfg == null) return "config must be an object";
+        if ("http".equals(cfg.get("type"))) return "http transport not yet supported in Java aggregator";
+        Object cmd = cfg.get("command");
+        if (!(cmd instanceof String) || ((String) cmd).isEmpty()) return "missing 'command'";
+        if (((String) cmd).matches(".*[;|<>&\\x00].*")) return "command contains shell operators or NUL";
+        Object args = cfg.getOrDefault("args", List.of());
+        if (args == null) args = List.of();
+        if (!(args instanceof List<?>)) return "'args' must be an array of strings";
+        for (Object a : (List<?>) args) {
+            if (!(a instanceof String)) return "all args must be strings";
+            if (((String) a).contains(" ")) return "args contain NUL";
+        }
+        return null;
+    }
+
+    private static Map<?, ?> aggregatorRpc(String ns, String method, Map<String, Object> params, long timeoutMs) throws IOException {
+        Process proc = aggregatorProcesses.get(ns);
+        if (proc == null || !proc.isAlive()) throw new IOException("aggregator '" + ns + "' not running");
+        Object lock = aggregatorLocks.get(ns);
+        if (lock == null) throw new IOException("no lock for ns: " + ns);
+        int reqId = aggregatorNextId.incrementAndGet();
+        String request = "{\"jsonrpc\":\"2.0\",\"id\":" + reqId
+            + ",\"method\":\"" + method + "\",\"params\":" + toJson(params) + "}\n";
+        synchronized (lock) {
+            try {
+                proc.getOutputStream().write(request.getBytes(StandardCharsets.UTF_8));
+                proc.getOutputStream().flush();
+            } catch (IOException e) {
+                throw new IOException("aggregator '" + ns + "' pipe broken: " + e.getMessage(), e);
+            }
+            BufferedReader reader = aggregatorReaders.get(ns);
+            if (reader == null) throw new IOException("no reader for ns: " + ns);
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (System.currentTimeMillis() < deadline) {
+                String line;
+                try {
+                    line = reader.readLine();
+                } catch (IOException e) {
+                    throw new IOException("aggregator '" + ns + "' read failed: " + e.getMessage(), e);
+                }
+                if (line == null) throw new EOFException("aggregator '" + ns + "' ended");
+                if (line.isBlank()) continue;
+                try {
+                    Map<String, Object> resp = parseJsonObject(line);
+                    Object respId = resp.get("id");
+                    if (!(respId instanceof Number) || ((Number) respId).intValue() != reqId) continue;
+                    if (resp.containsKey("error")) throw new IOException("rpc error: " + resp.get("error"));
+                    Object result = resp.get("result");
+                    return result instanceof Map ? (Map<?, ?>) result : Map.of("result", result);
+                } catch (RuntimeException re) {
+                    continue;
+                }
+            }
+            throw new IOException("aggregator '" + ns + "' response timeout");
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<AggregatedTool> aggregatorSpawn(String ns, Map<String, Object> cfg) throws Exception {
+        String cmd = (String) cfg.get("command");
+        Object argsRaw = cfg.getOrDefault("args", List.of());
+        List<?> argsList = argsRaw instanceof List<?> ? (List<?>) argsRaw : List.of();
+        Map<String, String> extraEnv = new HashMap<>();
+        Object envRaw = cfg.get("env");
+        if (envRaw instanceof Map<?, ?> envMap) {
+            for (Map.Entry<?, ?> e : envMap.entrySet()) {
+                if (e.getKey() instanceof String k && e.getValue() != null) {
+                    extraEnv.put(k, String.valueOf(e.getValue()));
+                }
+            }
+        }
+        List<String> cmdList = new ArrayList<>();
+        cmdList.add(cmd);
+        for (Object a : argsList) cmdList.add(String.valueOf(a));
+        ProcessBuilder pb = new ProcessBuilder(cmdList);
+        scrubEnv(pb);
+        pb.environment().putAll(extraEnv);
+        pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+        Process proc = pb.start();
+        aggregatorProcesses.put(ns, proc);
+        aggregatorReaders.put(ns, new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8)));
+        aggregatorLocks.put(ns, new Object());
+        try {
+            aggregatorRpc(ns, "initialize", Map.of(
+                "protocolVersion", "2024-11-05",
+                "capabilities", Map.of(),
+                "clientInfo", Map.of("name", "code-mcp-aggregator", "version", "0.1.0")
+            ), 30_000);
+            try {
+                String notif = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+                proc.getOutputStream().write(notif.getBytes(StandardCharsets.UTF_8));
+                proc.getOutputStream().flush();
+            } catch (Exception ignored) {}
+            Map<?, ?> result = aggregatorRpc(ns, "tools/list", Map.of(), 30_000);
+            Object toolsRaw = result.get("tools");
+            if (!(toolsRaw instanceof List<?>)) return List.of();
+            List<AggregatedTool> out = new ArrayList<>();
+            for (Object t : (List<?>) toolsRaw) {
+                if (!(t instanceof Map<?, ?> tm)) continue;
+                Object name = tm.get("name");
+                if (!(name instanceof String)) continue;
+                Object desc = tm.get("description");
+                Object schemaRaw = tm.get("inputSchema");
+                Map<String, Object> schema = schemaRaw instanceof Map
+                    ? new LinkedHashMap<>((Map<String, Object>) schemaRaw)
+                    : Map.of("type", "object");
+                out.add(new AggregatedTool(ns, (String) name,
+                    desc instanceof String s ? s : "", schema));
+            }
+            return out;
+        } catch (Exception e) {
+            Process p = aggregatorProcesses.remove(ns);
+            aggregatorReaders.remove(ns);
+            aggregatorLocks.remove(ns);
+            if (p != null) p.destroy();
+            throw e;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void loadAggregator(String configPath) {
+        Path path = Path.of(configPath);
+        if (!Files.exists(path)) {
+            System.err.println("[mcp] config not found: " + configPath);
+            return;
+        }
+        Map<String, Object> cfg;
+        try {
+            cfg = parseJsonObject(Files.readString(path));
+        } catch (Exception e) {
+            System.err.println("[mcp] failed to parse " + configPath + ": " + e.getMessage());
+            return;
+        }
+        Object serversRaw = cfg.get("mcpServers");
+        if (!(serversRaw instanceof Map<?, ?>)) {
+            System.err.println("[mcp] " + configPath + " has no 'mcpServers' object; aggregation disabled");
+            return;
+        }
+        Map<String, Object> servers = (Map<String, Object>) serversRaw;
+        List<Map.Entry<String, Map<String, Object>>> valid = new ArrayList<>();
+        for (var e : servers.entrySet()) {
+            String ns = e.getKey();
+            if (!(e.getValue() instanceof Map<?, ?>)) {
+                System.err.println("[mcp] skipping '" + ns + "': not an object");
+                continue;
+            }
+            Map<String, Object> scfg = (Map<String, Object>) e.getValue();
+            String err = validateAggregatorServer(ns, scfg);
+            if (err != null) {
+                System.err.println("[mcp] skipping '" + ns + "': " + err);
+                continue;
+            }
+            valid.add(Map.entry(ns, scfg));
+        }
+        if (valid.isEmpty()) return;
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(8, valid.size()));
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (var e : valid) {
+                String ns = e.getKey();
+                Map<String, Object> scfg = e.getValue();
+                futures.add(pool.submit(() -> {
+                    try {
+                        List<AggregatedTool> entries = aggregatorSpawn(ns, scfg);
+                        for (AggregatedTool t : entries) {
+                            aggregatorTools.put(ns + "__" + t.tool(), t);
+                        }
+                        System.err.println("[mcp] probed '" + ns + "' (stdio): " + entries.size() + " tool(s) cached");
+                    } catch (Exception ex) {
+                        System.err.println("[mcp] probe '" + ns + "' failed: " + ex.getMessage());
+                    }
+                }));
+            }
+            for (Future<?> f : futures) {
+                try { f.get(); } catch (Exception ignored) {}
+            }
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    private static void shutdownAggregator() {
+        for (Process p : aggregatorProcesses.values()) {
+            try { p.destroy(); } catch (Exception ignored) {}
+        }
+        aggregatorProcesses.clear();
+        aggregatorReaders.clear();
+        aggregatorLocks.clear();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<?, ?> callAggregatedRaw(String prefixedName, Map<String, Object> args) throws IOException {
+        AggregatedTool info = aggregatorTools.get(prefixedName);
+        if (info == null) throw new IOException("unknown aggregated tool: " + prefixedName);
+        return aggregatorRpc(info.ns(), "tools/call",
+            Map.of("name", info.tool(), "arguments", args == null ? Map.of() : args), 30_000);
     }
 
     @SuppressWarnings("unchecked")
@@ -2194,6 +2421,16 @@ public final class CodeMCP {
                         "Operating manual for this code-mcp server: live state, session-start ritual, when to remember, tool catalog. Call at session start.",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true))));
 
+                    // Aggregated external tools (boot-probed via --mcp).
+                    for (var entry : aggregatorTools.entrySet()) {
+                        AggregatedTool info = entry.getValue();
+                        tools.add(Map.of(
+                            "name", entry.getKey(),
+                            "description", info.description() != null ? info.description() : "",
+                            "inputSchema", info.inputSchema() != null ? info.inputSchema() : Map.of("type", "object")
+                        ));
+                    }
+
                     // Strip any tool that was disabled via --disallowed-tools.
                     if (!disallowedTools.isEmpty()) {
                         tools.removeIf(t -> disallowedTools.contains((String) t.get("name")));
@@ -2220,6 +2457,17 @@ public final class CodeMCP {
                             || (name.equals("powershell") && detectedShell != ShellType.POWERSHELL)) {
                         yield Map.of("content", List.of(Map.of("type", "text",
                             "text", "ERROR: tool '" + name + "' not available on this shell (" + detectedShell + ")")));
+                    }
+
+                    // Aggregated tools: forward upstream content blocks untouched (parity with TS).
+                    if (aggregatorTools.containsKey(name)) {
+                        try {
+                            Map<?, ?> raw = callAggregatedRaw(name, args);
+                            yield raw;
+                        } catch (Exception e) {
+                            yield Map.of("content", List.of(Map.of("type", "text",
+                                "text", "ERROR: " + e.getMessage())));
+                        }
                     }
 
                     String result;
