@@ -1638,7 +1638,61 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
 
 # ---------- memos ----------
 MEMO_FILE = ".memo.jsonl"
+MEMO_LOCK_FILE = ".memo.lock"
 MEMO_TAIL_BYTES = 8192
+MEMO_LOCK_TIMEOUT_MS = 30_000
+STALE_MEMO_LOCK_MS = 60_000
+MEMO_LOCK_RETRY_S = 0.04
+
+
+def _sanitize_tags(tags) -> list[str] | None:
+    """Filter to clean string[] or None. Drops null/numbers/empty strings."""
+    if not isinstance(tags, list):
+        return None
+    out = [t for t in tags if isinstance(t, str) and t]
+    return out if out else None
+
+
+class _MemoLock:
+    """Cross-process lock via O_CREAT|O_EXCL on {cwd}/.memo.lock.
+    Multiple Claude agents on the same device may share a cwd; this serializes
+    remember/forget across processes. Stale locks (older than 60s) are reaped.
+    """
+    def __init__(self, cwd: str):
+        self.path = Path(cwd) / MEMO_LOCK_FILE
+
+    def __enter__(self):
+        start = time.time()
+        while (time.time() - start) * 1000 < MEMO_LOCK_TIMEOUT_MS:
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    os.write(fd, f"{os.getpid()}\n".encode())
+                finally:
+                    os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    age_ms = (time.time() - self.path.stat().st_mtime) * 1000
+                    if age_ms > STALE_MEMO_LOCK_MS:
+                        try:
+                            self.path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        continue
+                except FileNotFoundError:
+                    continue
+                time.sleep(MEMO_LOCK_RETRY_S + random.random() * 0.03)
+        raise RuntimeError(
+            f"could not acquire memo lock at {self.path} within {MEMO_LOCK_TIMEOUT_MS}ms"
+        )
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        return False
 
 
 def read_memos(cwd: str) -> list[dict]:
@@ -1659,8 +1713,15 @@ def read_memos(cwd: str) -> list[dict]:
             m = json.loads(line)
             if (isinstance(m, dict)
                     and isinstance(m.get("id"), int)
+                    and not isinstance(m.get("id"), bool)
                     and isinstance(m.get("ts"), int)
+                    and not isinstance(m.get("ts"), bool)
                     and isinstance(m.get("memo"), str)):
+                clean = _sanitize_tags(m.get("tags"))
+                if clean:
+                    m["tags"] = clean
+                elif "tags" in m:
+                    del m["tags"]
                 memos.append(m)
         except Exception:
             # skip malformed line
@@ -1671,16 +1732,15 @@ def read_memos(cwd: str) -> list[dict]:
 def write_memos(cwd: str, memos: list[dict]):
     path = Path(cwd) / MEMO_FILE
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with memo_lock:
-        with open(tmp, "w", encoding="utf-8") as f:
-            for m in memos:
-                f.write(json.dumps(m, ensure_ascii=False) + "\n")
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp, path)
+    with open(tmp, "w", encoding="utf-8") as f:
+        for m in memos:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
 
 
 def last_memo_id(cwd: str) -> int:
@@ -1713,11 +1773,12 @@ def last_memo_id(cwd: str) -> int:
 
 
 def handle_remember(cwd: str, memo: str, tags: list | None = None) -> str:
-    with memo_lock:
+    clean_tags = _sanitize_tags(tags)
+    with _MemoLock(cwd):
         memo_id = last_memo_id(cwd) + 1
         entry = {"id": memo_id, "ts": int(time.time() * 1000), "memo": memo}
-        if tags:
-            entry["tags"] = tags
+        if clean_tags:
+            entry["tags"] = clean_tags
         path = Path(cwd) / MEMO_FILE
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1730,12 +1791,13 @@ def handle_remember(cwd: str, memo: str, tags: list | None = None) -> str:
 
 
 def handle_forget(cwd: str, memo_id: int) -> str:
-    memos = read_memos(cwd)
-    before = len(memos)
-    kept = [m for m in memos if m.get("id") != memo_id]
-    if len(kept) == before:
-        raise ValueError(f"no memo with id {memo_id}")
-    write_memos(cwd, kept)
+    with _MemoLock(cwd):
+        memos = read_memos(cwd)
+        before = len(memos)
+        kept = [m for m in memos if m.get("id") != memo_id]
+        if len(kept) == before:
+            raise ValueError(f"no memo with id {memo_id}")
+        write_memos(cwd, kept)
     return f"forgot #{memo_id}"
 
 
@@ -1755,14 +1817,15 @@ def handle_recall(cwd: str, query: str | None = None, tags: list | None = None,
     if off < 0:
         off = 0
     memos = read_memos(cwd)
-    q = query.lower() if query else None
-    tag_set = [t.lower() for t in tags] if tags else None
+    q = query.lower() if isinstance(query, str) and query else None
+    clean_tags = _sanitize_tags(tags)
+    tag_set = [t.lower() for t in clean_tags] if clean_tags else None
     filtered = []
     for m in memos:
         if q and q not in m.get("memo", "").lower():
             continue
         if tag_set:
-            memo_tags = [str(t).lower() for t in m.get("tags", [])]
+            memo_tags = [t.lower() for t in m.get("tags", []) if isinstance(t, str)]
             if not all(t in memo_tags for t in tag_set):
                 continue
         filtered.append(m)
@@ -1775,7 +1838,9 @@ def handle_recall(cwd: str, query: str | None = None, tags: list | None = None,
     page = filtered[off:off + lim]
     lines = []
     for m in page:
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(m.get("ts", 0) / 1000))
+        ts_ms = m.get("ts", 0)
+        secs, ms = divmod(int(ts_ms), 1000)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(secs)) + f".{ms:03d}Z"
         tag_str = f" [{','.join(m['tags'])}]" if m.get("tags") else ""
         lines.append(f"#{m['id']} {ts}{tag_str} {m['memo']}")
     end = off + len(page)

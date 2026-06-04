@@ -18,8 +18,8 @@
 //   --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
 
 import { spawn, spawnSync, file, write } from "bun";
-import { readdirSync, statSync, mkdirSync, rmSync } from "node:fs";
-import { appendFile } from "node:fs/promises";
+import { readdirSync, statSync, mkdirSync, rmSync, constants as fsConstants } from "node:fs";
+import { open as fsOpen, rename as fsRename, unlink as fsUnlink, stat as fsStat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
@@ -484,6 +484,16 @@ function startJob(command: string, cwd: string): Job {
 // ---------- memos ----------
 type Memo = { id: number; ts: number; memo: string; tags?: string[] };
 
+// Filter to a clean string[] or undefined. Drops null/numbers/empty strings.
+function sanitizeTags(tags: unknown): string[] | undefined {
+  if (!Array.isArray(tags)) return undefined;
+  const out: string[] = [];
+  for (const t of tags) {
+    if (typeof t === "string" && t.length > 0) out.push(t);
+  }
+  return out.length ? out : undefined;
+}
+
 async function readMemos(cwd: string): Promise<Memo[]> {
   const f = file(resolve(cwd, ".memo.jsonl"));
   if (!(await f.exists())) return [];
@@ -495,6 +505,8 @@ async function readMemos(cwd: string): Promise<Memo[]> {
     try {
       const m = JSON.parse(trimmed) as Memo;
       if (typeof m?.id === "number" && typeof m?.memo === "string" && typeof m?.ts === "number") {
+        const cleanTags = sanitizeTags((m as { tags?: unknown }).tags);
+        if (cleanTags) m.tags = cleanTags; else delete m.tags;
         memos.push(m);
       }
     } catch {
@@ -504,9 +516,56 @@ async function readMemos(cwd: string): Promise<Memo[]> {
   return memos;
 }
 
+// Atomic overwrite: write to tmp, fsync, rename. Survives crash mid-write.
 async function writeMemos(cwd: string, memos: Memo[]): Promise<void> {
   const text = memos.map((m) => JSON.stringify(m)).join("\n") + (memos.length ? "\n" : "");
-  await write(resolve(cwd, ".memo.jsonl"), text);
+  const target = resolve(cwd, ".memo.jsonl");
+  const tmp = target + ".tmp";
+  const fh = await fsOpen(tmp, "w");
+  try {
+    await fh.writeFile(text);
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await fsRename(tmp, target);
+}
+
+// ---------- cross-process memo lock ----------
+// Multiple Claude agents on the same device may share a cwd. Coordinate via
+// an EEXIST lockfile so remember/forget never interleave across processes.
+const MEMO_LOCK_TIMEOUT_MS = 30_000;
+const STALE_MEMO_LOCK_MS = 60_000;
+const MEMO_LOCK_RETRY_MS = 40;
+
+async function acquireMemoLock(cwd: string): Promise<() => Promise<void>> {
+  const lockPath = resolve(cwd, ".memo.lock");
+  const start = Date.now();
+  while (Date.now() - start < MEMO_LOCK_TIMEOUT_MS) {
+    try {
+      const fh = await fsOpen(
+        lockPath,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+      );
+      try { await fh.writeFile(`${process.pid}\n`); } catch { /* best-effort */ }
+      await fh.close();
+      return async () => { try { await fsUnlink(lockPath); } catch { /* gone is fine */ } };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
+      try {
+        const st = await fsStat(lockPath);
+        if (Date.now() - st.mtimeMs > STALE_MEMO_LOCK_MS) {
+          try { await fsUnlink(lockPath); } catch { /* race ok */ }
+          continue;
+        }
+      } catch {
+        // lock vanished between EEXIST and stat — retry immediately
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, MEMO_LOCK_RETRY_MS + Math.random() * 30));
+    }
+  }
+  throw new Error(`could not acquire memo lock at ${lockPath} within ${MEMO_LOCK_TIMEOUT_MS}ms`);
 }
 
 // Read the last memo id from {cwd}/.memo.jsonl without loading the whole file.
@@ -2266,13 +2325,23 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "memo"],
     },
     handler: async ({ cwd, memo, tags }) => {
-      const id = (await lastMemoId(cwd)) + 1;
-      const entry: Memo = { id, ts: Date.now(), memo, ...(tags?.length ? { tags } : {}) };
-      const line = JSON.stringify(entry) + "\n";
-      // True append — O(1) regardless of file size. node:fs/promises works on
-      // Windows/Linux/macOS and creates the file if absent.
-      await appendFile(resolve(cwd, ".memo.jsonl"), line);
-      return `remembered #${id}`;
+      const cleanTags = sanitizeTags(tags);
+      const release = await acquireMemoLock(cwd);
+      try {
+        const id = (await lastMemoId(cwd)) + 1;
+        const entry: Memo = { id, ts: Date.now(), memo, ...(cleanTags ? { tags: cleanTags } : {}) };
+        const line = JSON.stringify(entry) + "\n";
+        const fh = await fsOpen(resolve(cwd, ".memo.jsonl"), "a");
+        try {
+          await fh.writeFile(line);
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
+        return `remembered #${id}`;
+      } finally {
+        await release();
+      }
     },
   },
 
@@ -2287,12 +2356,17 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "memo_id"],
     },
     handler: async ({ cwd, memo_id }) => {
-      const memos = await readMemos(cwd);
-      const before = memos.length;
-      const kept = memos.filter((m) => m.id !== memo_id);
-      if (kept.length === before) throw new Error(`no memo with id ${memo_id}`);
-      await writeMemos(cwd, kept);
-      return `forgot #${memo_id}`;
+      const release = await acquireMemoLock(cwd);
+      try {
+        const memos = await readMemos(cwd);
+        const before = memos.length;
+        const kept = memos.filter((m) => m.id !== memo_id);
+        if (kept.length === before) throw new Error(`no memo with id ${memo_id}`);
+        await writeMemos(cwd, kept);
+        return `forgot #${memo_id}`;
+      } finally {
+        await release();
+      }
     },
   },
 
@@ -2313,8 +2387,9 @@ const tools: Record<string, Tool> = {
       const lim = Number.isFinite(limit) && limit >= 1 ? Math.min(Math.floor(limit), 1000) : 20;
       const off = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
       const memos = await readMemos(cwd);
-      const q = query?.toLowerCase();
-      const tagSet = tags?.length ? tags.map((t: string) => t.toLowerCase()) : null;
+      const q = typeof query === "string" && query.length ? query.toLowerCase() : null;
+      const cleanTags = sanitizeTags(tags);
+      const tagSet = cleanTags ? cleanTags.map((t) => t.toLowerCase()) : null;
       const filtered = memos.filter((m) => {
         if (q && !m.memo.toLowerCase().includes(q)) return false;
         if (tagSet) {

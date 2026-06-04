@@ -9,6 +9,7 @@ import java.io.*;
 import java.net.*;
 import java.net.http.*;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.*;
@@ -97,7 +98,6 @@ public final class CodeMCP {
     private static String gatewayDomain = null;
     private static String assignedDeviceId = null;
     private static final Set<String> disallowedTools = new HashSet<>();
-    private static final Object memoLock = new Object();
     private static String uploadRoot;
     private static String spillRoot;
     private static boolean hasRg = false;
@@ -723,23 +723,82 @@ public final class CodeMCP {
     @SuppressWarnings("unchecked")
     private static Memo parseMemo(String json) {
         Map<String, Object> m = parseJsonObject(json);
-        List<String> tags = null;
-        if (m.containsKey("tags")) {
-            Object t = m.get("tags");
-            if (t instanceof List<?>) {
-                tags = new ArrayList<>();
-                for (Object item : (List<?>) t) {
-                    if (item instanceof String) tags.add((String) item);
-                    else tags.add(String.valueOf(item));
+        Object idRaw = m.get("id");
+        Object tsRaw = m.get("ts");
+        Object memoRaw = m.get("memo");
+        if (!(idRaw instanceof Number) || !(tsRaw instanceof Number) || !(memoRaw instanceof String)) {
+            throw new IllegalArgumentException("invalid memo shape");
+        }
+        List<String> tags = sanitizeTags(m.get("tags"));
+        return new Memo(
+            ((Number) idRaw).intValue(),
+            ((Number) tsRaw).longValue(),
+            (String) memoRaw,
+            tags
+        );
+    }
+
+    /** Filter to clean string list or null. Drops null/numbers/empty strings. */
+    private static List<String> sanitizeTags(Object tags) {
+        if (!(tags instanceof List<?>)) return null;
+        List<String> out = new ArrayList<>();
+        for (Object t : (List<?>) tags) {
+            if (t instanceof String s && !s.isEmpty()) out.add(s);
+        }
+        return out.isEmpty() ? null : out;
+    }
+
+    // ===== CROSS-PROCESS MEMO LOCK =====
+    // Multiple Claude agents on the same device may share a cwd; serialize
+    // remember/forget across processes via an EEXIST lockfile.
+    private static final long MEMO_LOCK_TIMEOUT_MS = 30_000L;
+    private static final long STALE_MEMO_LOCK_MS = 60_000L;
+    private static final long MEMO_LOCK_RETRY_MS = 40L;
+
+    private static Path acquireMemoLock(String cwd) throws IOException {
+        Path lockPath = Path.of(cwd, ".memo.lock");
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() - start < MEMO_LOCK_TIMEOUT_MS) {
+            try {
+                Files.createFile(lockPath);
+                try {
+                    Files.writeString(lockPath, String.valueOf(ProcessHandle.current().pid()) + "\n");
+                } catch (IOException ignored) { /* best-effort PID hint */ }
+                return lockPath;
+            } catch (FileAlreadyExistsException e) {
+                try {
+                    long age = System.currentTimeMillis()
+                        - Files.getLastModifiedTime(lockPath).toMillis();
+                    if (age > STALE_MEMO_LOCK_MS) {
+                        try { Files.deleteIfExists(lockPath); } catch (IOException ignored) {}
+                        continue;
+                    }
+                } catch (NoSuchFileException nsfe) {
+                    continue;
+                }
+                try {
+                    Thread.sleep(MEMO_LOCK_RETRY_MS
+                        + ThreadLocalRandom.current().nextInt(30));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting for memo lock", ie);
                 }
             }
         }
-        return new Memo(
-            ((Number) m.get("id")).intValue(),
-            ((Number) m.get("ts")).longValue(),
-            (String) m.get("memo"),
-            tags
-        );
+        throw new IOException("could not acquire memo lock at " + lockPath
+            + " within " + MEMO_LOCK_TIMEOUT_MS + "ms");
+    }
+
+    private static void releaseMemoLock(Path lockPath) {
+        try { Files.deleteIfExists(lockPath); } catch (IOException ignored) {}
+    }
+
+    /** ISO 8601 with milliseconds + Z, parity with TS Date.toISOString() and Python output. */
+    private static String formatMemoTs(long ms) {
+        return java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochMilli(ms),
+                java.time.ZoneOffset.UTC)
+            .format(java.time.format.DateTimeFormatter
+                .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"));
     }
     
     // ----- JSON parser (FSM-based, RFC 8259 subset) -----
@@ -930,17 +989,19 @@ public final class CodeMCP {
         for (Memo m : memos) {
             sb.append(memoToJsonLine(m)).append('\n');
         }
-        synchronized (memoLock) {
-            Path target = Path.of(cwd, ".memo.jsonl");
-            Path tmp = Path.of(cwd, ".memo.jsonl.tmp");
-            Files.writeString(tmp, sb.toString(),
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-            try {
-                Files.move(tmp, target,
-                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException e) {
-                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-            }
+        Path target = Path.of(cwd, ".memo.jsonl");
+        Path tmp = Path.of(cwd, ".memo.jsonl.tmp");
+        byte[] data = sb.toString().getBytes(StandardCharsets.UTF_8);
+        try (FileChannel ch = FileChannel.open(tmp,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            ch.write(ByteBuffer.wrap(data));
+            ch.force(true);
+        }
+        try {
+            Files.move(tmp, target,
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -1565,33 +1626,47 @@ public final class CodeMCP {
     
     // --- memory tools (remember/forget/recall) ---
     private static String handleRemember(String cwd, String memo, List<String> tags) throws IOException {
-        synchronized (memoLock) {
+        List<String> cleanTags = sanitizeTags(tags);
+        Path lockPath = acquireMemoLock(cwd);
+        try {
             int id = lastMemoId(cwd) + 1;
-            Memo m = new Memo(id, System.currentTimeMillis(), memo, tags);
-            Files.writeString(Path.of(cwd, ".memo.jsonl"), memoToJsonLine(m) + "\n",
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            Memo m = new Memo(id, System.currentTimeMillis(), memo, cleanTags);
+            byte[] data = (memoToJsonLine(m) + "\n").getBytes(StandardCharsets.UTF_8);
+            try (FileChannel ch = FileChannel.open(Path.of(cwd, ".memo.jsonl"),
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+                ch.write(ByteBuffer.wrap(data));
+                ch.force(true);
+            }
             return "remembered #" + id;
+        } finally {
+            releaseMemoLock(lockPath);
         }
     }
     
     private static String handleForget(String cwd, int memoId) throws IOException {
-        List<Memo> memos = readMemos(cwd);
-        int before = memos.size();
-        memos = memos.stream().filter(m -> m.id != memoId).collect(Collectors.toList());
-        if (memos.size() == before) throw new RuntimeException("no memo with id " + memoId);
-        writeMemos(cwd, memos);
-        return "forgot #" + memoId;
+        Path lockPath = acquireMemoLock(cwd);
+        try {
+            List<Memo> memos = readMemos(cwd);
+            int before = memos.size();
+            memos = memos.stream().filter(m -> m.id != memoId).collect(Collectors.toList());
+            if (memos.size() == before) throw new RuntimeException("no memo with id " + memoId);
+            writeMemos(cwd, memos);
+            return "forgot #" + memoId;
+        } finally {
+            releaseMemoLock(lockPath);
+        }
     }
     
     private static String handleRecall(String cwd, String query, List<String> tags, int limit, int offset) throws IOException {
         int lim = limit < 1 ? 20 : Math.min(limit, 1000);
         int off = offset < 0 ? 0 : offset;
         List<Memo> memos = readMemos(cwd);
-        final String q = query != null ? query.toLowerCase() : null;
+        final String q = (query != null && !query.isEmpty()) ? query.toLowerCase() : null;
+        List<String> cleanTags = sanitizeTags(tags);
         final List<String> tagSet;
-        if (tags != null && !tags.isEmpty()) {
-            tagSet = new ArrayList<>(tags.size());
-            for (String t : tags) tagSet.add(t.toLowerCase());
+        if (cleanTags != null) {
+            tagSet = new ArrayList<>(cleanTags.size());
+            for (String t : cleanTags) tagSet.add(t.toLowerCase());
         } else {
             tagSet = null;
         }
@@ -1613,7 +1688,7 @@ public final class CodeMCP {
         int toIndex = Math.min(off + lim, total);
         List<Memo> page = filtered.subList(off, toIndex);
         String body = page.stream()
-            .map(m -> "#" + m.id + " " + java.time.Instant.ofEpochMilli(m.ts).toString() + (m.tags != null && !m.tags.isEmpty() ? " [" + String.join(",", m.tags) + "]" : "") + " " + m.memo)
+            .map(m -> "#" + m.id + " " + formatMemoTs(m.ts) + (m.tags != null && !m.tags.isEmpty() ? " [" + String.join(",", m.tags) + "]" : "") + " " + m.memo)
             .collect(Collectors.joining("\n"));
         int end = off + page.size();
         String footer = "-- " + (off + 1) + "-" + end + " of " + total;
