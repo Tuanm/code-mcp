@@ -1011,6 +1011,9 @@ def build_tools_list() -> list[dict]:
             {"name": "recall", "description": "Search memos by substring (query) and/or tags (AND). Both are case-insensitive. Sorted newest first. Paginated.",
              "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "query": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "number"}, "offset": {"type": "number"}}, "required": ["cwd"]}},
         ])
+    tools.append({"name": "guide",
+                  "description": "Operating manual for this code-mcp server: live state, session-start ritual, when to remember, tool catalog. Call at session start.",
+                  "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}}, "required": ["cwd"]}})
     if has_cloudflared:
         tools.append({"name": "preview", "description": "Start a Cloudflare quick tunnel.",
                       "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}})
@@ -1104,6 +1107,8 @@ def dispatch_tool(tool_name: str, params: dict) -> Any:
                               params.get("args") or {},
                               params.get("mcpConfigPath") or (mcp_config_path or ".mcp.json"),
                               cwd)
+        if tool_name == "guide":
+            return render_guide(cwd)
         return f"ERROR:-32601: unknown method: {tool_name}"
     except Exception as e:
         return f"ERROR: {e}"
@@ -1770,6 +1775,159 @@ def last_memo_id(cwd: str) -> int:
         return max((m["id"] for m in memos if "id" in m), default=0)
     except Exception:
         return 0
+
+
+# ---------- guide ----------
+
+def _xml_attr(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+              .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _collect_memo_state(cwd: str) -> dict:
+    memos = read_memos(cwd)
+    latest = None
+    if memos:
+        newest = max(memos, key=lambda m: m.get("id", 0))
+        ts_ms = newest.get("ts", 0)
+        secs, ms = divmod(int(ts_ms), 1000)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(secs)) + f".{ms:03d}Z"
+        tag_str = ""
+        if isinstance(newest.get("tags"), list) and newest["tags"]:
+            tag_str = f", tags=[{','.join(newest['tags'])}]"
+        latest = f"{ts}{tag_str}"
+    lock_held = False
+    lock_path = Path(cwd) / MEMO_LOCK_FILE
+    try:
+        age_ms = (time.time() - lock_path.stat().st_mtime) * 1000
+        lock_held = age_ms <= STALE_MEMO_LOCK_MS
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return {"count": len(memos), "latest": latest, "lock_held": lock_held}
+
+
+def _collect_project_docs(cwd: str) -> list[str]:
+    docs = []
+    for name in ("CLAUDE.md", "README.md"):
+        p = Path(cwd) / name
+        try:
+            if p.is_file():
+                docs.append(name)
+        except Exception:
+            pass
+    return docs
+
+
+def _list_external_servers(cwd: str) -> list[dict]:
+    """Enumerate external MCP servers from {cwd}/{mcp_config_path or .mcp.json}.
+    Include cached tool names from already-loaded servers (per-cwd)."""
+    cfg_path = Path(cwd) / (mcp_config_path or ".mcp.json")
+    if not cfg_path.exists():
+        return []
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return []
+    servers = cfg.get("mcpServers") or {}
+    if not isinstance(servers, dict):
+        return []
+    out = []
+    with mcp_lock:
+        loaded_snapshot = {k: dict(v) for k, v in mcp_servers.items()}
+    for name in sorted(servers.keys()):
+        key = f"{cwd}:{name}"
+        tools = loaded_snapshot.get(key, {}).get("tools", []) or []
+        out.append({"ns": name, "tools": sorted(tools), "loaded": key in loaded_snapshot})
+    return out
+
+
+def render_guide(cwd: str) -> str:
+    lines = [f'<guide tool="code-mcp">', ""]
+
+    memo_state = _collect_memo_state(cwd) if memory_enabled else None
+    docs = _collect_project_docs(cwd)
+
+    lines.append(f'<state cwd="{_xml_attr(cwd)}">')
+    if memo_state is not None:
+        latest_s = f" (latest {memo_state['latest']})" if memo_state['latest'] else ""
+        lines.append(f"memos: {memo_state['count']}{latest_s}")
+        lines.append(f"concurrent_writer: {'yes' if memo_state['lock_held'] else 'no'}")
+    if docs:
+        lines.append(f"project_docs: {', '.join(docs)}  (read for project rules)")
+    lines.append("</state>")
+
+    if memory_enabled or docs:
+        lines.append("")
+        lines.append("<session_start>")
+        step = 1
+        if memory_enabled:
+            lines.append(f"{step}. call recall(cwd) first to load prior memos"); step += 1
+        if docs:
+            lines.append(f"{step}. read {' and '.join(docs)} for project rules"); step += 1
+        if memory_enabled:
+            lines.append(f'{step}. "(no matches)" from recall = fresh session')
+        lines.append("</session_start>")
+
+    if memory_enabled:
+        lines.extend([
+            "",
+            "<when_to_remember>",
+            '- user signals handoff (e.g. "handoff", "wrap up"): tags=["handoff"],',
+            "  include file paths, last action, next step",
+            '- design or architectural decisions: tags=["decision"]',
+            '- non-obvious behaviors, surprising bugs: tags=["gotcha"]',
+            '- followups: tags=["todo"]',
+            "</when_to_remember>",
+            "",
+            "<memory_rules>",
+            "- memos are private to this cwd; never access the storage file directly,",
+            "  always go through recall / remember / forget",
+            "- tags are case-insensitive; multiple tags = AND filter",
+            "- non-string tags are dropped on write",
+            "- multiple agents on the same cwd are serialized automatically",
+            "- recall: limit default 20 (max 1000), offset default 0",
+            '- paging past end returns "(no matches at offset=N; total=M)"',
+            "</memory_rules>",
+        ])
+
+    lines.append("")
+    lines.append("<tools>")
+    builtin = sorted(t["name"] for t in build_tools_list())
+    lines.append("built-in: " + ", ".join(builtin))
+    externals = _list_external_servers(cwd)
+    if externals:
+        lines.append('external (via mcp tool, prefix "<server>__<tool>"):')
+        ns_width = max(len(e["ns"]) for e in externals)
+        for e in externals:
+            if e["tools"]:
+                preview = ", ".join(e["tools"][:6])
+                hint = preview + (f", ... ({len(e['tools'])} total)" if len(e["tools"]) > 6 else "")
+                lines.append(f"- {e['ns'].ljust(ns_width)}  tools: {hint}")
+            else:
+                lines.append(f"- {e['ns'].ljust(ns_width)}  (tools not yet probed; call mcp(action=\"list\") to discover)")
+        lines.append('call mcp(action="list") for full schemas of external tools.')
+    lines.append("</tools>")
+
+    lines.append("")
+    lines.append("<cheat_sheet>")
+    if memory_enabled:
+        lines.extend([
+            "recall(cwd)",
+            'recall(cwd, query="webhook")',
+            'recall(cwd, tags=["decision"], limit=5)',
+            'remember(cwd, "fixed bug at file.py:42", tags=["bug","fix"])',
+            "forget(cwd, 7)",
+        ])
+    lines.append("guide(cwd)")
+    if externals:
+        lines.append('mcp(action="list")')
+    lines.append("</cheat_sheet>")
+    lines.append("")
+    lines.append("</guide>")
+    return "\n".join(lines)
 
 
 def handle_remember(cwd: str, memo: str, tags: list | None = None) -> str:

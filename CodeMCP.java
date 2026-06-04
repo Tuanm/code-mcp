@@ -800,7 +800,197 @@ public final class CodeMCP {
             .format(java.time.format.DateTimeFormatter
                 .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"));
     }
-    
+
+    // ===== GUIDE =====
+    // Renders an XML-block operating manual for the agent. Reflects live state
+    // of this server (enabled tools, memos in cwd, project docs, external MCP
+    // servers). Called by the `guide` tool.
+
+    private static String xmlAttr(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    private record MemoState(int count, String latest, boolean lockHeld) {}
+
+    private static MemoState collectMemoState(String cwd) throws IOException {
+        List<Memo> memos = readMemos(cwd);
+        String latest = null;
+        if (!memos.isEmpty()) {
+            Memo newest = memos.stream().max((a, b) -> Integer.compare(a.id, b.id)).orElse(null);
+            if (newest != null) {
+                String ts = formatMemoTs(newest.ts);
+                String tagStr = (newest.tags != null && !newest.tags.isEmpty())
+                    ? ", tags=[" + String.join(",", newest.tags) + "]" : "";
+                latest = ts + tagStr;
+            }
+        }
+        boolean lockHeld = false;
+        Path lockPath = Path.of(cwd, ".memo.lock");
+        try {
+            long age = System.currentTimeMillis() - Files.getLastModifiedTime(lockPath).toMillis();
+            lockHeld = age <= STALE_MEMO_LOCK_MS;
+        } catch (NoSuchFileException nsfe) {
+            // not held
+        } catch (IOException ignored) {}
+        return new MemoState(memos.size(), latest, lockHeld);
+    }
+
+    private static List<String> collectProjectDocs(String cwd) {
+        List<String> docs = new ArrayList<>();
+        for (String name : List.of("CLAUDE.md", "README.md")) {
+            Path p = Path.of(cwd, name);
+            if (Files.isRegularFile(p)) docs.add(name);
+        }
+        return docs;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> listExternalServers(String cwd) {
+        Path cfgPath = Path.of(cwd, mcpConfigPath != null ? mcpConfigPath : ".mcp.json");
+        if (!Files.isRegularFile(cfgPath)) return List.of();
+        Map<String, Object> cfg;
+        try {
+            cfg = parseJsonObject(Files.readString(cfgPath));
+        } catch (Exception e) {
+            return List.of();
+        }
+        Object serversRaw = cfg.get("mcpServers");
+        if (!(serversRaw instanceof Map)) return List.of();
+        Map<String, Object> servers = (Map<String, Object>) serversRaw;
+        List<Map<String, Object>> out = new ArrayList<>();
+        List<String> names = new ArrayList<>(servers.keySet());
+        names.sort(String::compareTo);
+        for (String ns : names) {
+            String key = cwd + ":" + ns;
+            List<String> tools = new ArrayList<>();
+            boolean loaded;
+            synchronized (mcpProcesses) {
+                List<String> cached = mcpServerTools.get(key);
+                loaded = cached != null;
+                if (cached != null) tools.addAll(cached);
+            }
+            tools.sort(String::compareTo);
+            out.add(Map.of("ns", ns, "tools", tools, "loaded", loaded));
+        }
+        return out;
+    }
+
+    private static List<String> builtinToolNames() {
+        List<String> names = new ArrayList<>(List.of(
+            "read", "write", "edit", "multi_edit",
+            "grep", "find", "ls", "job", "mcp", "guide"
+        ));
+        switch (detectedShell) {
+            case BASH -> names.add("bash");
+            case SH -> names.add("shell");
+            case CMD -> names.add("command");
+            case POWERSHELL -> names.add("powershell");
+        }
+        if (hasCloudflared) names.add("preview");
+        if (memoryEnabled) {
+            names.add("remember");
+            names.add("forget");
+            names.add("recall");
+        }
+        if (publicBaseUrl != null && token != null) names.add("get_upload_link");
+        names.removeAll(disallowedTools);
+        names.sort(String::compareTo);
+        return names;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String renderGuide(String cwd) throws IOException {
+        List<String> lines = new ArrayList<>();
+        lines.add("<guide tool=\"code-mcp\">");
+        lines.add("");
+
+        MemoState memoState = memoryEnabled ? collectMemoState(cwd) : null;
+        List<String> docs = collectProjectDocs(cwd);
+
+        lines.add("<state cwd=\"" + xmlAttr(cwd) + "\">");
+        if (memoState != null) {
+            String latestSuffix = memoState.latest != null ? " (latest " + memoState.latest + ")" : "";
+            lines.add("memos: " + memoState.count + latestSuffix);
+            lines.add("concurrent_writer: " + (memoState.lockHeld ? "yes" : "no"));
+        }
+        if (!docs.isEmpty()) {
+            lines.add("project_docs: " + String.join(", ", docs) + "  (read for project rules)");
+        }
+        lines.add("</state>");
+
+        if (memoryEnabled || !docs.isEmpty()) {
+            lines.add("");
+            lines.add("<session_start>");
+            int step = 1;
+            if (memoryEnabled) lines.add(step++ + ". call recall(cwd) first to load prior memos");
+            if (!docs.isEmpty()) lines.add(step++ + ". read " + String.join(" and ", docs) + " for project rules");
+            if (memoryEnabled) lines.add(step++ + ". \"(no matches)\" from recall = fresh session");
+            lines.add("</session_start>");
+        }
+
+        if (memoryEnabled) {
+            lines.add("");
+            lines.add("<when_to_remember>");
+            lines.add("- user signals handoff (e.g. \"handoff\", \"wrap up\"): tags=[\"handoff\"],");
+            lines.add("  include file paths, last action, next step");
+            lines.add("- design or architectural decisions: tags=[\"decision\"]");
+            lines.add("- non-obvious behaviors, surprising bugs: tags=[\"gotcha\"]");
+            lines.add("- followups: tags=[\"todo\"]");
+            lines.add("</when_to_remember>");
+
+            lines.add("");
+            lines.add("<memory_rules>");
+            lines.add("- memos are private to this cwd; never access the storage file directly,");
+            lines.add("  always go through recall / remember / forget");
+            lines.add("- tags are case-insensitive; multiple tags = AND filter");
+            lines.add("- non-string tags are dropped on write");
+            lines.add("- multiple agents on the same cwd are serialized automatically");
+            lines.add("- recall: limit default 20 (max 1000), offset default 0");
+            lines.add("- paging past end returns \"(no matches at offset=N; total=M)\"");
+            lines.add("</memory_rules>");
+        }
+
+        lines.add("");
+        lines.add("<tools>");
+        lines.add("built-in: " + String.join(", ", builtinToolNames()));
+        List<Map<String, Object>> externals = listExternalServers(cwd);
+        if (!externals.isEmpty()) {
+            lines.add("external (via mcp tool, prefix \"<server>__<tool>\"):");
+            int nsWidth = externals.stream().mapToInt(e -> ((String) e.get("ns")).length()).max().orElse(0);
+            for (Map<String, Object> e : externals) {
+                String ns = (String) e.get("ns");
+                List<String> tools = (List<String>) e.get("tools");
+                String padded = ns + " ".repeat(Math.max(0, nsWidth - ns.length()));
+                if (tools != null && !tools.isEmpty()) {
+                    String preview = String.join(", ", tools.subList(0, Math.min(6, tools.size())));
+                    String hint = tools.size() > 6 ? preview + ", ... (" + tools.size() + " total)" : preview;
+                    lines.add("- " + padded + "  tools: " + hint);
+                } else {
+                    lines.add("- " + padded + "  (tools not yet probed; call mcp(action=\"list\") to discover)");
+                }
+            }
+            lines.add("call mcp(action=\"list\") for full schemas of external tools.");
+        }
+        lines.add("</tools>");
+
+        lines.add("");
+        lines.add("<cheat_sheet>");
+        if (memoryEnabled) {
+            lines.add("recall(cwd)");
+            lines.add("recall(cwd, query=\"webhook\")");
+            lines.add("recall(cwd, tags=[\"decision\"], limit=5)");
+            lines.add("remember(cwd, \"fixed bug at file.py:42\", tags=[\"bug\",\"fix\"])");
+            lines.add("forget(cwd, 7)");
+        }
+        lines.add("guide(cwd)");
+        if (!externals.isEmpty()) lines.add("mcp(action=\"list\")");
+        lines.add("</cheat_sheet>");
+        lines.add("");
+        lines.add("</guide>");
+        return String.join("\n", lines);
+    }
+
     // ----- JSON parser (FSM-based, RFC 8259 subset) -----
     private static final class JsonParser {
         private static final int MAX_DEPTH = 256;
@@ -2000,6 +2190,10 @@ public final class CodeMCP {
                             List.of()));
                     }
 
+                    tools.add(makeTool("guide",
+                        "Operating manual for this code-mcp server: live state, session-start ritual, when to remember, tool catalog. Call at session start.",
+                        List.of(Map.of("name", "cwd", "type", "string", "required", true))));
+
                     // Strip any tool that was disabled via --disallowed-tools.
                     if (!disallowedTools.isEmpty()) {
                         tools.removeIf(t -> disallowedTools.contains((String) t.get("name")));
@@ -2114,6 +2308,7 @@ public final class CodeMCP {
                                 args.get("args") != null ? (Map<String, Object>) args.get("args") : Map.of(),
                                 (String) args.get("mcpConfigPath"));
                             case "get_upload_link" -> handleGetUploadLink();
+                            case "guide" -> renderGuide((String) args.get("cwd"));
                             default -> "ERROR: unknown tool: " + name;
                         };
                     } catch (RuntimeException e) {

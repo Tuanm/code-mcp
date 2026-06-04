@@ -593,6 +593,167 @@ async function lastMemoId(cwd: string): Promise<number> {
   return memos.reduce((m, x) => Math.max(m, x.id), 0);
 }
 
+// ---------- guide ----------
+// Renders an XML-block operating manual for the agent. Reflects live state
+// of this server (enabled tools, memos in cwd, project docs, external MCP
+// servers). Called by the `guide` tool.
+
+function xmlAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+async function collectMemoState(cwd: string): Promise<{ count: number; latest: string | null; lockHeld: boolean }> {
+  const memos = await readMemos(cwd);
+  let latest: string | null = null;
+  if (memos.length) {
+    const newest = memos.reduce((a, b) => (a.id > b.id ? a : b));
+    const ts = new Date(newest.ts).toISOString();
+    const tagStr = newest.tags?.length ? `, tags=[${newest.tags.join(",")}]` : "";
+    latest = `${ts}${tagStr}`;
+  }
+  let lockHeld = false;
+  try {
+    const st = await fsStat(resolve(cwd, ".memo.lock"));
+    lockHeld = Date.now() - st.mtimeMs <= STALE_MEMO_LOCK_MS;
+  } catch { /* no lock = not held */ }
+  return { count: memos.length, latest, lockHeld };
+}
+
+async function collectProjectDocs(cwd: string): Promise<string[]> {
+  const docs: string[] = [];
+  for (const name of ["CLAUDE.md", "README.md"]) {
+    try {
+      const st = await fsStat(resolve(cwd, name));
+      if (st.isFile()) docs.push(name);
+    } catch { /* not present */ }
+  }
+  return docs;
+}
+
+async function listExternalServers(cwd: string): Promise<Array<{ ns: string; tools: string[]; loaded: boolean }>> {
+  // Source of truth: the .mcp.json under cwd (parity with Python/Java).
+  // Enrich loaded entries with tool names probed at boot (TS aggregator) or
+  // lazily (Python/Java cwd-keyed cache).
+  const cfgPath = resolve(cwd, mcpConfigPath ?? ".mcp.json");
+  let raw: string;
+  try {
+    raw = await file(cfgPath).text();
+  } catch { return []; }
+  let parsed: any;
+  try { parsed = JSON.parse(raw); } catch { return []; }
+  const servers = parsed?.mcpServers;
+  if (!servers || typeof servers !== "object") return [];
+
+  const probedByNs = new Map<string, string[]>();
+  for (const [, tool] of aggregatedTools) {
+    const list = probedByNs.get(tool.namespace) ?? [];
+    list.push(tool.originalName);
+    probedByNs.set(tool.namespace, list);
+  }
+
+  const names = Object.keys(servers).sort();
+  return names.map((ns) => {
+    const tools = (probedByNs.get(ns) ?? []).slice().sort();
+    const loaded = aggregatorServers.has(ns) || probedByNs.has(ns);
+    return { ns, tools, loaded };
+  });
+}
+
+async function renderGuide(cwd: string): Promise<string> {
+  const lines: string[] = [];
+  lines.push(`<guide tool="code-mcp">`);
+  lines.push("");
+
+  const memoState = memoryEnabled ? await collectMemoState(cwd) : null;
+  const docs = await collectProjectDocs(cwd);
+
+  // state block
+  lines.push(`<state cwd="${xmlAttr(cwd)}">`);
+  if (memoState) {
+    const latest = memoState.latest ? ` (latest ${memoState.latest})` : "";
+    lines.push(`memos: ${memoState.count}${latest}`);
+    lines.push(`concurrent_writer: ${memoState.lockHeld ? "yes" : "no"}`);
+  }
+  if (docs.length) {
+    lines.push(`project_docs: ${docs.join(", ")}  (read for project rules)`);
+  }
+  lines.push(`</state>`);
+
+  // session_start
+  if (memoryEnabled || docs.length) {
+    lines.push("");
+    lines.push(`<session_start>`);
+    let step = 1;
+    if (memoryEnabled) lines.push(`${step++}. call recall(cwd) first to load prior memos`);
+    if (docs.length) lines.push(`${step++}. read ${docs.join(" and ")} for project rules`);
+    if (memoryEnabled) lines.push(`${step++}. "(no matches)" from recall = fresh session`);
+    lines.push(`</session_start>`);
+  }
+
+  if (memoryEnabled) {
+    lines.push("");
+    lines.push(`<when_to_remember>`);
+    lines.push(`- user signals handoff (e.g. "handoff", "wrap up"): tags=["handoff"],`);
+    lines.push(`  include file paths, last action, next step`);
+    lines.push(`- design or architectural decisions: tags=["decision"]`);
+    lines.push(`- non-obvious behaviors, surprising bugs: tags=["gotcha"]`);
+    lines.push(`- followups: tags=["todo"]`);
+    lines.push(`</when_to_remember>`);
+
+    lines.push("");
+    lines.push(`<memory_rules>`);
+    lines.push(`- memos are private to this cwd; never access the storage file directly,`);
+    lines.push(`  always go through recall / remember / forget`);
+    lines.push(`- tags are case-insensitive; multiple tags = AND filter`);
+    lines.push(`- non-string tags are dropped on write`);
+    lines.push(`- multiple agents on the same cwd are serialized automatically`);
+    lines.push(`- recall: limit default 20 (max 1000), offset default 0`);
+    lines.push(`- paging past end returns "(no matches at offset=N; total=M)"`);
+    lines.push(`</memory_rules>`);
+  }
+
+  // tools block
+  lines.push("");
+  lines.push(`<tools>`);
+  const builtin = Object.keys(tools).sort().join(", ");
+  lines.push(`built-in: ${builtin}`);
+  const externals = await listExternalServers(cwd);
+  if (externals.length) {
+    lines.push(`external (via mcp tool, prefix "<server>__<tool>"):`);
+    const nsWidth = Math.max(...externals.map((e) => e.ns.length));
+    for (const e of externals) {
+      const padded = e.ns.padEnd(nsWidth);
+      if (e.tools.length) {
+        const preview = e.tools.slice(0, 6).join(", ");
+        const hint = e.tools.length > 6 ? `${preview}, ... (${e.tools.length} total)` : preview;
+        lines.push(`- ${padded}  tools: ${hint}`);
+      } else {
+        lines.push(`- ${padded}  (tools not yet probed; call mcp(action="list") to discover)`);
+      }
+    }
+    lines.push(`call mcp(action="list") for full schemas of external tools.`);
+  }
+  lines.push(`</tools>`);
+
+  // cheat_sheet
+  lines.push("");
+  lines.push(`<cheat_sheet>`);
+  if (memoryEnabled) {
+    lines.push(`recall(cwd)`);
+    lines.push(`recall(cwd, query="webhook")`);
+    lines.push(`recall(cwd, tags=["decision"], limit=5)`);
+    lines.push(`remember(cwd, "fixed bug at file.py:42", tags=["bug","fix"])`);
+    lines.push(`forget(cwd, 7)`);
+  }
+  lines.push(`guide(cwd)`);
+  if (externals.length) lines.push(`mcp(action="list")`);
+  lines.push(`</cheat_sheet>`);
+
+  lines.push("");
+  lines.push(`</guide>`);
+  return lines.join("\n");
+}
+
 // ---------- upload page ----------
 // Full HTML page served at GET /upload/<session_id>. The page embeds a drop
 // zone that POSTs back to the same URL. Auth lives in the URL path.
@@ -2413,6 +2574,18 @@ const tools: Record<string, Tool> = {
       const footer = `-- ${off + 1}-${end} of ${total}${hasMore ? ` (next: offset=${end})` : ""}`;
       return lines.join("\n") + "\n" + footer;
     },
+  },
+
+  guide: {
+    description: "Operating manual for this code-mcp server: live state, session-start ritual, when to remember, tool catalog. Call at session start.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string" },
+      },
+      required: ["cwd"],
+    },
+    handler: async ({ cwd }) => renderGuide(cwd),
   },
 
   get_upload_link: {
