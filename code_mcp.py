@@ -1844,6 +1844,34 @@ def _collect_project_docs(cwd: str) -> list[str]:
     return docs
 
 
+def _collect_loadable_servers(cwd: str) -> list[dict]:
+    """Lightweight scan of <cwd>/.mcp.json: ns + transport only. Lenient on
+    URL scheme since the guide is informational; mcp tool does strict validation
+    at load time."""
+    try:
+        with open(Path(cwd) / ".mcp.json", "r", encoding="utf-8") as f:
+            parsed = json.load(f)
+    except Exception:
+        return []
+    servers = parsed.get("mcpServers") if isinstance(parsed, dict) else None
+    if not isinstance(servers, dict):
+        return []
+    out = []
+    for ns, cfg in servers.items():
+        if not isinstance(ns, str) or not NAMESPACE_RE.match(ns):
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        transport = "http" if cfg.get("type") == "http" else "stdio"
+        if transport == "http" and not isinstance(cfg.get("url"), str):
+            continue
+        if transport == "stdio" and not isinstance(cfg.get("command"), str):
+            continue
+        out.append({"ns": ns, "transport": transport})
+    out.sort(key=lambda x: x["ns"])
+    return out
+
+
 def _list_external_servers(cwd: str) -> list[dict]:
     """Enumerate external MCP servers from aggregator state (server-wide, --mcp flag).
     Tool names included for probed servers."""
@@ -1915,17 +1943,30 @@ def render_guide(cwd: str) -> str:
     builtin = sorted(t["name"] for t in build_tools_list() if t["name"] not in aggregated_names)
     lines.append("built-in: " + ", ".join(builtin))
     externals = _list_external_servers(cwd)
+    loadable = _collect_loadable_servers(cwd)
+    loadable_set = {l["ns"] for l in loadable}
+    externals_set = {e["ns"] for e in externals}
     if externals:
         lines.append('external (via mcp tool, prefix "<server>__<tool>"):')
         ns_width = max(len(e["ns"]) for e in externals)
         for e in externals:
+            also = "  [also in .mcp.json]" if e["ns"] in loadable_set else ""
             if e["tools"]:
                 preview = ", ".join(e["tools"][:6])
                 hint = preview + (f", ... ({len(e['tools'])} total)" if len(e["tools"]) > 6 else "")
-                lines.append(f"- {e['ns'].ljust(ns_width)}  tools: {hint}")
+                lines.append(f"- {e['ns'].ljust(ns_width)}  tools: {hint}{also}")
             else:
-                lines.append(f"- {e['ns'].ljust(ns_width)}  (tools not yet probed; call mcp(action=\"list\") to discover)")
+                lines.append(f"- {e['ns'].ljust(ns_width)}  (tools not yet probed; call mcp(action=\"list\") to discover){also}")
         lines.append('call mcp(action="list") for full schemas of external tools.')
+    loadable_only = [l for l in loadable if l["ns"] not in externals_set]
+    if loadable_only:
+        if externals:
+            lines.append("")
+        lines.append("loadable (via mcp tool from .mcp.json in cwd):")
+        l_width = max(len(l["ns"]) for l in loadable_only)
+        for l in loadable_only:
+            lines.append(f"- {l['ns'].ljust(l_width)}  {l['transport']}")
+        lines.append('call mcp(action="list", server="<name>") to load tools on demand.')
     lines.append("</tools>")
 
     lines.append("")
@@ -1941,6 +1982,8 @@ def render_guide(cwd: str) -> str:
     lines.append("guide(cwd)")
     if externals:
         lines.append('mcp(action="list")')
+    if loadable_only:
+        lines.append(f'mcp(action="list", server="{loadable_only[0]["ns"]}")')
     lines.append("</cheat_sheet>")
     lines.append("")
     lines.append("</guide>")

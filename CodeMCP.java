@@ -862,6 +862,36 @@ public final class CodeMCP {
         return docs;
     }
 
+    // Lightweight scan of <cwd>/.mcp.json: ns + transport only. Lenient on URL scheme
+    // since the guide is informational; mcp tool does strict validation at load time.
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, String>> collectLoadableServers(String cwd) {
+        Path path = Path.of(cwd, ".mcp.json");
+        if (!Files.isRegularFile(path)) return List.of();
+        Map<String, Object> parsed;
+        try {
+            parsed = parseJsonObject(Files.readString(path));
+        } catch (Exception e) {
+            return List.of();
+        }
+        Object serversRaw = parsed.get("mcpServers");
+        if (!(serversRaw instanceof Map<?, ?>)) return List.of();
+        Map<String, Object> servers = (Map<String, Object>) serversRaw;
+        List<Map<String, String>> out = new ArrayList<>();
+        for (var entry : servers.entrySet()) {
+            String ns = entry.getKey();
+            if (ns == null || !AGGREGATOR_NS_RE.matcher(ns).matches()) continue;
+            if (!(entry.getValue() instanceof Map<?, ?>)) continue;
+            Map<String, Object> cfg = (Map<String, Object>) entry.getValue();
+            String transport = "http".equals(cfg.get("type")) ? "http" : "stdio";
+            if ("http".equals(transport) && !(cfg.get("url") instanceof String)) continue;
+            if ("stdio".equals(transport) && !(cfg.get("command") instanceof String)) continue;
+            out.add(Map.of("ns", ns, "transport", transport));
+        }
+        out.sort((a, b) -> a.get("ns").compareTo(b.get("ns")));
+        return out;
+    }
+
     private static List<Map<String, Object>> listExternalServers() {
         // Source: aggregatorKnown (server-wide, from --mcp config). Tool names come
         // from aggregatorTools (only populated for successfully probed servers).
@@ -1162,6 +1192,11 @@ public final class CodeMCP {
         lines.add("<tools>");
         lines.add("built-in: " + String.join(", ", builtinToolNames()));
         List<Map<String, Object>> externals = listExternalServers();
+        List<Map<String, String>> loadable = collectLoadableServers(cwd);
+        Set<String> loadableSet = new HashSet<>();
+        for (Map<String, String> l : loadable) loadableSet.add(l.get("ns"));
+        Set<String> externalsSet = new HashSet<>();
+        for (Map<String, Object> e : externals) externalsSet.add((String) e.get("ns"));
         if (!externals.isEmpty()) {
             lines.add("external (via mcp tool, prefix \"<server>__<tool>\"):");
             int nsWidth = externals.stream().mapToInt(e -> ((String) e.get("ns")).length()).max().orElse(0);
@@ -1169,15 +1204,29 @@ public final class CodeMCP {
                 String ns = (String) e.get("ns");
                 List<String> tools = (List<String>) e.get("tools");
                 String padded = ns + " ".repeat(Math.max(0, nsWidth - ns.length()));
+                String also = loadableSet.contains(ns) ? "  [also in .mcp.json]" : "";
                 if (tools != null && !tools.isEmpty()) {
                     String preview = String.join(", ", tools.subList(0, Math.min(6, tools.size())));
                     String hint = tools.size() > 6 ? preview + ", ... (" + tools.size() + " total)" : preview;
-                    lines.add("- " + padded + "  tools: " + hint);
+                    lines.add("- " + padded + "  tools: " + hint + also);
                 } else {
-                    lines.add("- " + padded + "  (tools not yet probed; call mcp(action=\"list\") to discover)");
+                    lines.add("- " + padded + "  (tools not yet probed; call mcp(action=\"list\") to discover)" + also);
                 }
             }
             lines.add("call mcp(action=\"list\") for full schemas of external tools.");
+        }
+        List<Map<String, String>> loadableOnly = new ArrayList<>();
+        for (Map<String, String> l : loadable) if (!externalsSet.contains(l.get("ns"))) loadableOnly.add(l);
+        if (!loadableOnly.isEmpty()) {
+            if (!externals.isEmpty()) lines.add("");
+            lines.add("loadable (via mcp tool from .mcp.json in cwd):");
+            int lWidth = loadableOnly.stream().mapToInt(l -> l.get("ns").length()).max().orElse(0);
+            for (Map<String, String> l : loadableOnly) {
+                String ns = l.get("ns");
+                String padded = ns + " ".repeat(Math.max(0, lWidth - ns.length()));
+                lines.add("- " + padded + "  " + l.get("transport"));
+            }
+            lines.add("call mcp(action=\"list\", server=\"<name>\") to load tools on demand.");
         }
         lines.add("</tools>");
 
@@ -1192,6 +1241,7 @@ public final class CodeMCP {
         }
         lines.add("guide(cwd)");
         if (!externals.isEmpty()) lines.add("mcp(action=\"list\")");
+        if (!loadableOnly.isEmpty()) lines.add("mcp(action=\"list\", server=\"" + loadableOnly.get(0).get("ns") + "\")");
         lines.add("</cheat_sheet>");
         lines.add("");
         lines.add("</guide>");

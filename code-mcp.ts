@@ -630,6 +630,28 @@ async function collectProjectDocs(cwd: string): Promise<string[]> {
   return docs;
 }
 
+// Lightweight scan of <cwd>/.mcp.json for the guide block: name + transport only.
+// Lenient (e.g. accepts http://localhost URLs) because the guide is informational;
+// the strict validation happens when the mcp tool actually loads the server.
+async function collectLoadableServers(cwd: string): Promise<Array<{ ns: string; transport: "stdio" | "http" }>> {
+  try {
+    const raw = await file(resolve(cwd, ".mcp.json")).text();
+    const parsed = JSON.parse(raw);
+    const servers = parsed?.mcpServers;
+    if (!servers || typeof servers !== "object") return [];
+    const out: Array<{ ns: string; transport: "stdio" | "http" }> = [];
+    for (const [ns, cfg] of Object.entries(servers as Record<string, any>)) {
+      if (!NAMESPACE_RE.test(ns)) continue;
+      if (!cfg || typeof cfg !== "object") continue;
+      const transport: "stdio" | "http" = cfg.type === "http" ? "http" : "stdio";
+      if (transport === "http" && typeof cfg.url !== "string") continue;
+      if (transport === "stdio" && typeof cfg.command !== "string") continue;
+      out.push({ ns, transport });
+    }
+    return out.sort((a, b) => a.ns.localeCompare(b.ns));
+  } catch { return []; }
+}
+
 function listExternalServers(): Array<{ ns: string; tools: string[] }> {
   // Source of truth: aggregatorKnownServers (declared in --mcp config).
   // Tool names come from aggregatedTools (only populated for probed servers).
@@ -704,20 +726,34 @@ async function renderGuide(cwd: string): Promise<string> {
   const builtin = Object.keys(tools).sort().join(", ");
   lines.push(`built-in: ${builtin}`);
   const externals = listExternalServers();
+  const loadable = await collectLoadableServers(cwd);
+  const loadableSet = new Set(loadable.map((l) => l.ns));
+  const externalsSet = new Set(externals.map((e) => e.ns));
   if (externals.length) {
     lines.push(`external (via mcp tool, prefix "<server>__<tool>"):`);
     const nsWidth = Math.max(...externals.map((e) => e.ns.length));
     for (const e of externals) {
       const padded = e.ns.padEnd(nsWidth);
+      const alsoNote = loadableSet.has(e.ns) ? "  [also in .mcp.json]" : "";
       if (e.tools.length) {
         const preview = e.tools.slice(0, 6).join(", ");
         const hint = e.tools.length > 6 ? `${preview}, ... (${e.tools.length} total)` : preview;
-        lines.push(`- ${padded}  tools: ${hint}`);
+        lines.push(`- ${padded}  tools: ${hint}${alsoNote}`);
       } else {
-        lines.push(`- ${padded}  (tools not yet probed; call mcp(action="list") to discover)`);
+        lines.push(`- ${padded}  (tools not yet probed; call mcp(action="list") to discover)${alsoNote}`);
       }
     }
     lines.push(`call mcp(action="list") for full schemas of external tools.`);
+  }
+  const loadableOnly = loadable.filter((l) => !externalsSet.has(l.ns));
+  if (loadableOnly.length) {
+    if (externals.length) lines.push("");
+    lines.push(`loadable (via mcp tool from .mcp.json in cwd):`);
+    const lWidth = Math.max(...loadableOnly.map((l) => l.ns.length));
+    for (const l of loadableOnly) {
+      lines.push(`- ${l.ns.padEnd(lWidth)}  ${l.transport}`);
+    }
+    lines.push(`call mcp(action="list", server="<name>") to load tools on demand.`);
   }
   lines.push(`</tools>`);
 
@@ -733,6 +769,7 @@ async function renderGuide(cwd: string): Promise<string> {
   }
   lines.push(`guide(cwd)`);
   if (externals.length) lines.push(`mcp(action="list")`);
+  if (loadableOnly.length) lines.push(`mcp(action="list", server="${loadableOnly[0].ns}")`);
   lines.push(`</cheat_sheet>`);
 
   lines.push("");
