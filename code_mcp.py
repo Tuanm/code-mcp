@@ -1008,7 +1008,7 @@ def build_tools_list() -> list[dict]:
              "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "memo": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["cwd", "memo"]}},
             {"name": "forget", "description": "Remove a memo by id.",
              "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "memo_id": {"type": "number"}}, "required": ["cwd", "memo_id"]}},
-            {"name": "recall", "description": "Search memos by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
+            {"name": "recall", "description": "Search memos by substring (query) and/or tags (AND). Both are case-insensitive. Sorted newest first. Paginated.",
              "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "query": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "number"}, "offset": {"type": "number"}}, "required": ["cwd"]}},
         ])
     if has_cloudflared:
@@ -1648,9 +1648,24 @@ def read_memos(cwd: str) -> list[dict]:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-        return [json.loads(line) for line in content.split("\n") if line.strip()]
     except Exception:
         return []
+    memos = []
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            m = json.loads(line)
+            if (isinstance(m, dict)
+                    and isinstance(m.get("id"), int)
+                    and isinstance(m.get("ts"), int)
+                    and isinstance(m.get("memo"), str)):
+                memos.append(m)
+        except Exception:
+            # skip malformed line
+            continue
+    return memos
 
 
 def write_memos(cwd: str, memos: list[dict]):
@@ -1725,28 +1740,46 @@ def handle_forget(cwd: str, memo_id: int) -> str:
 
 
 def handle_recall(cwd: str, query: str | None = None, tags: list | None = None,
-                  limit: int = 20, offset: int = 0) -> str:
+                  limit: int | None = None, offset: int | None = None) -> str:
+    try:
+        lim = int(limit) if limit is not None else 20
+    except (TypeError, ValueError):
+        lim = 20
+    try:
+        off = int(offset) if offset is not None else 0
+    except (TypeError, ValueError):
+        off = 0
+    if lim < 1:
+        lim = 20
+    lim = min(lim, 1000)
+    if off < 0:
+        off = 0
     memos = read_memos(cwd)
     q = query.lower() if query else None
+    tag_set = [t.lower() for t in tags] if tags else None
     filtered = []
     for m in memos:
         if q and q not in m.get("memo", "").lower():
             continue
-        if tags and not all(t in m.get("tags", []) for t in tags):
-            continue
+        if tag_set:
+            memo_tags = [str(t).lower() for t in m.get("tags", [])]
+            if not all(t in memo_tags for t in tag_set):
+                continue
         filtered.append(m)
     filtered.sort(key=lambda m: m.get("id", 0), reverse=True)
     total = len(filtered)
     if not total:
         return "(no matches)"
-    page = filtered[offset:offset + limit]
+    if off >= total:
+        return f"(no matches at offset={off}; total={total})"
+    page = filtered[off:off + lim]
     lines = []
     for m in page:
         ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(m.get("ts", 0) / 1000))
         tag_str = f" [{','.join(m['tags'])}]" if m.get("tags") else ""
         lines.append(f"#{m['id']} {ts}{tag_str} {m['memo']}")
-    end = offset + len(page)
-    footer = f"-- {offset + 1}-{end} of {total}"
+    end = off + len(page)
+    footer = f"-- {off + 1}-{end} of {total}"
     if end < total:
         footer += f" (next: offset={end})"
     return "\n".join(lines) + "\n" + footer

@@ -1584,28 +1584,41 @@ public final class CodeMCP {
     }
     
     private static String handleRecall(String cwd, String query, List<String> tags, int limit, int offset) throws IOException {
+        int lim = limit < 1 ? 20 : Math.min(limit, 1000);
+        int off = offset < 0 ? 0 : offset;
         List<Memo> memos = readMemos(cwd);
-        
-        memos = memos.stream().filter(m -> {
-            if (query != null && !m.memo.toLowerCase().contains(query.toLowerCase())) return false;
-            if (tags != null && !tags.isEmpty()) {
+        final String q = query != null ? query.toLowerCase() : null;
+        final List<String> tagSet;
+        if (tags != null && !tags.isEmpty()) {
+            tagSet = new ArrayList<>(tags.size());
+            for (String t : tags) tagSet.add(t.toLowerCase());
+        } else {
+            tagSet = null;
+        }
+        List<Memo> filtered = memos.stream().filter(m -> {
+            if (q != null && !m.memo.toLowerCase().contains(q)) return false;
+            if (tagSet != null) {
                 if (m.tags == null) return false;
-                for (String t : tags) {
-                    if (!m.tags.contains(t)) return false;
+                List<String> memoTags = new ArrayList<>(m.tags.size());
+                for (String t : m.tags) memoTags.add(t.toLowerCase());
+                for (String t : tagSet) {
+                    if (!memoTags.contains(t)) return false;
                 }
             }
             return true;
         }).sorted((a, b) -> Integer.compare(b.id, a.id)).collect(Collectors.toList());
-        
-        int fromIndex = Math.min(offset, memos.size());
-        int toIndex = Math.min(offset + limit, memos.size());
-        List<Memo> page = memos.subList(fromIndex, toIndex);
-        
-        if (page.isEmpty()) return "(no matches)";
-        
-        return page.stream()
+        int total = filtered.size();
+        if (total == 0) return "(no matches)";
+        if (off >= total) return "(no matches at offset=" + off + "; total=" + total + ")";
+        int toIndex = Math.min(off + lim, total);
+        List<Memo> page = filtered.subList(off, toIndex);
+        String body = page.stream()
             .map(m -> "#" + m.id + " " + java.time.Instant.ofEpochMilli(m.ts).toString() + (m.tags != null && !m.tags.isEmpty() ? " [" + String.join(",", m.tags) + "]" : "") + " " + m.memo)
             .collect(Collectors.joining("\n"));
+        int end = off + page.size();
+        String footer = "-- " + (off + 1) + "-" + end + " of " + total;
+        if (end < total) footer += " (next: offset=" + end + ")";
+        return body + "\n" + footer;
     }
     
     // --- get_upload_link tool ---
@@ -1898,7 +1911,7 @@ public final class CodeMCP {
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "memo_id", "type", "number", "required", true))));
 
-                        tools.add(makeTool("recall", "Search memos.",
+                        tools.add(makeTool("recall", "Search memos by substring (query) and/or tags (AND). Both are case-insensitive. Sorted newest first. Paginated.",
                             List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                    Map.of("name", "query", "type", "string"),
                                    Map.of("name", "tags", "type", "array"),

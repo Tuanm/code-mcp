@@ -488,10 +488,20 @@ async function readMemos(cwd: string): Promise<Memo[]> {
   const f = file(resolve(cwd, ".memo.jsonl"));
   if (!(await f.exists())) return [];
   const text = await f.text();
-  return text
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((l) => JSON.parse(l) as Memo);
+  const memos: Memo[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const m = JSON.parse(trimmed) as Memo;
+      if (typeof m?.id === "number" && typeof m?.memo === "string" && typeof m?.ts === "number") {
+        memos.push(m);
+      }
+    } catch {
+      // skip malformed line — survives partial writes, manual edits, encoding glitches
+    }
+  }
+  return memos;
 }
 
 async function writeMemos(cwd: string, memos: Memo[]): Promise<void> {
@@ -2287,7 +2297,7 @@ const tools: Record<string, Tool> = {
   },
 
   recall: {
-    description: "Search memos by substring (query) and/or tags (AND). Sorted newest first. Paginated.",
+    description: "Search memos by substring (query) and/or tags (AND). Both are case-insensitive. Sorted newest first. Paginated.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2299,25 +2309,33 @@ const tools: Record<string, Tool> = {
       },
       required: ["cwd"],
     },
-    handler: async ({ cwd, query, tags, limit = 20, offset = 0 }) => {
+    handler: async ({ cwd, query, tags, limit, offset }) => {
+      const lim = Number.isFinite(limit) && limit >= 1 ? Math.min(Math.floor(limit), 1000) : 20;
+      const off = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
       const memos = await readMemos(cwd);
       const q = query?.toLowerCase();
+      const tagSet = tags?.length ? tags.map((t: string) => t.toLowerCase()) : null;
       const filtered = memos.filter((m) => {
         if (q && !m.memo.toLowerCase().includes(q)) return false;
-        if (tags?.length && !tags.every((t: string) => m.tags?.includes(t))) return false;
+        if (tagSet) {
+          const memoTags = (m.tags ?? []).map((t) => t.toLowerCase());
+          if (!tagSet.every((t) => memoTags.includes(t))) return false;
+        }
         return true;
       });
       filtered.sort((a, b) => b.id - a.id);
       const total = filtered.length;
       if (!total) return "(no matches)";
-      const page = filtered.slice(offset, offset + limit);
+      if (off >= total) return `(no matches at offset=${off}; total=${total})`;
+      const page = filtered.slice(off, off + lim);
       const lines = page.map((m) => {
         const ts = new Date(m.ts).toISOString();
         const tagStr = m.tags?.length ? ` [${m.tags.join(",")}]` : "";
         return `#${m.id} ${ts}${tagStr} ${m.memo}`;
       });
-      const end = offset + page.length;
-      const footer = `-- ${offset + 1}-${end} of ${total}${end < total ? ` (next: offset=${end})` : ""}`;
+      const end = off + page.length;
+      const hasMore = end < total;
+      const footer = `-- ${off + 1}-${end} of ${total}${hasMore ? ` (next: offset=${end})` : ""}`;
       return lines.join("\n") + "\n" + footer;
     },
   },
