@@ -1845,34 +1845,17 @@ def _collect_project_docs(cwd: str) -> list[str]:
 
 
 def _list_external_servers(cwd: str) -> list[dict]:
-    """Enumerate external MCP servers from {cwd}/{mcp_config_path or .mcp.json}.
-    Include cached tool names from already-loaded servers (per-cwd)."""
-    cfg_path = Path(cwd) / (mcp_config_path or ".mcp.json")
-    if not cfg_path.exists():
-        return []
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
-        return []
-    servers = cfg.get("mcpServers") or {}
-    if not isinstance(servers, dict):
-        return []
+    """Enumerate external MCP servers from aggregator state (server-wide, --mcp flag).
+    Tool names included for probed servers."""
     out = []
-    with mcp_lock:
-        loaded_snapshot = {k: dict(v) for k, v in mcp_servers.items()}
-    # Aggregator-probed tools: namespace -> [tool names]
-    aggr_by_ns: dict[str, list[str]] = {}
     with aggregator_lock:
+        known = sorted(aggregator_known)
+        aggr_by_ns: dict[str, list[str]] = {}
         for info in aggregator_tools.values():
             aggr_by_ns.setdefault(info["ns"], []).append(info["tool"])
-    for name in sorted(servers.keys()):
-        key = f"{cwd}:{name}"
-        lazy_tools = loaded_snapshot.get(key, {}).get("tools", []) or []
-        probed_tools = aggr_by_ns.get(name, [])
-        tools = sorted(set(lazy_tools) | set(probed_tools))
-        loaded = key in loaded_snapshot or name in aggr_by_ns
-        out.append({"ns": name, "tools": tools, "loaded": loaded})
+    for name in known:
+        tools = sorted(aggr_by_ns.get(name, []))
+        out.append({"ns": name, "tools": tools})
     return out
 
 
@@ -2084,7 +2067,8 @@ mcp_lock = threading.Lock()
 NAMESPACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 aggregator_processes: dict[str, subprocess.Popen] = {}  # key: namespace
 aggregator_tools: dict[str, dict] = {}  # prefixed name -> {"ns","tool","description","inputSchema"}
-aggregator_lock = threading.Lock()  # protects aggregator_processes / aggregator_tools maps
+aggregator_known: set[str] = set()  # all ns declared in --mcp config (probed or not)
+aggregator_lock = threading.Lock()  # protects aggregator_* maps and set
 aggregator_io_locks: dict[str, threading.Lock] = {}  # per-namespace stdio lock
 _aggregator_next_id = 0
 
@@ -2241,6 +2225,8 @@ def load_aggregator(config_path: str) -> None:
             print(f"[mcp] skipping '{ns}': {err}", file=sys.stderr)
             continue
         valid.append((ns, scfg))
+        with aggregator_lock:
+            aggregator_known.add(ns)
     if not valid:
         return
     # Parallel probe so boot time is bounded by the slowest server.
@@ -2441,7 +2427,9 @@ def main():
     port, token, gateway_domain, assigned_device_id = parse_args(sys.argv[1:])
 
     if mcp_config_path:
-        load_aggregator(str(Path.cwd() / mcp_config_path))
+        # Relative paths resolve against process cwd at open time; no need to
+        # explicitly prepend Path.cwd() here.
+        load_aggregator(mcp_config_path)
 
     if gateway_domain:
         t = threading.Thread(target=start_gateway_client, args=(gateway_domain, assigned_device_id), daemon=True)

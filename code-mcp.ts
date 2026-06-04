@@ -630,33 +630,19 @@ async function collectProjectDocs(cwd: string): Promise<string[]> {
   return docs;
 }
 
-async function listExternalServers(cwd: string): Promise<Array<{ ns: string; tools: string[]; loaded: boolean }>> {
-  // Source of truth: the .mcp.json under cwd (parity with Python/Java).
-  // Enrich loaded entries with tool names probed at boot (TS aggregator) or
-  // lazily (Python/Java cwd-keyed cache).
-  const cfgPath = resolve(cwd, mcpConfigPath ?? ".mcp.json");
-  let raw: string;
-  try {
-    raw = await file(cfgPath).text();
-  } catch { return []; }
-  let parsed: any;
-  try { parsed = JSON.parse(raw); } catch { return []; }
-  const servers = parsed?.mcpServers;
-  if (!servers || typeof servers !== "object") return [];
-
+function listExternalServers(): Array<{ ns: string; tools: string[] }> {
+  // Source of truth: aggregatorKnownServers (declared in --mcp config).
+  // Tool names come from aggregatedTools (only populated for probed servers).
   const probedByNs = new Map<string, string[]>();
   for (const [, tool] of aggregatedTools) {
     const list = probedByNs.get(tool.namespace) ?? [];
     list.push(tool.originalName);
     probedByNs.set(tool.namespace, list);
   }
-
-  const names = Object.keys(servers).sort();
-  return names.map((ns) => {
-    const tools = (probedByNs.get(ns) ?? []).slice().sort();
-    const loaded = aggregatorServers.has(ns) || probedByNs.has(ns);
-    return { ns, tools, loaded };
-  });
+  return [...aggregatorKnownServers].sort().map((ns) => ({
+    ns,
+    tools: (probedByNs.get(ns) ?? []).slice().sort(),
+  }));
 }
 
 async function renderGuide(cwd: string): Promise<string> {
@@ -717,7 +703,7 @@ async function renderGuide(cwd: string): Promise<string> {
   lines.push(`<tools>`);
   const builtin = Object.keys(tools).sort().join(", ");
   lines.push(`built-in: ${builtin}`);
-  const externals = await listExternalServers(cwd);
+  const externals = listExternalServers();
   if (externals.length) {
     lines.push(`external (via mcp tool, prefix "<server>__<tool>"):`);
     const nsWidth = Math.max(...externals.map((e) => e.ns.length));
@@ -1285,6 +1271,9 @@ function safeResolve(cwd: string, userPath: string, allowSpill = false): { ok: t
 
 const aggregatorServers = new Map<string, ServerState>();
 const aggregatedTools = new Map<string, AggregatedTool>(); // prefixed name -> info
+// All namespaces declared in --mcp config (including those whose probe failed).
+// Source of truth for guide's external block — never re-read the config file.
+const aggregatorKnownServers = new Set<string>();
 
 // ---------- mcp tool: per-cwd server cache ----------
 
@@ -1992,6 +1981,7 @@ async function loadAggregator(configPath: string): Promise<void> {
       continue;
     }
     valid.push({ ns, cfg });
+    aggregatorKnownServers.add(ns);
   }
   if (valid.length === 0) return;
 
@@ -2825,9 +2815,11 @@ for (const name of disallowedTools) {
   delete tools[name];
 }
 
-// Load external MCP aggregation config if --mcp was given.
+// Load external MCP aggregation config if --mcp was given. Pass the user's
+// path through unchanged — Bun/Node resolve relative paths against the
+// process cwd at file-open time, so an explicit resolve here is redundant.
 if (mcpConfigPath) {
-  await loadAggregator(resolve(process.cwd(), mcpConfigPath));
+  await loadAggregator(mcpConfigPath);
 }
 
 // Walk an MCP `content` array and spill any oversized blocks. Text blocks

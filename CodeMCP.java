@@ -92,6 +92,7 @@ public final class CodeMCP {
     private static final Map<String, BufferedReader> aggregatorReaders = new ConcurrentHashMap<>();
     private static final Map<String, Object> aggregatorLocks = new ConcurrentHashMap<>();
     private static final Map<String, AggregatedTool> aggregatorTools = new ConcurrentHashMap<>(); // prefixed name -> info
+    private static final Set<String> aggregatorKnown = ConcurrentHashMap.newKeySet(); // all ns declared in --mcp
     private static final AtomicInteger aggregatorNextId = new AtomicInteger(0);
     private static final Pattern AGGREGATOR_NS_RE = Pattern.compile("^[A-Za-z][A-Za-z0-9_-]{0,63}$");
     
@@ -181,9 +182,10 @@ public final class CodeMCP {
             server.stop(5);
         }));
 
-        // Load --mcp aggregator (boot-time probe, parity with TS).
+        // Load --mcp aggregator (boot-time probe, parity with TS). Relative paths
+        // resolve against process cwd at file-open time; no need to prepend.
         if (mcpConfigPath != null) {
-            loadAggregator(Path.of(System.getProperty("user.dir"), mcpConfigPath).toString());
+            loadAggregator(mcpConfigPath);
         }
 
         // Start gateway client if --gateway is set
@@ -860,43 +862,20 @@ public final class CodeMCP {
         return docs;
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<Map<String, Object>> listExternalServers(String cwd) {
-        Path cfgPath = Path.of(cwd, mcpConfigPath != null ? mcpConfigPath : ".mcp.json");
-        if (!Files.isRegularFile(cfgPath)) return List.of();
-        Map<String, Object> cfg;
-        try {
-            cfg = parseJsonObject(Files.readString(cfgPath));
-        } catch (Exception e) {
-            return List.of();
-        }
-        Object serversRaw = cfg.get("mcpServers");
-        if (!(serversRaw instanceof Map)) return List.of();
-        Map<String, Object> servers = (Map<String, Object>) serversRaw;
-        List<Map<String, Object>> out = new ArrayList<>();
-        List<String> names = new ArrayList<>(servers.keySet());
-        names.sort(String::compareTo);
-        // Aggregator-probed tools: namespace -> list of tool names
+    private static List<Map<String, Object>> listExternalServers() {
+        // Source: aggregatorKnown (server-wide, from --mcp config). Tool names come
+        // from aggregatorTools (only populated for successfully probed servers).
         Map<String, List<String>> aggrByNs = new HashMap<>();
         for (AggregatedTool t : aggregatorTools.values()) {
             aggrByNs.computeIfAbsent(t.ns(), k -> new ArrayList<>()).add(t.tool());
         }
+        List<String> names = new ArrayList<>(aggregatorKnown);
+        names.sort(String::compareTo);
+        List<Map<String, Object>> out = new ArrayList<>();
         for (String ns : names) {
-            String key = cwd + ":" + ns;
-            List<String> tools = new ArrayList<>();
-            boolean loaded;
-            synchronized (mcpProcesses) {
-                List<String> cached = mcpServerTools.get(key);
-                loaded = cached != null;
-                if (cached != null) tools.addAll(cached);
-            }
-            List<String> probed = aggrByNs.get(ns);
-            if (probed != null) {
-                for (String t : probed) if (!tools.contains(t)) tools.add(t);
-                loaded = true;
-            }
+            List<String> tools = new ArrayList<>(aggrByNs.getOrDefault(ns, List.of()));
             tools.sort(String::compareTo);
-            out.add(Map.of("ns", ns, "tools", tools, "loaded", loaded));
+            out.add(Map.of("ns", ns, "tools", tools));
         }
         return out;
     }
@@ -1081,6 +1060,7 @@ public final class CodeMCP {
                 continue;
             }
             valid.add(Map.entry(ns, scfg));
+            aggregatorKnown.add(ns);
         }
         if (valid.isEmpty()) return;
         ExecutorService pool = Executors.newFixedThreadPool(Math.min(8, valid.size()));
@@ -1181,7 +1161,7 @@ public final class CodeMCP {
         lines.add("");
         lines.add("<tools>");
         lines.add("built-in: " + String.join(", ", builtinToolNames()));
-        List<Map<String, Object>> externals = listExternalServers(cwd);
+        List<Map<String, Object>> externals = listExternalServers();
         if (!externals.isEmpty()) {
             lines.add("external (via mcp tool, prefix \"<server>__<tool>\"):");
             int nsWidth = externals.stream().mapToInt(e -> ((String) e.get("ns")).length()).max().orElse(0);
