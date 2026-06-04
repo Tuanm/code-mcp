@@ -583,6 +583,33 @@ public final class CodeMCP {
     
     // ===== PROCESS EXECUTION =====
     /**
+     * Pump bytes from a process's combined output stream into a StringBuilder, decoding UTF-8
+     * as chars arrive. Uses InputStreamReader.read(char[]) which returns once any chars are
+     * available (the underlying StreamDecoder pulls from InputStream.read in chunks). This is
+     * the equivalent of Python's os.read+incremental-decoder pump and TS's ReadableStream
+     * chunked reads: progress-bar output without trailing \n becomes visible during the run
+     * instead of sitting in the pipe buffer until EOF (the old BufferedReader.readLine path).
+     */
+    private static void pumpProcessOutput(InputStream in, StringBuilder sb) {
+        try (var reader = new InputStreamReader(in, StandardCharsets.UTF_8)) {
+            char[] cbuf = new char[4096];
+            while (true) {
+                int n = reader.read(cbuf, 0, cbuf.length);
+                if (n < 0) break;
+                if (n == 0) continue;
+                synchronized (sb) {
+                    sb.append(cbuf, 0, n);
+                    if (sb.length() > OUTPUT_CAP_MAX) {
+                        String capped = capOutput(sb.toString());
+                        sb.setLength(0);
+                        sb.append(capped);
+                    }
+                }
+            }
+        } catch (IOException ignored) {}
+    }
+
+    /**
      * Run a process for the bash/shell/command/powershell tools.
      *
      * Two paths depending on whether the caller passed timeoutMs:
@@ -604,26 +631,18 @@ public final class CodeMCP {
         pb.redirectInput(ProcessBuilder.Redirect.PIPE);
         scrubEnv(pb);
 
-        Process p = pb.start();
+        Process p;
+        try {
+            p = pb.start();
+        } catch (IOException e) {
+            // Match Python+TS exit=-1 + ERROR shape so MCP clients see a uniform error
+            // format (bad cwd, missing binary, fork failure) instead of an exception.
+            return "exit=-1\nERROR: " + e.getMessage();
+        }
         try { p.getOutputStream().close(); } catch (IOException ignored) {}
 
         StringBuilder sb = new StringBuilder();
-        Thread reader = new Thread(() -> {
-            try (var in = p.getInputStream();
-                 var br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    synchronized (sb) {
-                        sb.append(line).append('\n');
-                        if (sb.length() > OUTPUT_CAP_MAX) {
-                            String capped = capOutput(sb.toString());
-                            sb.setLength(0);
-                            sb.append(capped);
-                        }
-                    }
-                }
-            } catch (IOException ignored) {}
-        }, "proc-stdout-" + p.pid());
+        Thread reader = new Thread(() -> pumpProcessOutput(p.getInputStream(), sb), "proc-stdout-" + p.pid());
         reader.setDaemon(true);
         reader.start();
 
@@ -696,10 +715,28 @@ public final class CodeMCP {
         }
     }
 
-    private static Job startJob(String command, String cwd) {
-        if (countRunningJobs() >= MAX_CONCURRENT_JOBS) {
-            throw new RuntimeException("max concurrent jobs (" + MAX_CONCURRENT_JOBS + ") exceeded");
+    /**
+     * Register a new Job in the jobs map iff we're not shutting down and the running-job count
+     * is below MAX_CONCURRENT_JOBS. The check + put runs under `synchronized (jobs)` so two
+     * concurrent start/adopt calls can never both pass the check.
+     */
+    private static Job registerJob(String id, String command, Process process, StringBuilder sb) {
+        synchronized (jobs) {
+            if (shuttingDown) {
+                throw new RuntimeException("server is shutting down");
+            }
+            int running = 0;
+            for (Job j : jobs.values()) if ("running".equals(j.status)) running++;
+            if (running >= MAX_CONCURRENT_JOBS) {
+                throw new RuntimeException("max concurrent jobs (" + MAX_CONCURRENT_JOBS + ") exceeded");
+            }
+            Job job = new Job(id, command, process, sb);
+            jobs.put(id, job);
+            return job;
         }
+    }
+
+    private static Job startJob(String command, String cwd) {
         String id = "j" + jobSeq.incrementAndGet();
         ProcessBuilder pb = new ProcessBuilder(shellCmd(command));
         pb.directory(new File(cwd));
@@ -712,26 +749,16 @@ public final class CodeMCP {
             try { process.getOutputStream().close(); } catch (IOException ignored) {}
             // Thread-safe StringBuilder; cap on append. O(n) amortized vs O(n^2) string concat.
             final StringBuilder sb = new StringBuilder();
-            Job job = new Job(id, command, process, sb);
-            jobs.put(id, job);
+            final Job job;
+            try {
+                job = registerJob(id, command, process, sb);
+            } catch (RuntimeException e) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+                throw e;
+            }
 
-            CompletableFuture.runAsync(() -> {
-                try (var reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        synchronized (sb) {
-                            sb.append(line).append('\n');
-                            if (sb.length() > OUTPUT_CAP_MAX) {
-                                String capped = capOutput(sb.toString());
-                                sb.setLength(0);
-                                sb.append(capped);
-                            }
-                        }
-                    }
-                } catch (IOException e) {
-                    // Stream closed
-                }
-            });
+            CompletableFuture.runAsync(() -> pumpProcessOutput(process.getInputStream(), sb));
 
             CompletableFuture.runAsync(() -> {
                 try {
@@ -740,6 +767,9 @@ public final class CodeMCP {
                     job.exitCode = code;
                     // Keep entry so view_job after exit still works (matches Python/TS).
                 } catch (InterruptedException e) {
+                    // Flip status so view_job stops reporting "running" forever if the waiter is interrupted.
+                    job.status = "exited";
+                    job.exitCode = -1;
                     Thread.currentThread().interrupt();
                 }
             });
@@ -756,12 +786,8 @@ public final class CodeMCP {
      * to the job system at the auto-background threshold without dropping in-flight output.
      */
     private static Job adoptJob(String command, Process process, StringBuilder sb, Thread reader) {
-        if (countRunningJobs() >= MAX_CONCURRENT_JOBS) {
-            throw new RuntimeException("max concurrent jobs (" + MAX_CONCURRENT_JOBS + ") exceeded");
-        }
         String id = "j" + jobSeq.incrementAndGet();
-        Job job = new Job(id, command, process, sb);
-        jobs.put(id, job);
+        Job job = registerJob(id, command, process, sb);
         CompletableFuture.runAsync(() -> {
             try {
                 int code = process.waitFor();
@@ -770,16 +796,13 @@ public final class CodeMCP {
                 job.status = "exited";
                 job.exitCode = code;
             } catch (InterruptedException e) {
+                // Match startJob: flip to exited so view_job doesn't show "running" forever.
+                job.status = "exited";
+                job.exitCode = -1;
                 Thread.currentThread().interrupt();
             }
         });
         return job;
-    }
-
-    private static int countRunningJobs() {
-        int n = 0;
-        for (Job j : jobs.values()) if ("running".equals(j.status)) n++;
-        return n;
     }
     
     // ===== MEMO MANAGEMENT =====

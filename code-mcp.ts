@@ -379,14 +379,22 @@ function killProcessTree(pid: number) {
 async function runShell(cmd: string[], cwd: string, command: string, timeout_ms?: number): Promise<string> {
   const explicit = typeof timeout_ms === "number" && timeout_ms > 0;
   const effective = explicit ? (timeout_ms as number) : DEFAULT_SHELL_TIMEOUT_MS;
-  const proc = spawn({
-    cmd,
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-    env: buildChildEnv({}),
-  });
+  let proc: ReturnType<typeof spawn>;
+  try {
+    proc = spawn({
+      cmd,
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      env: buildChildEnv({}),
+    });
+  } catch (e) {
+    // Match Python's exit=-1 + ERROR shape so MCP clients see a uniform error format
+    // (bad cwd, missing binary, fork failure) instead of an unhandled exception.
+    const reason = (e as Error).message || String(e);
+    return `exit=-1\nERROR: ${reason}`;
+  }
   const sink = { text: "" };
   // .catch on each inner promise: on the auto-background path the outer Promise.all
   // is never awaited, so a pump rejection (reader error, decoder hiccup) would
@@ -402,34 +410,37 @@ async function runShell(cmd: string[], cwd: string, command: string, timeout_ms?
   type ExitWin = { kind: "exit"; code: number };
   const exitPromise: Promise<ExitWin> = proc.exited.then((code: number) => ({ kind: "exit", code }));
 
-  const winner = await Promise.race([exitPromise, timerPromise]);
-  if (winner !== "timeout") {
-    if (timerHandle) clearTimeout(timerHandle);
-    await pumps;
-    return `exit=${(winner as ExitWin).code}\n${sink.text}`;
-  }
-
-  // Timer fired. Process still running (or just exited within race window).
-  if (explicit) {
-    const pid = (proc as any)?.pid;
-    if (pid) killProcessTree(pid);
-    await proc.exited;
-    await pumps;
-    return `exit=124\n${sink.text}${timeoutMarker(effective)}`;
-  }
-
-  // No explicit timeout: hand off to the job system instead of killing.
   try {
-    const job = adoptJob(command, proc as any, sink);
-    return `exit=running\n${sink.text}${backgroundedMarker(effective, job.id)}`;
-  } catch (e) {
-    // Adoption failed (MAX_JOBS reached, shutting down, …) — degrade to kill.
-    const pid = (proc as any)?.pid;
-    if (pid) killProcessTree(pid);
-    await proc.exited;
-    await pumps;
-    const reason = (e as Error).message || String(e);
-    return `exit=124\n${sink.text}\n[Auto-background failed: ${reason}; process killed.]`;
+    const winner = await Promise.race([exitPromise, timerPromise]);
+    if (winner !== "timeout") {
+      await pumps;
+      return `exit=${(winner as ExitWin).code}\n${sink.text}`;
+    }
+
+    // Timer fired. Process still running (or just exited within race window).
+    if (explicit) {
+      const pid = (proc as any)?.pid;
+      if (pid) killProcessTree(pid);
+      await proc.exited;
+      await pumps;
+      return `exit=124\n${sink.text}${timeoutMarker(effective)}`;
+    }
+
+    // No explicit timeout: hand off to the job system instead of killing.
+    try {
+      const job = adoptJob(command, proc as any, sink);
+      return `exit=running\n${sink.text}${backgroundedMarker(effective, job.id)}`;
+    } catch (e) {
+      // Adoption failed (MAX_JOBS reached, shutting down, …) — degrade to kill.
+      const pid = (proc as any)?.pid;
+      if (pid) killProcessTree(pid);
+      await proc.exited;
+      await pumps;
+      const reason = (e as Error).message || String(e);
+      return `exit=124\n${sink.text}\n[Auto-background failed: ${reason}; process killed.]`;
+    }
+  } finally {
+    if (timerHandle) clearTimeout(timerHandle);
   }
 }
 
@@ -1349,7 +1360,7 @@ const NAMESPACE_RE = /^[a-z][a-z0-9-]*$/;
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const SUBPROCESS_CALL_TIMEOUT_MS = 90_000;
 const MAX_CONSECUTIVE_SPAWN_FAILS = 3;
-const MAX_JOBS = 100;
+const MAX_JOBS = 10;
 
 function safeResolve(cwd: string, userPath: string, allowSpill = false): { ok: true; path: string } | { ok: false; reason: string } {
   const cwdResolved = resolve(cwd).replace(/\\/g, "/");

@@ -1111,6 +1111,18 @@ def _shell_tool_name() -> str:
     }.get(get_shell_type(), "bash")
 
 
+def _shell_tool_description() -> str:
+    lead = {
+        ShellType.BASH: "Run a bash command.",
+        ShellType.SH: "Run a POSIX sh command.",
+        ShellType.CMD: "Run a Windows CMD command.",
+        ShellType.POWERSHELL: "Run a PowerShell command.",
+    }.get(get_shell_type(), "Run a bash command.")
+    return (f"{lead} Returns combined stdout+stderr. If still running at 60s with no "
+            f"timeout_ms set, auto-detaches into the `job` tool (the return value carries "
+            f"the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.")
+
+
 def build_tools_list() -> list[dict]:
     tools: list[dict] = [
         {"name": "read", "description": "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
@@ -1121,7 +1133,7 @@ def build_tools_list() -> list[dict]:
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["cwd", "path", "old_str", "new_str"]}},
         {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "edits": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}, "required": ["cwd", "edits"]}},
-        {"name": _shell_tool_name(), "description": "Run a command in the detected shell. Returns 'exit=N\\n' + combined stdout+stderr. If still running at 60s with no timeout_ms set, auto-detaches into the `job` tool (the return value carries the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.",
+        {"name": _shell_tool_name(), "description": _shell_tool_description(),
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "command"]}},
         {"name": "grep", "description": "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, "required": ["cwd", "pattern"]}},
