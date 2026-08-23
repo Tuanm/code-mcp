@@ -42,6 +42,7 @@ from typing import Any, BinaryIO, Optional
 
 # Configuration
 DEFAULT_PORT = 7777
+DEFAULT_GATEWAY = "code-mcp.tuanm.workers.dev"  # used by bare `--gateway`
 DEFAULT_BIND = "127.0.0.1"
 TIMEOUT_MS = 30_000
 MAX_OUTPUT = 1_000_000
@@ -296,9 +297,14 @@ def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None
         elif arg == "--gateway-token" and i + 1 < len(args):
             gateway_token = args[i + 1]
             i += 2
-        elif arg == "--gateway" and i + 1 < len(args):
-            gateway_domain = args[i + 1]
-            i += 2
+        elif arg == "--gateway":
+            # Bare --gateway (no URL) connects to the default managed gateway.
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                gateway_domain = args[i + 1]
+                i += 2
+            else:
+                gateway_domain = DEFAULT_GATEWAY
+                i += 1
         elif arg == "--id" and i + 1 < len(args):
             device_id = args[i + 1]
             i += 2
@@ -339,7 +345,8 @@ Flags:
   --port <n>            Listen port (default: 7777 or $PORT)
   --bind <addr>         Bind address (default: 127.0.0.1)
   --token <s>           Require ?token=<s> on every request
-  --gateway <url>       Connect to gateway server (wss:// or https://)
+  --gateway [url]       Connect to gateway server; bare flag uses the default
+                        (wss://code-mcp.tuanm.workers.dev)
   --id <uuid>           Use specific device ID for gateway connection
   --gateway-token <s>   Device credential sent to the gateway on connect
                         (defaults to --token; must match the token registered

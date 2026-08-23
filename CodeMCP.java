@@ -35,6 +35,7 @@ public final class CodeMCP {
     
     // ===== CONSTANTS =====
     private static final int DEFAULT_PORT = 7777;
+    private static final String DEFAULT_GATEWAY = "code-mcp.tuanm.workers.dev"; // bare --gateway
     private static final int OUTPUT_CAP_MAX = 1_000_000;
     private static final int OUTPUT_CAP_KEEP = 500_000;
     private static final int RESULT_SPILL_THRESHOLD = 10_000;
@@ -251,8 +252,13 @@ public final class CodeMCP {
                     mcpConfigPath = args[i];
                 }
                 case "--gateway" -> {
-                    if (++i >= args.length) usage();
-                    gatewayDomain = args[i];
+                    // Bare --gateway (no URL) connects to the default managed gateway.
+                    if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+                        i++;
+                        gatewayDomain = args[i];
+                    } else {
+                        gatewayDomain = DEFAULT_GATEWAY;
+                    }
                 }
                 case "--id" -> {
                     if (++i >= args.length) usage();
@@ -303,7 +309,8 @@ public final class CodeMCP {
           --public                    Expose via Cloudflare quick tunnel (requires cloudflared)
           --domain <host>             Use given public hostname (mutually exclusive with --public)
           --mcp <path>                Aggregate tools from external MCP servers (JSON config)
-          --gateway <domain>          Connect to gateway server (wss://{domain}/ws)
+          --gateway [domain]         Connect to gateway server; bare flag uses the default
+                                      (wss://code-mcp.tuanm.workers.dev)
           --id <uuid>                 Use specific device ID for gateway connection
           --gateway-token <s>         Device credential sent to the gateway on connect
                                       (defaults to --token; must match the token registered
