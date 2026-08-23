@@ -73,13 +73,13 @@ liveness detection:
 | `--port <n>`                | Listen port                                                            | `7777` or `$PORT` |
 | `--bind <addr>`             | Bind address                                                           | `127.0.0.1`       |
 | `--token <s>`               | Require `?token=<s>` or `Authorization: Bearer <s>` on every request; in gateway mode also presented to the gateway as the device credential | no auth |
+| `--gateway [url]`          | Connect to a gateway server and tunnel requests via WebSocket; bare flag uses the default managed gateway | `wss://code-mcp.tuanm.workers.dev` |
 | `--gateway-token <s>`      | Device credential sent to the gateway on connect (overrides `--token`); must match the token registered for `--id` in the gateway | `--token` |
 | `--enable-memory`           | Enable remember/forget/recall tools                                    | disabled          |
 | `--disallowed-tools <list>` | Comma-separated list of tools to disable                               | none              |
 | `--public`                  | Expose via Cloudflare quick tunnel (requires `cloudflared`)            | disabled          |
 | `--domain <host>`           | Use existing public hostname (mutually exclusive with `--public`)      | none              |
 | `--mcp <path>`              | Aggregate tools from external MCP servers (Claude Desktop JSON config) | none              |
-| `--gateway [url]`          | Connect to a gateway server and tunnel requests via WebSocket; bare flag uses the default managed gateway | `wss://code-mcp.tuanm.workers.dev` |
 | `--id <uuid>`               | Use specific device ID for gateway connection                          | random UUID       |
 
 ### MCP Config Format
