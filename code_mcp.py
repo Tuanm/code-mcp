@@ -7,6 +7,7 @@ Python 3.10+ only, no external dependencies.
 import base64
 import codecs
 import concurrent.futures
+import functools
 import hashlib
 import hmac
 import http.server
@@ -16,6 +17,7 @@ import random
 import re
 import secrets
 import select
+import shutil
 import shlex
 import signal
 import socket
@@ -46,7 +48,22 @@ MAX_OUTPUT = 1_000_000
 OUTPUT_CAP_KEEP = 500_000
 UPLOAD_TTL_MS = 10 * 60 * 1000
 MAX_CONCURRENT_JOBS = 10
+MAX_SHELL_CONCURRENCY = 5          # parity with Java's shellSemaphore
+_shell_semaphore = threading.BoundedSemaphore(MAX_SHELL_CONCURRENCY)
 MAX_REQUEST_BYTES = 100 * 1024 * 1024  # cap request body to 100MB (DoS guard)
+MAX_READ_BYTES = 100 * 1024 * 1024  # cap single-file reads (memory DoS guard)
+
+
+def _read_size_error(path: Path) -> str | None:
+    """Return an error string if the file exceeds MAX_READ_BYTES, else None."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size > MAX_READ_BYTES:
+        return (f"ERROR: file too large ({size} bytes > {MAX_READ_BYTES}); "
+                f"use a range, or grep the file instead")
+    return None
 MAX_GATEWAY_HEADER_BYTES = 64 * 1024   # cap WS handshake response headers
 MAX_WS_FRAME_BYTES = 64 * 1024 * 1024  # cap WS frame payload (DoS guard)
 DEFAULT_SHELL_TIMEOUT_MS = 60_000  # auto-handoff threshold for shell tools when caller doesn't pass timeout_ms
@@ -75,6 +92,17 @@ RESULT_SPILL_HEAD = 3_000
 RESULT_SPILL_ROOT = Path(_tempfile.gettempdir()) / "code-mcp"
 try:
     RESULT_SPILL_ROOT.mkdir(parents=True, exist_ok=True)
+    # Spill files hold tool output (potentially secrets): keep the root
+    # private and sweep files older than 24h so a long session can't fill the
+    # disk or leave world-readable data behind (default mkdir is 0777&~umask).
+    os.chmod(RESULT_SPILL_ROOT, 0o700)
+    _spill_cutoff = time.time() - 86_400
+    for _p in RESULT_SPILL_ROOT.iterdir():
+        try:
+            if _p.is_file() and _p.stat().st_mtime < _spill_cutoff:
+                _p.unlink()
+        except OSError:
+            pass
 except OSError:
     pass
 
@@ -99,7 +127,10 @@ def maybe_spill_text(text: str, tool_name: str = "") -> str:
     path = RESULT_SPILL_ROOT / fname
     total_lines = text.count("\n") + (0 if text.endswith("\n") else 1)
     try:
-        path.write_text(text, encoding="utf-8")
+        # 0600: tool results can contain secrets; never world-readable.
+        with open(path, "wb") as _fh:
+            _fh.write(raw)
+        os.chmod(path, 0o600)
     except OSError as e:
         return (head + f"\n[TRUNCATED: full output is {len(raw)} bytes "
                 f"({total_lines} lines); spill to disk FAILED ({e})]\n")
@@ -130,6 +161,7 @@ make_public = False
 public_base_url: Optional[str] = None
 cloudflare_tunnel_url: Optional[str] = None
 _gateway_dispatch_pool: Optional[Any] = None  # lazy-initialized ThreadPoolExecutor, reused across gateway reconnects
+_gateway_dispatch_slots = threading.BoundedSemaphore(64)  # bound in-flight tunnel relays (backpressure)
 
 def check_cloudflared() -> bool:
     try:
@@ -166,10 +198,12 @@ def find_on_path(name: str) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
 def has_rg() -> bool:
     return find_on_path("rg")
 
 
+@functools.lru_cache(maxsize=1)
 def has_findstr() -> bool:
     return find_on_path("findstr")
 
@@ -385,6 +419,13 @@ def read_file(path: str, cwd: str = ".",
         ok, full_path, err = safe_resolve(cwd, path, allow_spill=True)
         if not ok:
             return f"ERROR: {err}"
+        if not full_path.is_file():
+            # Reject devices/FIFOs early: /dev/zero reports size 0 and would
+            # otherwise hang the read forever.
+            return "ERROR: not a regular file"
+        too_big = _read_size_error(full_path)
+        if too_big:
+            return too_big
         content = full_path.read_text(encoding="utf-8", errors="replace")
         if range and isinstance(range, (list, tuple)) and len(range) == 2:
             try:
@@ -422,6 +463,9 @@ def edit_file(path: str, old_str: str, new_str: str, cwd: str = ".") -> str:
         ok, full_path, err = safe_resolve(cwd, path)
         if not ok:
             return f"ERROR: {err}"
+        too_big = _read_size_error(full_path)
+        if too_big:
+            return too_big
         content = full_path.read_text(encoding="utf-8", errors="replace")
         if old_str not in content:
             return f"ERROR: String not found"
@@ -448,6 +492,9 @@ def multi_edit_files(edits: list[dict], cwd: str = ".") -> str:
                 return f"ERROR: edit #{i+1}: {err}"
             resolved = str(full_path)
             if resolved not in originals:
+                too_big = _read_size_error(full_path)
+                if too_big:
+                    return too_big
                 originals[resolved] = full_path.read_text(encoding="utf-8", errors="replace")
             text = originals[resolved]
             if old_str not in text:
@@ -723,9 +770,34 @@ def handle_upload_post(content_type: str, body: bytes, session_id: str) -> tuple
 
     safe_name = _sanitize_filename(fname)
     target_dir = Path(UPLOAD_ROOT) / session_id
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return 500, {"error": f"upload dir failed: {e}"}
+    # A local attacker who guesses a session id must not redirect the write via
+    # a pre-created symlink (UPLOAD_ROOT lives under the world-writable tmpdir).
+    if target_dir.is_symlink() or not target_dir.is_dir():
+        return 500, {"error": "upload path invalid"}
     target = target_dir / safe_name
-    target.write_bytes(file_bytes)
+    try:
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(file_bytes)
+    except OSError as e:
+        return 500, {"error": f"write failed: {e}"}
+
+    # TTL sweep: links expire after 10 minutes; drop stale session dirs so a
+    # long-lived server can't fill the disk (disk-DoS guard).
+    _upload_ttl = time.time() - 900
+    try:
+        for _d in Path(UPLOAD_ROOT).iterdir():
+            try:
+                if _d.is_dir() and not _d.is_symlink() and _d.stat().st_mtime < _upload_ttl:
+                    shutil.rmtree(_d, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
     sha = hashlib.sha256(file_bytes).hexdigest()
     import mimetypes
@@ -763,6 +835,19 @@ def _run_proc(cmd, cwd: str, timeout_ms: int | None, executable: str | None = No
     explicit = bool(timeout_ms and timeout_ms > 0)
     effective_ms = timeout_ms if explicit else DEFAULT_SHELL_TIMEOUT_MS
     timeout_s = effective_ms / 1000.0
+    # Bound concurrent shell executions (parity with Java): waiting callers get
+    # a clear error after 30s instead of unbounded subprocess fan-out.
+    if not _shell_semaphore.acquire(timeout=30):
+        return "ERROR: Too many concurrent shell executions, please try again later"
+    try:
+        return _run_proc_inner(cmd, cwd, timeout_ms, explicit, effective_ms, timeout_s,
+                               executable, shell)
+    finally:
+        _shell_semaphore.release()
+
+
+def _run_proc_inner(cmd, cwd, timeout_ms, explicit, effective_ms, timeout_s,
+                    executable=None, shell=True) -> str:
     popen_kwargs = dict(
         shell=shell,
         executable=executable,
@@ -929,6 +1014,14 @@ def find_files(pattern: str, cwd: str = ".", path: str = ".", include_hidden: bo
             return f"ERROR: {err}"
         if not base_path.exists():
             return f"ERROR: path not found: {path}"
+        # The glob pattern must stay inside the cwd sandbox: reject absolute
+        # roots, drive letters and ".." components (pathlib treats them
+        # literally, so without this find could list anywhere on disk).
+        norm_pat = pattern.replace("\\", "/")
+        if norm_pat.startswith("/") or norm_pat.startswith("~") or re.match(r"^[A-Za-z]:", norm_pat):
+            return "ERROR: pattern must be relative to the working directory"
+        if any(seg == ".." for seg in norm_pat.split("/")):
+            return "ERROR: pattern may not contain '..'"
         pat = pattern if ("/" in pattern or "\\" in pattern) else f"**/{pattern}"
         cwd_resolved = Path(cwd).resolve()
         noise_dirs = {"node_modules", ".git", ".next", ".nuxt", ".turbo", ".cache",
@@ -944,8 +1037,8 @@ def find_files(pattern: str, cwd: str = ".", path: str = ".", include_hidden: bo
                 rel = m.resolve().relative_to(cwd_resolved)
                 parts = rel.parts
             except ValueError:
-                parts = m.parts
-                rel = m
+                # Resolved outside the cwd (symlink escape) — never list it.
+                continue
             skip = False
             for seg in parts:
                 if seg in noise_dirs and not explicit_noise:
@@ -1277,14 +1370,69 @@ def dispatch_tool(tool_name: str, params: dict) -> Any:
         return f"ERROR: {e}"
 
 
+MAX_CONCURRENT_REQUESTS = 64   # parity with Java's MAX_HTTP_THREADS
+HTTP_READ_TIMEOUT_S = 60          # slowloris guard: a stalled body can't pin a thread forever
+
+
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
+
+    # Bounded concurrency: excess connections get an immediate 503 instead of
+    # spawning unbounded handler threads (memory-DoS guard).
+    _active = 0
+    _active_lock = threading.Lock()
+
+    def process_request(self, request, client_address):
+        with self._active_lock:
+            if self._active >= MAX_CONCURRENT_REQUESTS:
+                try:
+                    request.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\n"
+                        b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                except Exception:
+                    pass
+                try:
+                    request.close()
+                except Exception:
+                    pass
+                return
+            self._active += 1
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._active_lock:
+                self._active -= 1
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._active_lock:
+                self._active -= 1
+
+    def handle_error(self, request, client_address):
+        # Slowloris probes / aborted clients are not server errors: keep the
+        # log clean while real failures stay visible.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (socket.timeout, ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class MCPRequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def setup(self):
+        super().setup()
+        # Slowloris guard: never block forever reading a request body.
+        try:
+            self.connection.settimeout(HTTP_READ_TIMEOUT_S)
+        except Exception:
+            pass
 
     def send_json(self, data: dict, status: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -1473,7 +1621,10 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
             is_local = d.startswith("localhost") or d.startswith("127.") or d.startswith("192.168.") or d.startswith("10.") or d.startswith("172.16.")
             base = ("ws://" if is_local else "wss://") + d
         if dev_id:
-            return base + "/ws/" + dev_id
+            # Defensive: --id lands in the request path — never allow CR/LF
+            # to inject headers or extra request lines into the handshake.
+            safe_dev = dev_id.replace("\r", "").replace("\n", "")
+            return base + "/ws/" + safe_dev
         return base + "/ws"
 
     def send_ws_frame(sock, data: bytes):
@@ -1567,6 +1718,12 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                     continue
                 if opcode in (0x1, 0x2, 0x0):
                     buffer.extend(payload)
+                    # Enforce the cap across FRAGMENTS too (a single frame is
+                    # already capped; endless continuations must not grow the
+                    # message buffer without bound -> OOM guard).
+                    if len(buffer) > MAX_WS_FRAME_BYTES:
+                        print(f"[gateway] message exceeds {MAX_WS_FRAME_BYTES} bytes", file=sys.stderr)
+                        return None
                     if fin:
                         return bytes(buffer)
                     continue
@@ -1656,7 +1813,7 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
             print(f"[gateway] connecting to {url}", file=sys.stderr)
 
             uri = urllib.parse.urlparse(url)
-            host = uri.hostname or domain
+            host = (uri.hostname or domain).replace("\r", "").replace("\n", "")
             gateway_port = uri.port or (443 if uri.scheme == "wss" else 80)
 
             use_ssl = url.startswith("wss://") or url.startswith("https://")
@@ -1778,6 +1935,8 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                                          name="gw-keepalive", daemon=True)
             ka_thread.start()
 
+            MAX_GATEWAY_RESP_BYTES = 64 * 1024 * 1024  # cap tool responses relayed through the tunnel
+
             def dispatch_async(msg, sock_ref):
                 try:
                     tunnel_req = msg["request"]
@@ -1791,7 +1950,12 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                         headers={"Content-Type": "application/json; charset=utf-8"})
                     try:
                         http_resp = urllib.request.urlopen(http_req, timeout=30)
-                        resp_obj = json.loads(http_resp.read().decode("utf-8", errors="replace"))
+                        raw = http_resp.read(MAX_GATEWAY_RESP_BYTES + 1)
+                        if len(raw) > MAX_GATEWAY_RESP_BYTES:
+                            resp_obj = {"jsonrpc": "2.0", "id": tunnel_req.get("id"),
+                                        "error": {"code": -32603, "message": "tool response too large"}}
+                        else:
+                            resp_obj = json.loads(raw.decode("utf-8", errors="replace"))
                     except Exception as e:
                         resp_obj = {"jsonrpc": "2.0", "id": tunnel_req.get("id"),
                                     "error": {"code": -32603, "message": str(e)}}
@@ -1813,7 +1977,25 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                         if isinstance(msg, dict) and msg.get("type") == "keepalive-ack":
                             continue
                         if "request" in msg:
-                            dispatch_pool.submit(dispatch_async, msg, ssock)
+                            if not _gateway_dispatch_slots.acquire(blocking=False):
+                                # Backpressure: a gateway flooding faster than we can
+                                # drain must not grow an unbounded queue (OOM guard).
+                                try:
+                                    _req = msg.get("request") or {}
+                                    safe_send(ssock, json.dumps({
+                                        "id": msg.get("id"),
+                                        "response": {"jsonrpc": "2.0", "id": _req.get("id"),
+                                                     "error": {"code": -32000, "message": "gateway relay overloaded"}},
+                                    }, ensure_ascii=False).encode("utf-8"))
+                                except Exception:
+                                    pass
+                                continue
+                            def _dispatch_guarded(m, sock):
+                                try:
+                                    dispatch_async(m, sock)
+                                finally:
+                                    _gateway_dispatch_slots.release()
+                            dispatch_pool.submit(_dispatch_guarded, msg, ssock)
                     except socket.timeout:
                         continue
                     except Exception as e:
@@ -2239,30 +2421,51 @@ def handle_recall(cwd: str, query: str | None = None, tags: list | None = None,
 def handle_preview(url: str) -> str:
     if not has_cloudflared:
         return "ERROR: cloudflared not found on PATH"
-    global cloudflare_tunnel_url
-    if cloudflare_tunnel_url:
-        return f"tunnel already running: {cloudflare_tunnel_url}"
+    if not url or not isinstance(url, str):
+        return "ERROR: url required"
+    # The tunnel exposes the target to the public internet: only allow http(s)
+    # URLs to localhost/LAN-style hosts, never cloud-metadata or internal
+    # names. cloudflared is spawned as argv (no shell), so no injection.
     try:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", url, "--no-autoupdate"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace",
-        )
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    return "ERROR: cloudflared exited"
-                continue
-            m = re.match(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-            if m:
-                cloudflare_tunnel_url = m.group(0)
-                return f"tunnel ready: {cloudflare_tunnel_url}"
-        proc.terminate()
-        return "ERROR: tunnel URL not received within 20s"
-    except Exception as e:
-        return f"ERROR: {e}"
+        u = urllib.parse.urlparse(url)
+    except ValueError:
+        return "ERROR: invalid url"
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return "ERROR: url must be http(s)"
+    host = u.hostname.lower()
+    if host in ("169.254.169.254", "metadata.google.internal", "metadata")             or host.endswith(".internal") or host == "localhost":
+        return "ERROR: url targets a protected host"
+    global cloudflare_tunnel_url
+    with gateway_lock:
+        if cloudflare_tunnel_url:
+            return f"tunnel already running: {cloudflare_tunnel_url}"
+        proc = None
+        got_url = False
+        try:
+            proc = subprocess.Popen(
+                ["cloudflared", "tunnel", "--url", url, "--no-autoupdate"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace",
+            )
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        return "ERROR: cloudflared exited"
+                    continue
+                m = re.match(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    cloudflare_tunnel_url = m.group(0)
+                    got_url = True
+                    return f"tunnel ready: {cloudflare_tunnel_url}"
+            return "ERROR: tunnel URL not received within 20s"
+        finally:
+            if proc is not None and proc.poll() is None and not got_url:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
 
 
 # MCP server state management
@@ -2535,7 +2738,10 @@ def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path:
                         list(cmd) + list(args_list),
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        # stderr is never consumed; a child filling the pipe would
+                        # deadlock the JSON-RPC exchange (parity with the
+                        # aggregator spawn, which already uses DEVNULL).
+                        stderr=subprocess.DEVNULL,
                         cwd=cwd,
                         env=build_child_env({k: str(v) for k, v in extra_env.items()}),
                     )
@@ -2626,6 +2832,20 @@ def signal_handler(sig, frame):
     global shutting_down
     shutting_down = True
     shutdown_aggregator()
+    # Kill tracked children (jobs + MCP servers) so Ctrl-C does not orphan
+    # running subprocesses.
+    with jobs_lock:
+        _procs = [j.get("proc") for j in jobs.values() if j.get("proc") is not None]
+    with mcp_lock:
+        _procs += list(mcp_processes.values())
+    for _p in _procs:
+        try:
+            if sys.platform != "win32":
+                os.killpg(os.getpgid(_p.pid), signal.SIGTERM)
+            else:
+                _p.terminate()
+        except Exception:
+            pass
     sys.exit(0)
 
 

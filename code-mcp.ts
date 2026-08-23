@@ -18,9 +18,9 @@
 //   --mcp <path>       aggregate tools from external MCP servers defined in the given JSON config (Claude Desktop format).
 
 import { spawn, spawnSync, file, write } from "bun";
-import { readdirSync, statSync, mkdirSync, rmSync, constants as fsConstants } from "node:fs";
+import { readdirSync, statSync, mkdirSync, rmSync, realpathSync, lstatSync, constants as fsConstants } from "node:fs";
 import { open as fsOpen, rename as fsRename, unlink as fsUnlink, stat as fsStat } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { resolve, sep, basename, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { parseArgs } from "util";
@@ -189,6 +189,13 @@ if (makePublic && domain) {
   console.error(USAGE);
   process.exit(2);
 }
+// Exposing the server to the internet without a token is an unauthenticated
+// remote shell (read/write/bash). Refuse instead of silently enabling it.
+if ((makePublic || domain) && !token) {
+  console.error("error: --public/--domain require --token (otherwise the server is an unauthenticated remote shell)\n");
+  console.error(USAGE);
+  process.exit(2);
+}
 if (domain && !/^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$/.test(domain)) {
   console.error(`error: invalid --domain: ${domain}`);
   process.exit(2);
@@ -218,6 +225,7 @@ const UPLOAD_ROOT =
 const RESULT_SPILL_ROOT = resolve(tmpdir(), "code-mcp");
 const RESULT_SPILL_THRESHOLD = 10_000; // bytes
 const RESULT_SPILL_HEAD = 3_000;
+const MAX_READ_BYTES = 100 * 1024 * 1024; // cap single-file reads (memory DoS guard)
 
 // Best-effort cleanup of any stale spill files from a previous run. Failure
 // is non-fatal: the spill directory may not exist yet, may belong to another
@@ -226,6 +234,18 @@ const RESULT_SPILL_HEAD = 3_000;
 // each other; we just ensure our per-PID subdirectory exists.
 try {
   mkdirSync(RESULT_SPILL_ROOT, { recursive: true });
+  // Spill files hold tool output (potentially secrets): keep the root private
+  // and sweep files older than 24h so a long session can't fill the disk or
+  // leave world-readable data behind.
+  try { chmodSync(RESULT_SPILL_ROOT, 0o700); } catch {}
+  const cutoff = Date.now() - 86_400_000;
+  for (const name of readdirSync(RESULT_SPILL_ROOT)) {
+    try {
+      const p = resolve(RESULT_SPILL_ROOT, name);
+      const st = statSync(p);
+      if (st.isFile() && st.mtimeMs < cutoff) rmSync(p, { force: true });
+    } catch {}
+  }
 } catch (e: any) {
   console.error(`[spill] failed to prepare ${RESULT_SPILL_ROOT}: ${e?.message ?? e}`);
 }
@@ -271,6 +291,7 @@ async function maybeSpillText(text: string, toolName?: string): Promise<string> 
 
   try {
     await Bun.write(path, text);
+    try { chmodSync(path, 0o600); } catch {}
   } catch (e: any) {
     // Spill failed (full disk, read-only fs, permission). Do NOT fall back
     // to returning the full text — that would blow the agent's context.
@@ -384,7 +405,53 @@ function killProcessTree(pid: number) {
 // Uses a single combined sink (stdout+stderr interleaved by arrival, matching the
 // `job` tool's behaviour) so the sink can be handed off to the adopted Job
 // without merging buffers.
+// Bound concurrent shell executions (parity with Java/Python's 5 permits):
+// an agent firing many bash calls in parallel must not spawn unbounded
+// subprocesses (resource-DoS guard).
+const MAX_CONCURRENT_SHELL = 5;
+let shellActive = 0;
+const shellWaiters: Array<() => void> = [];
+
+async function acquireShellSlot(timeoutMs = 30_000): Promise<boolean> {
+  if (shellActive < MAX_CONCURRENT_SHELL) { shellActive++; return true; }
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      const i = shellWaiters.indexOf(wake);
+      if (i >= 0) shellWaiters.splice(i, 1);
+      resolve(false);
+    }, timeoutMs);
+    const wake = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      shellActive++;
+      resolve(true);
+    };
+    shellWaiters.push(wake);
+  });
+}
+
+function releaseShellSlot(): void {
+  shellActive--;
+  const w = shellWaiters.shift();
+  if (w) w();
+}
+
 async function runShell(cmd: string[], cwd: string, command: string, timeout_ms?: number): Promise<string> {
+  if (!(await acquireShellSlot())) {
+    return "ERROR: Too many concurrent shell executions, please try again later";
+  }
+  try {
+    return await runShellInner(cmd, cwd, command, timeout_ms);
+  } finally {
+    releaseShellSlot();
+  }
+}
+
+async function runShellInner(cmd: string[], cwd: string, command: string, timeout_ms?: number): Promise<string> {
   const explicit = typeof timeout_ms === "number" && timeout_ms > 0;
   const effective = explicit ? (timeout_ms as number) : DEFAULT_SHELL_TIMEOUT_MS;
   let proc: ReturnType<typeof spawn>;
@@ -396,6 +463,9 @@ async function runShell(cmd: string[], cwd: string, command: string, timeout_ms?
       stderr: "pipe",
       stdin: "ignore",
       env: buildChildEnv({}),
+      // Own process group so killJobTree's negative-PID kill reaches
+      // grandchildren (tree-kill parity with Python/Java).
+      detached: process.platform !== "win32",
     });
   } catch (e) {
     // Match Python's exit=-1 + ERROR shape so MCP clients see a uniform error format
@@ -506,6 +576,16 @@ async function pumpCapped(stream: ReadableStream<Uint8Array> | null, sink: { tex
 }
 
 function startJob(command: string, cwd: string): Job {
+  return startJobImpl(shellCmd(command), command, cwd);
+}
+
+// Like startJob but spawns argv directly (no shell interpolation): use for
+// tool inputs that must never reach a shell (e.g. preview's URL).
+function startJobArgv(argv: string[], displayCommand: string, cwd: string): Job {
+  return startJobImpl(argv, displayCommand, cwd);
+}
+
+function startJobImpl(argv: string[], displayCommand: string, cwd: string): Job {
   if (totalJobs >= MAX_JOBS) throw new Error(`max concurrent jobs (${MAX_JOBS}) exceeded`);
   if (shuttingDown) throw new Error("server is shutting down");
   totalJobs++;
@@ -513,18 +593,21 @@ function startJob(command: string, cwd: string): Job {
   let proc: any;
   try {
     proc = spawn({
-      cmd: shellCmd(command),
+      cmd: argv,
       cwd,
       stdout: "pipe",
       stderr: "pipe",
       stdin: "ignore",
       env: buildChildEnv({}),
+      // Own process group so killJobTree's negative-PID kill reaches
+      // grandchildren too (tree-kill parity with Python/Java).
+      detached: process.platform !== "win32",
     });
   } catch (e) {
     totalJobs--;
     throw e;
   }
-  const job: Job = { id, command, proc, output: "", status: "running", startedAt: Date.now() };
+  const job: Job = { id, command: displayCommand, proc, output: "", status: "running", startedAt: Date.now() };
   jobs.set(id, job);
 
   const sink = { get text() { return job.output; }, set text(v: string) { job.output = v; } };
@@ -535,6 +618,9 @@ function startJob(command: string, cwd: string): Job {
     totalJobs--;
     job.status = "exited";
     job.exitCode = code;
+    // Exited jobs are kept briefly for view_job, then evicted so the map
+    // cannot grow without bound (memory-leak guard).
+    setTimeout(() => { jobs.delete(id); }, 60 * 60 * 1000);
   });
   return job;
 }
@@ -1371,19 +1457,38 @@ const MAX_CONSECUTIVE_SPAWN_FAILS = 3;
 const MAX_JOBS = 10;
 
 function safeResolve(cwd: string, userPath: string, allowSpill = false): { ok: true; path: string } | { ok: false; reason: string } {
-  const cwdResolved = resolve(cwd).replace(/\\/g, "/");
+  const cwdResolved = resolve(cwd);
   try {
-    const p = resolve(cwdResolved, userPath).replace(/\\/g, "/");
-    if (!p.startsWith(cwdResolved + "/") && p !== cwdResolved) {
+    const p = resolve(cwdResolved, userPath);
+    let base: string;
+    try { base = realpathSync(cwdResolved); } catch { base = cwdResolved; } // cwd missing: fall back to lexical base
+    // path.resolve() is lexical: a symlinked INTERMEDIATE directory could
+    // smuggle the target outside the cwd. Real-path the deepest existing
+    // ancestor, re-append the non-existent tail, then enforce the boundary.
+    let probe: string = p;
+    const tail: string[] = [];
+    let real: string | null = null;
+    for (;;) {
+      try { real = realpathSync(probe); break; }
+      catch {
+        const parent = dirname(probe);
+        if (parent === probe) break;
+        tail.unshift(basename(probe));
+        probe = parent;
+      }
+    }
+    const final = real !== null ? resolve(real, ...tail) : p;
+    if (final !== base && !final.startsWith(base + sep)) {
       // Spill files live under RESULT_SPILL_ROOT, outside cwd. read/grep must
       // reach them because spill markers point callers at that path.
       if (allowSpill) {
-        const spillRoot = RESULT_SPILL_ROOT.replace(/\\/g, "/");
-        if (p === spillRoot || p.startsWith(spillRoot + "/")) return { ok: true, path: p };
+        let spillBase: string;
+        try { spillBase = realpathSync(RESULT_SPILL_ROOT); } catch { spillBase = RESULT_SPILL_ROOT; }
+        if (final === spillBase || final.startsWith(spillBase + sep)) return { ok: true, path: final };
       }
       return { ok: false, reason: `path escapes cwd: ${userPath}` };
     }
-    return { ok: true, path: p };
+    return { ok: true, path: final };
   } catch {
     return { ok: false, reason: `invalid path: ${userPath}` };
   }
@@ -2180,6 +2285,16 @@ const tools: Record<string, Tool> = {
     handler: async ({ cwd, path, range, no_truncate }) => {
       const r = safeResolve(cwd, path, true);
       if (!r.ok) throw new Error(r.reason);
+      // Memory-DoS guard: never buffer a huge file (or device node) whole.
+      try {
+        const st = statSync(r.path);
+        if (!st.isFile()) throw new Error("not a regular file");
+        if (st.size > MAX_READ_BYTES) {
+          throw new Error(`file too large (${st.size} bytes > ${MAX_READ_BYTES}); use a range, or grep the file instead`);
+        }
+      } catch (e: any) {
+        if (e instanceof Error && (e.message.startsWith("file too large") || e.message === "not a regular file")) throw e;
+      }
       const text = await file(r.path).text();
       if (no_truncate) return text;
       if (!range) return text;
@@ -2447,6 +2562,15 @@ const tools: Record<string, Tool> = {
     handler: async ({ cwd, pattern, path = ".", include_hidden = false }) => {
       const sr = safeResolve(cwd, path);
       if (!sr.ok) throw new Error(sr.reason);
+      // The glob must stay inside the cwd sandbox: reject absolute roots,
+      // drive letters and ".." components (parity with Python's find).
+      const normPat = pattern.replace(/\\/g, "/");
+      if (normPat.startsWith("/") || normPat.startsWith("~") || /^[A-Za-z]:/.test(normPat)) {
+        throw new Error("pattern must be relative to the working directory");
+      }
+      if (normPat.split("/").some((seg) => seg === "..")) {
+        throw new Error("pattern may not contain '..'");
+      }
       const pat = pattern.includes("/") || pattern.includes("\\") ? pattern : `**/${pattern}`;
       const glob = new Bun.Glob(pat);
 
@@ -2571,7 +2695,20 @@ const tools: Record<string, Tool> = {
       required: ["url"],
     },
     handler: async ({ url }) => {
-      const j = startJob(`cloudflared tunnel --url ${url} --no-autoupdate 2>&1`, process.cwd());
+      if (typeof url !== "string" || !url) throw new Error("url required");
+      let parsed: URL;
+      try { parsed = new URL(url); } catch { throw new Error("invalid url"); }
+      if (!/^https?$/.test(parsed.protocol.slice(0, -1))) throw new Error("url must be http(s)");
+      // The tunnel exposes the target to the public internet: never allow
+      // cloud-metadata / internal hosts (SSRF-as-a-service guard).
+      const host = parsed.hostname.toLowerCase();
+      if (host === "169.254.169.254" || host === "metadata.google.internal" || host === "metadata"
+          || host === "localhost" || host.endsWith(".internal")) {
+        throw new Error("url targets a protected host");
+      }
+      // Spawn as argv (no shell) so the URL can never inject commands.
+      const j = startJobArgv(["cloudflared", "tunnel", "--url", url, "--no-autoupdate"],
+        `cloudflared tunnel --url ${url} --no-autoupdate`, process.cwd());
       const deadline = Date.now() + 20_000;
       const re = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
       while (Date.now() < deadline) {
@@ -3147,10 +3284,41 @@ async function handleUpload(req: Request, sessionId: string): Promise<Response> 
       headers: { "Content-Type": "application/json", ...CORS_HEADERS },
     });
   }
+  // A local attacker who guesses a session id must not redirect the write via
+  // a pre-created symlink under the world-writable tmpdir.
+  try {
+    if (lstatSync(destDir).isSymbolicLink()) {
+      return new Response(JSON.stringify({ error: "upload path invalid" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+  } catch {
+    // destDir vanished between mkdir and lstat — treat as failure.
+    return new Response(JSON.stringify({ error: "upload path invalid" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
   const path = resolve(destDir, safe);
   try {
     const buf = await f.arrayBuffer();
     await write(path, buf);
+    try { chmodSync(path, 0o600); } catch {}
+    // TTL sweep: links expire after 10 minutes; drop stale session dirs so a
+    // long-lived server can't fill the disk (disk-DoS guard).
+    const cutoff = Date.now() - 900_000;
+    try {
+      for (const name of readdirSync(UPLOAD_ROOT)) {
+        try {
+          const d = resolve(UPLOAD_ROOT, name);
+          const st = lstatSync(d);
+          if (st.isDirectory() && !st.isSymbolicLink() && st.mtimeMs < cutoff) {
+            rmSync(d, { recursive: true, force: true });
+          }
+        } catch {}
+      }
+    } catch {}
     const hash = new Bun.CryptoHasher("sha256");
     hash.update(buf);
     const sha256 = hash.digest("hex");
@@ -3169,6 +3337,9 @@ async function handleUpload(req: Request, sessionId: string): Promise<Response> 
 Bun.serve({
   port,
   hostname: bindAddr,
+  // Reject oversized request bodies at the server level (chunked uploads have
+  // no Content-Length, so the handler-level check alone can be bypassed).
+  maxRequestBodySize: MAX_UPLOAD_BYTES + 1024 * 1024,
   async fetch(req) {
     const url = new URL(req.url);
 

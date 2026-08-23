@@ -47,6 +47,7 @@ public final class CodeMCP {
     private static final long MAX_WS_FRAME_BYTES = 64L * 1024 * 1024;
     private static final int MAX_GATEWAY_HEADER_BYTES = 64 * 1024;
     private static final int MAX_REQUEST_BYTES = 100 * 1024 * 1024;
+    private static final long MAX_READ_BYTES = 100L * 1024 * 1024; // cap single-file reads (memory DoS guard)
     private static final int MAX_HTTP_THREADS = 64;
     private static final String DEFAULT_BIND = "127.0.0.1";
     private static final int MAX_RETRIES = 30;
@@ -323,26 +324,43 @@ public final class CodeMCP {
             throw new IOException("Invalid path");
         }
         Path base = Path.of(cwd).toAbsolutePath().normalize();
+        Path realBase;
+        try {
+            realBase = base.toRealPath();
+        } catch (IOException e) {
+            realBase = base; // cwd missing: fall back to the lexical base
+        }
         Path resolved = base.resolve(userPath).normalize();
-        if (!resolved.startsWith(base)) {
+        // Real-path the DEEPEST EXISTING ancestor, then re-append the missing
+        // tail. normalize() is lexical, so a symlinked INTERMEDIATE directory
+        // could otherwise smuggle the target outside the cwd (e.g. repo/link/passwd
+        // where link -> /etc). The final component is checked implicitly because
+        // its parent chain is real-pathed before use.
+        Path probe = resolved;
+        Path tail = Path.of("");
+        while (probe != null && !Files.exists(probe, LinkOption.NOFOLLOW_LINKS)) {
+            tail = probe.getFileName() == null ? tail : probe.getFileName().resolve(tail);
+            probe = probe.getParent();
+        }
+        Path real = (probe != null) ? probe.toRealPath() : resolved;
+        Path finalPath = real.resolve(tail).normalize();
+        if (!finalPath.startsWith(realBase)) {
             // Spill files live under spillRoot, outside cwd. read/grep must reach
             // them because spill markers point callers at that path.
-            if (allowSpill && spillRoot != null
-                    && resolved.startsWith(Path.of(spillRoot).toAbsolutePath().normalize())) {
-                return resolved;
+            if (allowSpill && spillRoot != null) {
+                Path spillBase;
+                try {
+                    spillBase = Path.of(spillRoot).toRealPath();
+                } catch (IOException e) {
+                    spillBase = Path.of(spillRoot).toAbsolutePath().normalize();
+                }
+                if (finalPath.startsWith(spillBase)) {
+                    return finalPath;
+                }
             }
-            throw new IOException("Access denied: path outside working directory");
+            throw new IOException("Access denied: symlink escapes working directory");
         }
-        // If the target exists, follow symlinks via toRealPath so a symlink can't escape `base`.
-        if (Files.exists(resolved, LinkOption.NOFOLLOW_LINKS) && Files.isSymbolicLink(resolved)) {
-            Path real = resolved.toRealPath();
-            Path realBase = base.toRealPath();
-            if (!real.startsWith(realBase)) {
-                throw new IOException("Access denied: symlink escapes working directory");
-            }
-            return real;
-        }
-        return resolved;
+        return finalPath;
     }
     
     // Same as safeResolve but also verifies result is a file (not directory)
@@ -750,8 +768,18 @@ public final class CodeMCP {
     }
 
     private static Job startJob(String command, String cwd) {
+        return startJobImpl(shellCmd(command), command, cwd);
+    }
+
+    // Like startJob but spawns argv directly (no shell interpolation): use for
+    // tool inputs that must never reach a shell (e.g. preview URL).
+    private static Job startJobArgv(String[] argv, String displayCommand, String cwd) {
+        return startJobImpl(argv, displayCommand, cwd);
+    }
+
+    private static Job startJobImpl(String[] argv, String displayCommand, String cwd) {
         String id = "j" + jobSeq.incrementAndGet();
-        ProcessBuilder pb = new ProcessBuilder(shellCmd(command));
+        ProcessBuilder pb = new ProcessBuilder(argv);
         pb.directory(new File(cwd));
         pb.redirectInput(ProcessBuilder.Redirect.PIPE);
         pb.redirectErrorStream(true);
@@ -764,7 +792,7 @@ public final class CodeMCP {
             final StringBuilder sb = new StringBuilder();
             final Job job;
             try {
-                job = registerJob(id, command, process, sb);
+                job = registerJob(id, displayCommand, process, sb);
             } catch (RuntimeException e) {
                 process.descendants().forEach(ProcessHandle::destroyForcibly);
                 process.destroyForcibly();
@@ -778,7 +806,10 @@ public final class CodeMCP {
                     int code = process.waitFor();
                     job.status = "exited";
                     job.exitCode = code;
-                    // Keep entry so view_job after exit still works (matches Python/TS).
+                    // Keep the entry briefly so view_job after exit still works,
+                    // then evict so the map cannot grow without bound (leak guard).
+                    CompletableFuture.delayedExecutor(1, TimeUnit.HOURS)
+                            .execute(() -> jobs.remove(id, job));
                 } catch (InterruptedException e) {
                     // Flip status so view_job stops reporting "running" forever if the waiter is interrupted.
                     job.status = "exited";
@@ -1641,6 +1672,16 @@ public final class CodeMCP {
     // --- read tool ---
     private static String handleRead(String cwd, String path, int[] range, boolean noTruncate) throws IOException {
         Path file = safeResolveFile(cwd, path, true);
+        // Memory-DoS guard: never buffer a huge file (or device node) whole.
+        // Devices/FIFOs report size 0, so also reject non-regular files.
+        if (!Files.isRegularFile(file)) {
+            throw new IOException("not a regular file");
+        }
+        long size = Files.size(file);
+        if (size > MAX_READ_BYTES) {
+            throw new IOException("file too large (" + size + " bytes > " + MAX_READ_BYTES
+                    + "); use a range, or grep the file instead");
+        }
         String content = Files.readString(file);
         if (range != null) {
             if (range.length != 2) throw new RuntimeException("range must be [start, end]");
@@ -1787,18 +1828,35 @@ public final class CodeMCP {
     
     // --- grep tool ---
     private static String handleGrep(String cwd, String pattern, String path, String glob) throws Exception {
+        // The search root must stay inside the cwd sandbox (like read/write):
+        // pass the RESOLVED path to rg/grep, never the raw caller string.
+        String searchPath;
+        if (path == null || path.isBlank() || path.equals(".")) {
+            searchPath = ".";
+        } else {
+            searchPath = safeResolveDir(cwd, path).toString();
+        }
+        if (glob != null) {
+            String g = glob.replace("\\", "/");
+            if (g.startsWith("/") || g.startsWith("~") || g.matches("^[A-Za-z]:.*")) {
+                throw new IOException("Access denied: glob must be relative");
+            }
+            for (String seg : g.split("/")) {
+                if (seg.equals("..")) throw new IOException("Access denied: glob may not contain '..'");
+            }
+        }
         String[] cmd;
         if (hasRg) {
             cmd = new String[]{"rg", "--line-number", "--no-heading", "--color=never"};
             if (glob != null) cmd = append(cmd, "--glob", glob);
             // `--` so a pattern starting with `-` isn't parsed as a flag.
-            cmd = append(cmd, "--", pattern, path != null ? path : ".");
+            cmd = append(cmd, "--", pattern, searchPath);
         } else if (isWindows && hasFindstr) {
-            cmd = new String[]{"findstr", "/r", "/n", pattern, glob != null ? path + "\\" + glob.replace("*", "*") : (path != null ? path : ".")};
+            cmd = new String[]{"findstr", "/r", "/n", pattern, glob != null ? searchPath + "\\" + glob.replace("*", "*") : searchPath};
         } else {
             cmd = new String[]{"grep", "-rEn"};
             if (glob != null) cmd = append(cmd, "--include", glob);
-            cmd = append(cmd, "--", pattern, path != null ? path : ".");
+            cmd = append(cmd, "--", pattern, searchPath);
         }
         
         // grep uses the raw runCommand body and parses it back. We pass an explicit timeout
@@ -2172,8 +2230,24 @@ public final class CodeMCP {
     // --- preview tool ---
     private static String handlePreview(String url) {
         if (!hasCloudflared) throw new RuntimeException("cloudflared not found on PATH");
+        if (url == null || url.isBlank()) throw new RuntimeException("url required");
         try {
-            Job j = startJob("cloudflared tunnel --url " + url + " --no-autoupdate 2>&1", System.getProperty("user.dir"));
+            URI uri = URI.create(url);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || host == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                throw new RuntimeException("url must be http(s)");
+            }
+            // The tunnel exposes the target to the public internet: never allow
+            // cloud-metadata / internal hosts (SSRF-as-a-service guard).
+            String h = host.toLowerCase();
+            if (h.equals("169.254.169.254") || h.equals("metadata.google.internal") || h.equals("metadata")
+                    || h.equals("localhost") || h.endsWith(".internal")) {
+                throw new RuntimeException("url targets a protected host");
+            }
+            // Spawn as argv (no shell) so the URL can never inject commands.
+            Job j = startJobArgv(new String[]{"cloudflared", "tunnel", "--url", url, "--no-autoupdate"},
+                    "cloudflared tunnel --url " + url + " --no-autoupdate", System.getProperty("user.dir"));
             Pattern pattern = Pattern.compile("https://[a-z0-9-]+\\.trycloudflare\\.com", Pattern.CASE_INSENSITIVE);
             long deadline = System.currentTimeMillis() + 20_000;
             
@@ -3253,14 +3327,14 @@ public final class CodeMCP {
                     // Read response headers (byte-level until \r\n\r\n) with cap.
                     ByteArrayOutputStream hdr = new ByteArrayOutputStream();
                     int b;
+                    int last4 = 0; // rolling window of the last 4 bytes
                     while ((b = in.read()) != -1) {
                         hdr.write(b);
                         if (hdr.size() > MAX_GATEWAY_HEADER_BYTES) {
                             throw new IOException("gateway handshake too large");
                         }
-                        byte[] cur = hdr.toByteArray();
-                        if (cur.length >= 4 && cur[cur.length - 4] == '\r' && cur[cur.length - 3] == '\n'
-                                && cur[cur.length - 2] == '\r' && cur[cur.length - 1] == '\n') {
+                        last4 = ((last4 << 8) | (b & 0xFF)) & 0xFFFFFFFF;
+                        if (last4 == 0x0D0A0D0A) { // CRLFCRLF
                             break;
                         }
                     }
@@ -3348,8 +3422,29 @@ public final class CodeMCP {
         t.start();
     }
 
+    // Bounds in-flight gateway relays: a gateway flooding faster than we drain
+    // must get an immediate busy response, never queue unboundedly or run on
+    // the WS read-loop thread (CallerRunsPolicy would stall keepalives and churn).
+    private static final Semaphore GATEWAY_DISPATCH_SLOTS = new Semaphore(64);
+
     private static void handleGatewayMessage(DataOutputStream out, String data) {
-        // Submit to dispatch pool so a slow tool call doesn't block the WebSocket read loop.
+        if (!GATEWAY_DISPATCH_SLOTS.tryAcquire()) {
+            // Backpressure: answer with a busy error instead of queueing forever.
+            try {
+                Map<String, Object> json = parseJsonObject(data);
+                Map<String, Object> req = (Map<String, Object>) json.get("request");
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("jsonrpc", "2.0");
+                err.put("id", req != null ? req.get("id") : null);
+                err.put("error", Map.of("code", -32000, "message", "gateway relay overloaded"));
+                Map<String, Object> tunnelRes = new LinkedHashMap<>();
+                tunnelRes.put("id", json.get("id"));
+                tunnelRes.put("response", err);
+                sendFrame(out, MCPRouteHandler.serializeResult(tunnelRes).getBytes(StandardCharsets.UTF_8), (byte) 0x81);
+            } catch (Exception ignored) {}
+            return;
+        }
+        // Submit to dispatch pool so a slow tool call does not block the WebSocket read loop.
         GATEWAY_DISPATCH.submit(() -> {
             try {
                 Map<String, Object> json = parseJsonObject(data);
@@ -3387,6 +3482,8 @@ public final class CodeMCP {
                 sendFrame(out, MCPRouteHandler.serializeResult(tunnelRes).getBytes(StandardCharsets.UTF_8), (byte) 0x81);
             } catch (Exception e) {
                 System.err.println("[gateway] dispatch error: " + e.getMessage());
+            } finally {
+                GATEWAY_DISPATCH_SLOTS.release();
             }
         });
     }
@@ -3434,13 +3531,19 @@ public final class CodeMCP {
             if (len < 0 || len > MAX_WS_FRAME_BYTES) {
                 throw new IOException("ws frame too large: " + len);
             }
+            // RFC 6455 5.5: control frame payloads are at most 125 bytes. Without
+            // this a 64MB ping would be buffered and echoed as a pong (memory +
+            // bandwidth amplification from a chatty gateway).
+            if ((opcode == 0x8 || opcode == 0x9 || opcode == 0xA) && len > 125) {
+                throw new IOException("ws: control frame too large: " + len);
+            }
             byte[] mask = new byte[4];
             if (masked) {
-                if (readFully(in, mask, 0, 4) != 4) break;
+                if (readFully(in, mask, 0, 4, System.currentTimeMillis() + INBOUND_DEADLINE_MS) != 4) break;
             }
             byte[] payload = new byte[(int) len];
             if (len > 0) {
-                int got = readFully(in, payload, 0, (int) len);
+                int got = readFully(in, payload, 0, (int) len, System.currentTimeMillis() + INBOUND_DEADLINE_MS);
                 if (got != (int) len) break;
             }
             if (masked) {
@@ -3460,6 +3563,11 @@ public final class CodeMCP {
                     continue;
                 case 0x0: case 0x1: case 0x2:
                     messageBuf.write(payload);
+                    // Enforce the cap across FRAGMENTS too: endless continuation
+                    // frames must not grow the message buffer without bound (OOM guard).
+                    if (messageBuf.size() > MAX_WS_FRAME_BYTES) {
+                        throw new IOException("ws: fragmented message too large");
+                    }
                     if (fin) {
                         String msg = messageBuf.toString(StandardCharsets.UTF_8);
                         messageBuf.reset();
@@ -3474,13 +3582,19 @@ public final class CodeMCP {
         }
     }
 
-    private static int readFully(InputStream in, byte[] buf, int off, int len) throws IOException {
+    private static int readFully(InputStream in, byte[] buf, int off, int len, long deadline) throws IOException {
         int total = 0;
         while (total < len) {
             int n;
             try {
                 n = in.read(buf, off + total, len - total);
             } catch (SocketTimeoutException e) {
+                // A peer that stalls mid-frame must not pin this thread forever:
+                // give up once the inbound deadline passes so the reconnect loop
+                // can fire (previously this spun on 60s socket timeouts forever).
+                if (System.currentTimeMillis() > deadline) {
+                    throw new IOException("ws: timed out mid-frame");
+                }
                 continue;
             }
             if (n == -1) break;
