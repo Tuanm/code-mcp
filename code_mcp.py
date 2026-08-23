@@ -1851,7 +1851,7 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
     global _gateway_dispatch_pool
     if _gateway_dispatch_pool is None:
         _gateway_dispatch_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=16, thread_name_prefix="gw-dispatch")
+            max_workers=24, thread_name_prefix="gw-dispatch")
     dispatch_pool = _gateway_dispatch_pool
     send_lock = threading.Lock()
 

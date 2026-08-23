@@ -3342,8 +3342,8 @@ public final class CodeMCP {
     // Bounded queue + caller-runs policy so a slow handler can't OOM the server
     // by accumulating thousands of pending tunnel messages.
     private static final ExecutorService GATEWAY_DISPATCH = new ThreadPoolExecutor(
-        4, 16, 60L, TimeUnit.SECONDS,
-        new LinkedBlockingQueue<>(64),
+        8, 32, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(128),
         r -> {
             Thread t = new Thread(r, "gw-dispatch-" + System.nanoTime());
             t.setDaemon(true);
