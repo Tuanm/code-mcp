@@ -2003,39 +2003,69 @@ async function httpSend(state: HttpServerState, body: Json): Promise<any | null>
   };
   if (state.sessionId) headers["Mcp-Session-Id"] = state.sessionId;
 
+  // Keep the abort deadline alive until the BODY is consumed: clearing it at
+  // the response headers left the body read unbounded (a stalled server could
+  // pin the request forever).
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SUBPROCESS_CALL_TIMEOUT_MS);
-  let resp: Response;
+  const resp = await fetch(state.config.url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: ctrl.signal,
+  });
   try {
-    resp = await fetch(state.config.url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
+    // Capture session ID assigned by server on initialize.
+    const sid = resp.headers.get("Mcp-Session-Id");
+    if (sid && !state.sessionId) state.sessionId = sid;
+
+    if (!resp.ok) {
+      throw new Error(`http ${resp.status}: ${await readBodyCapped(resp, MCP_HTTP_RESP_MAX)}`);
+    }
+
+    // Notifications return 202 No Content (or empty 200) — no body to parse.
+    if (resp.status === 202 || resp.headers.get("content-length") === "0") return null;
+
+    const ct = resp.headers.get("content-type") ?? "";
+    if (ct.includes("text/event-stream")) {
+      return parseSseSingleResponse(resp);
+    }
+    // Plain JSON response — read with a byte cap.
+    const text = await readBodyCapped(resp, MCP_HTTP_RESP_MAX);
+    if (!text.trim()) return null;
+    return JSON.parse(text);
   } finally {
     clearTimeout(timer);
   }
+}
 
-  // Capture session ID assigned by server on initialize.
-  const sid = resp.headers.get("Mcp-Session-Id");
-  if (sid && !state.sessionId) state.sessionId = sid;
+// Max bytes to buffer from an external MCP HTTP server (memory-DoS guard).
+const MCP_HTTP_RESP_MAX = 16 * 1024 * 1024;
 
-  if (!resp.ok) {
-    throw new Error(`http ${resp.status}: ${await resp.text()}`);
+async function readBodyCapped(resp: Response, max: number): Promise<string> {
+  const cl = Number(resp.headers.get("content-length") ?? "0");
+  if (Number.isFinite(cl) && cl > max) {
+    throw new Error(`response too large (${cl} bytes > ${max})`);
   }
-
-  // Notifications return 202 No Content (or empty 200) — no body to parse.
-  if (resp.status === 202 || resp.headers.get("content-length") === "0") return null;
-
-  const ct = resp.headers.get("content-type") ?? "";
-  if (ct.includes("text/event-stream")) {
-    return parseSseSingleResponse(resp);
+  if (!resp.body) return "";
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let out = "";
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        throw new Error(`response too large (> ${max} bytes)`);
+      }
+      out += dec.decode(value, { stream: true });
+    }
+    return out + dec.decode();
+  } finally {
+    try { reader.releaseLock(); } catch {}
   }
-  // Plain JSON response.
-  const text = await resp.text();
-  if (!text.trim()) return null;
-  return JSON.parse(text);
 }
 
 // Parse SSE stream and return the first JSON-RPC response it contains.
@@ -2045,11 +2075,17 @@ async function parseSseSingleResponse(resp: Response): Promise<any | null> {
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
+  const MAX_SSE_BUF = 8 * 1024 * 1024;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
+      // A server streaming endless events without a JSON-RPC response must not
+      // grow the buffer without bound (OOM guard).
+      if (buf.length > MAX_SSE_BUF) {
+        throw new Error(`SSE stream exceeded ${MAX_SSE_BUF} bytes without a response`);
+      }
       // Split on double-newline (SSE event separator).
       let idx;
       while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -2210,16 +2246,25 @@ async function loadAggregator(configPath: string): Promise<void> {
   }
   if (valid.length === 0) return;
 
-  // Phase 2: probe in parallel. Each probe spawns its own subprocess (or
-  // initializes its own HTTP session), so startup time is bounded by the
-  // slowest server rather than the sum.
-  const probes = valid.map(({ ns, cfg }) =>
-    probeServer(ns, cfg).then(
-      (list) => ({ ns, cfg, ok: true as const, list }),
-      (e: any) => ({ ns, cfg, ok: false as const, error: e?.message ?? String(e) }),
-    )
-  );
-  const results = await Promise.all(probes);
+  // Phase 2: probe with bounded fan-out. Each probe spawns its own subprocess
+  // (or initializes its own HTTP session), so startup time is bounded by the
+  // slowest server rather than the sum - but never fire more than
+  // MAX_PROBE_CONCURRENCY at once (resource guard).
+  const MAX_PROBE_CONCURRENCY = 5;
+  const results: Array<{ ns: string; cfg: McpServerConfig; ok: boolean; list?: any; error?: string }> = [];
+  let probeIdx = 0;
+  async function worker() {
+    while (probeIdx < valid.length) {
+      const { ns, cfg } = valid[probeIdx++];
+      try {
+        const list = await probeServer(ns, cfg);
+        results.push({ ns, cfg, ok: true, list });
+      } catch (e: any) {
+        results.push({ ns, cfg, ok: false, error: e?.message ?? String(e) });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(MAX_PROBE_CONCURRENCY, valid.length) }, worker));
 
   // Phase 3: register and log in the original config order so output is
   // deterministic regardless of which probe finished first.

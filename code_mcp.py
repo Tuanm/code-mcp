@@ -191,7 +191,8 @@ def find_on_path(name: str) -> bool:
     try:
         result = subprocess.run(
             ["which", name] if sys.platform != "win32" else ["where", name],
-            capture_output=True, timeout=5
+            capture_output=True, timeout=5,
+            env=build_child_env(),
         )
         return result.returncode == 0
     except Exception:
@@ -520,9 +521,19 @@ def multi_edit_files(edits: list[dict], cwd: str = ".") -> str:
                 text = text[:r_start] + replacement + text[r_end:]
             originals[r_path] = text
 
-        # Write all files
+        # Write all files atomically (temp + rename): a concurrent edit or a
+        # crash mid-write can no longer leave a half-written file behind.
         for resolved, new_content in originals.items():
-            Path(resolved).write_text(new_content, encoding="utf-8")
+            target = Path(resolved)
+            fd, tmp = _tempfile.mkstemp(dir=str(target.parent), prefix=".multi_edit-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(new_content)
+                os.replace(tmp, target)
+            except Exception:
+                try: os.unlink(tmp)
+                except OSError: pass
+                raise
         return "ok"
     except Exception as e:
         return f"ERROR: {e}"
@@ -629,7 +640,9 @@ def _b64url_decode(s: str) -> bytes:
 def mint_upload_session_id() -> str:
     if not token:
         raise RuntimeError("--token is required to mint upload sessions")
-    exp = int(time.time()) + UPLOAD_TTL_S
+    # exp is in MILLISECONDS - parity with Java/TS, so a session minted by
+    # any implementation verifies on any other implementation.
+    exp = int(time.time() * 1000) + UPLOAD_TTL_MS
     nonce = secrets.token_hex(8)
     payload = f"{exp}.{nonce}"
     sig = hmac.new(token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
@@ -649,7 +662,7 @@ def verify_upload_session_id(sid: str) -> tuple[bool, str]:
         if not hmac.compare_digest(sig, expected):
             return False, "bad signature"
         exp_part = payload.split(".", 1)[0]
-        if int(time.time()) > int(exp_part):
+        if int(time.time() * 1000) > int(exp_part):
             return False, "expired"
         return True, ""
     except Exception:
@@ -1068,8 +1081,10 @@ def list_directory(path: str = ".", cwd: str = ".") -> str:
         for entry in full_path.iterdir():
             try:
                 st = entry.stat()
-                prefix = "d" if entry.is_dir() else "-"
-                size = st.st_size if entry.is_file() else 0
+                is_dir = stat.S_ISDIR(st.st_mode)
+                is_file = stat.S_ISREG(st.st_mode)
+                prefix = "d" if is_dir else "-"
+                size = st.st_size if is_file else 0
                 entries.append(f"{prefix}{size:>10} {entry.name}")
             except PermissionError:
                 entries.append(f"? {entry.name}")
@@ -1641,10 +1656,7 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
             frame.extend(struct.pack(">Q", length))
         mask = secrets.token_bytes(4)
         frame.extend(mask)
-        masked = bytearray(data)
-        for i in range(len(masked)):
-            masked[i] ^= mask[i & 3]
-        frame.extend(masked)
+        frame.extend(_apply_mask(data, mask))
         sock.sendall(bytes(frame))
 
     def recv_ws_frame(sock) -> bytes | None:
@@ -1699,7 +1711,7 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                 if length > 0:
                     payload = _recv_exact(sock, length) or b""
                     if masked and mask_key:
-                        payload = bytes(p ^ mask_key[i & 3] for i, p in enumerate(payload))
+                        payload = _apply_mask(payload, mask_key)
                 # Control frames (0x8 close, 0x9 ping, 0xA pong) — never fragmented.
                 if opcode == 0x8:
                     # Close: best-effort echo and bail.
@@ -1751,10 +1763,7 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
             frame.extend(struct.pack(">Q", length))
         mask = secrets.token_bytes(4)
         frame.extend(mask)
-        masked = bytearray(data)
-        for i in range(len(masked)):
-            masked[i] ^= mask[i & 3]
-        frame.extend(masked)
+        frame.extend(_apply_mask(data, mask))
         sock.sendall(bytes(frame))
 
     def handle_request(req: dict) -> dict:
@@ -1791,6 +1800,17 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
             final_text = text if skip_spill else maybe_spill_text(text, tool_name)
             result = {"content": [{"type": "text", "text": final_text}]}
         return jsonrpc_response(req_id, result)
+
+    def _apply_mask(data: bytes, mask: bytes) -> bytes:
+        """XOR a WS payload with its 4-byte mask via big-int math (~10-50x faster
+        than the naive per-byte loop; matters for near-64MB frames)."""
+        if not data:
+            return data
+        n = len(data)
+        # Repeat the 4-byte mask as a BYTE SEQUENCE (mask * repeats), then XOR
+        # the big-int views: all C-speed, no Python per-byte loop.
+        stream = (mask * ((n + 3) // 4))[:n]
+        return (int.from_bytes(data, "big") ^ int.from_bytes(stream, "big")).to_bytes(n, "big")
 
     WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     # Singleton pool reused across reconnects so a churning gateway can't leak

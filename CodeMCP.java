@@ -1878,7 +1878,7 @@ public final class CodeMCP {
                 exitCode = -1;
             }
         }
-        if (!output.isEmpty()) return output;
+        if (!output.isEmpty()) return maybeSpillText(output, "grep");
         if (exitCode == 1) return "(no matches)";
         return "ERROR (exit=" + exitCode + "): " + output;
     }
@@ -1924,8 +1924,10 @@ public final class CodeMCP {
         AtomicBoolean aborted = new AtomicBoolean(false);
         
         ExecutorService exec = Executors.newSingleThreadExecutor();
+        java.util.concurrent.atomic.AtomicReference<java.util.stream.Stream<Path>> walkRef = new java.util.concurrent.atomic.AtomicReference<>();
         Future<?> future = exec.submit(() -> {
             try (var stream = Files.walk(base, hasRecursive ? Integer.MAX_VALUE : 1)) {
+                walkRef.set(stream);
                 stream.forEach(p -> {
                     if (aborted.get()) return;
                     if (results.size() >= 10_000) {
@@ -1965,6 +1967,12 @@ public final class CodeMCP {
             future.get(30, TimeUnit.SECONDS);
         } catch (Exception e) {
             aborted.set(true);
+            // Close the stream so the walker stops promptly instead of
+            // burning CPU/IO after the response was already sent.
+            java.util.stream.Stream<Path> s = walkRef.get();
+            if (s != null) {
+                try { s.close(); } catch (Exception ignored) {}
+            }
         } finally {
             exec.shutdownNow();
         }
@@ -2401,7 +2409,7 @@ public final class CodeMCP {
                 writeJsonResponse(exchange, 413, "{\"error\":\"request too large\"}");
                 return;
             }
-            String body = readBodyCapped(exchange.getRequestBody(), MAX_REQUEST_BYTES);
+            String body = readBodyCapped(exchange, MAX_REQUEST_BYTES);
 
             String idStr;
             try {
@@ -2458,17 +2466,34 @@ public final class CodeMCP {
             }
         }
 
-        private static String readBodyCapped(InputStream in, long maxBytes) throws IOException {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            long total = 0;
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                total += n;
-                if (total > maxBytes) throw new IOException("request body exceeds " + maxBytes + " bytes");
-                out.write(buf, 0, n);
+        // A client that trickles bytes (slowloris) must not pin an HTTP thread
+        // forever: run the body read under a watchdog that force-closes the
+        // exchange after BODY_READ_TIMEOUT_MS (com.sun.net.httpserver exposes
+        // no socket SO_TIMEOUT, so this is the portable guard).
+        private static final long BODY_READ_TIMEOUT_MS = 120_000;
+
+        private static String readBodyCapped(HttpExchange exchange, long maxBytes) throws IOException {
+            Thread watchdog = new Thread(() -> {
+                try { Thread.sleep(BODY_READ_TIMEOUT_MS); exchange.close(); }
+                catch (InterruptedException ignored) {}
+            });
+            watchdog.setDaemon(true);
+            watchdog.start();
+            try {
+                InputStream in = exchange.getRequestBody();
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                long total = 0;
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    total += n;
+                    if (total > maxBytes) throw new IOException("request body exceeds " + maxBytes + " bytes");
+                    out.write(buf, 0, n);
+                }
+                return out.toString(StandardCharsets.UTF_8);
+            } finally {
+                watchdog.interrupt();
             }
-            return out.toString(StandardCharsets.UTF_8);
         }
         
         private String parseQueryParam(URI uri, String param) {
@@ -2948,7 +2973,8 @@ public final class CodeMCP {
 
                 List<int[]> parts = splitMultipart(body, boundary);
                 String fileName = null;
-                byte[] fileContent = null;
+                int fileContentStart = -1;
+                int fileContentEnd = -1;
                 for (int[] range : parts) {
                     int hdrEnd = findBytes(body, range[0], range[1], new byte[]{'\r','\n','\r','\n'});
                     if (hdrEnd < 0) continue;
@@ -2962,11 +2988,14 @@ public final class CodeMCP {
                     if (contentEnd - 2 >= contentStart && body[contentEnd - 2] == '\r' && body[contentEnd - 1] == '\n') {
                         contentEnd -= 2;
                     }
-                    fileContent = Arrays.copyOfRange(body, contentStart, contentEnd);
+                    // Slice WITHOUT copying: write/hash the sub-range in place
+                    // so peak RAM stays 1x body instead of 2x per upload.
+                    fileContentStart = contentStart;
+                    fileContentEnd = contentEnd;
                     break;
                 }
 
-                if (fileName == null || fileContent == null) {
+                if (fileName == null || fileContentStart < 0) {
                     writeJson(exchange, 400, "{\"error\":\"no file provided\"}");
                     return;
                 }
@@ -2982,22 +3011,48 @@ public final class CodeMCP {
 
                 Path uploadDir = Path.of(uploadRoot, sessionId);
                 Files.createDirectories(uploadDir);
+                // A local attacker who guesses a session id must not redirect
+                // the write via a pre-created symlink under the tmpdir.
+                if (Files.isSymbolicLink(uploadDir) || !Files.isDirectory(uploadDir)) {
+                    writeJson(exchange, 500, "{\"error\":\"upload path invalid\"}");
+                    return;
+                }
+                try { Files.setPosixFilePermissions(uploadDir, java.nio.file.attribute.PosixFilePermissions.fromString("rwx------")); } catch (UnsupportedOperationException ignored) {}
                 Path filePath = uploadDir.resolve(fileName);
-                Files.write(filePath, fileContent,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(filePath,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                    ch.write(ByteBuffer.wrap(body, fileContentStart, fileContentEnd - fileContentStart));
+                }
+                try { Files.setPosixFilePermissions(filePath, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")); } catch (UnsupportedOperationException ignored) {}
 
                 MessageDigest md = MessageDigest.getInstance("SHA-256");
-                byte[] hash = md.digest(fileContent);
+                md.update(body, fileContentStart, fileContentEnd - fileContentStart);
+                byte[] hash = md.digest();
                 StringBuilder hashHex = new StringBuilder();
                 for (byte b : hash) hashHex.append(String.format("%02x", b));
 
                 String mime = Files.probeContentType(filePath);
                 if (mime == null) mime = "application/octet-stream";
 
+                // TTL sweep: links expire after 10 minutes; drop stale session
+                // dirs so a long-lived server cannot fill the disk.
+                long cutoff = System.currentTimeMillis() - 900_000L;
+                try (var stream = Files.list(Path.of(uploadRoot))) {
+                    stream.filter(Files::isDirectory).forEach(d -> {
+                        try {
+                            if (!Files.isSymbolicLink(d) && Files.getLastModifiedTime(d).toMillis() < cutoff) {
+                                Files.walk(d).sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                                    try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                                });
+                            }
+                        } catch (IOException ignored) {}
+                    });
+                } catch (IOException ignored) {}
+
                 String response = String.format(
                     "{\"path\":%s,\"size\":%d,\"sha256\":%s,\"mime\":%s}",
                     jsonQuote(filePath.toString()),
-                    fileContent.length,
+                    fileContentEnd - fileContentStart,
                     jsonQuote(hashHex.toString()),
                     jsonQuote(mime));
                 writeJson(exchange, 200, response);
@@ -3366,7 +3421,7 @@ public final class CodeMCP {
 
                     retries = 0;
                     System.err.println("[gateway] connected, registering as " + deviceId);
-                    String register = "{\"type\":\"register\",\"deviceId\":\"" + deviceId + "\"}";
+                    String register = "{\"type\":\"register\",\"deviceId\":\"" + escapeJson(deviceId) + "\"}";
                     sendFrame(out, register.getBytes(StandardCharsets.UTF_8), (byte) 0x81);
 
                     // Proactive app-layer keepalive every 25s.
