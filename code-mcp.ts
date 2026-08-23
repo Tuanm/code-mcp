@@ -3584,7 +3584,12 @@ if (gatewayDomain) {
         // tools). Bypassing the local HTTP round trip removes per-call TCP +
         // HTTP overhead and keeps the relay responsive under heavy load.
         const resp = await handle(msg.request as Json);
-        if (resp === null) return; // notification — no response body
+        if (resp === null) {
+          // Notification: acknowledge with response:null so the gateway
+          // answers 204 No Content (strict clients reject error bodies).
+          ws.send(JSON.stringify({ id: msg.id, response: null }));
+          return;
+        }
         ws.send(JSON.stringify({ id: msg.id, response: resp }));
       } catch (err) {
         console.error(`[${deviceId}] handle error:`, err);

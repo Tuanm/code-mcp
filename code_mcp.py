@@ -1797,8 +1797,11 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "code-mcp", "version": "0.1.0"},
             })
-        if method == "notifications/initialized":
-            return {}  # no response needed
+        if method and method.startswith("notifications/"):
+            # Notification: no response body. The relay sends response:null so
+            # the gateway answers 204 No Content (strict clients reject error
+            # bodies for notifications).
+            return None
         if method == "ping":
             return jsonrpc_response(req_id, {})
         if method == "tools/list":

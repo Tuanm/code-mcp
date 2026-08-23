@@ -3557,7 +3557,10 @@ public final class CodeMCP {
                 Map<String, Object> mcpRes;
                 try {
                     String respBody = MCPRouteHandler.handleMcpBody(MCPRouteHandler.serializeResult(req));
-                    mcpRes = parseJsonObject(respBody != null ? respBody : "{}");
+                    // Notification: handleMcpBody returns null -> reply
+                    // response:null so the gateway answers 204 No Content
+                    // (strict clients reject error bodies for notifications).
+                    mcpRes = respBody == null ? null : parseJsonObject(respBody);
                 } catch (Exception e) {
                     Map<String, Object> err = new LinkedHashMap<>();
                     err.put("jsonrpc", "2.0");
