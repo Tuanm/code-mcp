@@ -1240,7 +1240,20 @@ def _shell_tool_description() -> str:
             f"the job id). Pass an explicit timeout_ms to force kill-on-timeout instead.")
 
 
+# tools/list is built on every request; cache it (the tool set is static
+# after startup apart from aggregator loads, which invalidate the cache).
+_tools_list_cache: Optional[list[dict]] = None
+
+
+def invalidate_tools_list() -> None:
+    global _tools_list_cache
+    _tools_list_cache = None
+
+
 def build_tools_list() -> list[dict]:
+    global _tools_list_cache
+    if _tools_list_cache is not None:
+        return _tools_list_cache
     tools: list[dict] = [
         {"name": "read", "description": "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "range": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "no_truncate": {"type": "boolean"}}, "required": ["cwd", "path"]}},
@@ -1290,7 +1303,8 @@ def build_tools_list() -> list[dict]:
         tools.append({"name": "get_upload_link",
                       "description": "Return a short-lived upload URL (10-minute TTL) for sending a file to the local machine.",
                       "inputSchema": {"type": "object", "properties": {}}})
-    return [t for t in tools if t["name"] not in disallowed_tools]
+    _tools_list_cache = [t for t in tools if t["name"] not in disallowed_tools]
+    return _tools_list_cache
 
 
 def dispatch_tool(tool_name: str, params: dict) -> Any:
@@ -1793,12 +1807,31 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
             tool_name = method
             tool_params = params if isinstance(params, dict) else {}
 
+        if is_tools_call:
+            # Aggregated tools (--mcp): forward upstream content blocks untouched
+            # (parity with the HTTP /mcp handler).
+            with aggregator_lock:
+                is_aggregated = tool_name in aggregator_tools
+            if is_aggregated:
+                try:
+                    raw = call_aggregated_raw(tool_name, tool_params if isinstance(tool_params, dict) else {})
+                    if isinstance(raw, dict) and isinstance(raw.get("content"), list):
+                        return jsonrpc_response(req_id, raw)
+                    text = json.dumps(raw, ensure_ascii=False) if not isinstance(raw, str) else raw
+                    return jsonrpc_response(req_id, {"content": [{"type": "text", "text": text}]})
+                except Exception as e:
+                    return jsonrpc_response(req_id, {"content": [{"type": "text", "text": f"ERROR: {e}"}]})
+
         result = dispatch_tool(tool_name, tool_params)
         if is_tools_call:
             text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             skip_spill = tool_name == "read" and isinstance(tool_params, dict) and bool(tool_params.get("no_truncate"))
             final_text = text if skip_spill else maybe_spill_text(text, tool_name)
             result = {"content": [{"type": "text", "text": final_text}]}
+            return jsonrpc_response(req_id, result)
+        # Raw methods: emit a proper JSON-RPC error for "method not found".
+        if isinstance(result, str) and result.startswith("ERROR:-32601:"):
+            return jsonrpc_error(req_id, -32601, result[len("ERROR:-32601:"):].strip())
         return jsonrpc_response(req_id, result)
 
     def _apply_mask(data: bytes, mask: bytes) -> bytes:
@@ -1818,7 +1851,7 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
     global _gateway_dispatch_pool
     if _gateway_dispatch_pool is None:
         _gateway_dispatch_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=8, thread_name_prefix="gw-dispatch")
+            max_workers=16, thread_name_prefix="gw-dispatch")
     dispatch_pool = _gateway_dispatch_pool
     send_lock = threading.Lock()
 
@@ -1961,24 +1994,17 @@ def start_gateway_client(domain: str, device_id: str | None, gw_token: str | Non
                 try:
                     tunnel_req = msg["request"]
                     tunnel_id = msg["id"]
-                    tok = msg.get("token")
-                    token_param = f"?token={tok}" if tok else ""
-                    local_url = f"http://127.0.0.1:{port}/mcp{token_param}"
-                    req_data = json.dumps(tunnel_req, ensure_ascii=False).encode("utf-8")
-                    http_req = urllib.request.Request(
-                        local_url, data=req_data,
-                        headers={"Content-Type": "application/json; charset=utf-8"})
-                    try:
-                        http_resp = urllib.request.urlopen(http_req, timeout=30)
-                        raw = http_resp.read(MAX_GATEWAY_RESP_BYTES + 1)
-                        if len(raw) > MAX_GATEWAY_RESP_BYTES:
-                            resp_obj = {"jsonrpc": "2.0", "id": tunnel_req.get("id"),
-                                        "error": {"code": -32603, "message": "tool response too large"}}
-                        else:
-                            resp_obj = json.loads(raw.decode("utf-8", errors="replace"))
-                    except Exception as e:
-                        resp_obj = {"jsonrpc": "2.0", "id": tunnel_req.get("id"),
-                                    "error": {"code": -32603, "message": str(e)}}
+                    # In-process dispatch: handle_request mirrors the local /mcp
+                    # handler (initialize, ping, tools/list, tools/call, raw
+                    # methods, aggregated tools, spill). Bypassing the local HTTP
+                    # round trip removes ~20ms latency per call plus the
+                    # per-request TCP connection, and keeps the gateway relay
+                    # responsive under heavy concurrent load.
+                    if isinstance(tunnel_req, dict):
+                        resp_obj = handle_request(tunnel_req)
+                    else:
+                        resp_obj = {"jsonrpc": "2.0", "id": None,
+                                    "error": {"code": -32600, "message": "invalid request"}}
                     tunnel_resp = {"id": tunnel_id, "response": resp_obj}
                     safe_send(sock_ref, json.dumps(tunnel_resp, ensure_ascii=False).encode("utf-8"))
                 except Exception as e:
@@ -2677,6 +2703,7 @@ def load_aggregator(config_path: str) -> None:
                 for entry in entries:
                     prefixed_name = f"{ns}__{entry['tool']}"
                     aggregator_tools[prefixed_name] = entry
+                    invalidate_tools_list()
             print(f"[mcp] probed '{ns}' (stdio): {len(entries)} tool(s) cached", file=sys.stderr)
 
 

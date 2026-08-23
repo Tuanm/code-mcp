@@ -2370,6 +2370,42 @@ public final class CodeMCP {
             }
         }
         
+        // In-process JSON-RPC dispatch mirroring handleMcpRequest: used by the
+        // gateway relay path so tunneled calls skip the local HTTP round trip.
+        // Returns the response body string, or null for notifications.
+        private static String handleMcpBody(String body) {
+            try {
+                Map<String, Object> request = parseJsonObject(body);
+                String idStr = request.containsKey("id") ? toJson(request.get("id")) : "null";
+                String method = (String) request.get("method");
+                @SuppressWarnings("unchecked")
+                Object paramsObj = request.get("params");
+                if (paramsObj != null && !(paramsObj instanceof Map)) {
+                    return "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"error\":{\"code\":-32602,\"message\":\"Invalid params: expected object\"}}";
+                }
+                Map<String, Object> params = (Map<String, Object>) paramsObj;
+                if (method != null && method.startsWith("notifications/")) {
+                    return null; // notification - no response body
+                }
+                Object result = handleMcpMethod(method, params);
+                if (result instanceof String && ((String) result).startsWith("ERROR")) {
+                    String errMsg = (String) result;
+                    int code = -32603;
+                    if (errMsg.startsWith("ERROR:-32601:")) {
+                        code = -32601;
+                        errMsg = errMsg.substring("ERROR:-32601:".length()).trim();
+                    } else if (errMsg.startsWith("ERROR:-32602:")) {
+                        code = -32602;
+                        errMsg = errMsg.substring("ERROR:-32602:".length()).trim();
+                    }
+                    return "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"error\":{\"code\":" + code + ",\"message\":" + jsonQuote(errMsg) + "}}";
+                }
+                return "{\"jsonrpc\":\"2.0\",\"id\":" + idStr + ",\"result\":" + serializeResult(result) + "}";
+            } catch (Exception e) {
+                return "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":" + jsonQuote(e.getMessage()) + "}}";
+            }
+        }
+
         private void handleMcpRequest(HttpExchange exchange) throws IOException {
             Headers headers = exchange.getResponseHeaders();
             headers.add("Access-Control-Allow-Origin", "*");
@@ -2519,7 +2555,7 @@ public final class CodeMCP {
             return null;
         }
         
-        private String jsonQuote(String s) {
+        private static String jsonQuote(String s) {
             if (s == null) return "\"\"";
             return "\"" + escapeJson(s) + "\"";
         }
@@ -2922,7 +2958,7 @@ public final class CodeMCP {
             exchange.close();
         }
         
-        private String jsonQuote(String s) {
+        private static String jsonQuote(String s) {
             if (s == null) return "\"\"";
             return "\"" + escapeJson(s) + "\"";
         }
@@ -3508,20 +3544,13 @@ public final class CodeMCP {
                 Map<String, Object> req = (Map<String, Object>) json.get("request");
                 String tok = json.containsKey("token") ? String.valueOf(json.get("token")) : null;
 
-                String tokenParam = (tok != null && !tok.isBlank()) ? "?token=" + tok : "";
-                String localUrl = "http://127.0.0.1:" + port + "/mcp" + tokenParam;
-
-                HttpRequest httpReq = HttpRequest.newBuilder()
-                        .uri(URI.create(localUrl))
-                        .header("Content-Type", "application/json")
-                        .timeout(java.time.Duration.ofSeconds(60))
-                        .POST(HttpRequest.BodyPublishers.ofString(MCPRouteHandler.serializeResult(req), StandardCharsets.UTF_8))
-                        .build();
-
+                // In-process dispatch: handleMcpBody mirrors the /mcp HTTP handler
+                // exactly, so tunneled calls skip the local HTTP round trip
+                // (per-call TCP + HTTP overhead) - critical under heavy load.
                 Map<String, Object> mcpRes;
                 try {
-                    HttpResponse<String> httpRes = GATEWAY_HTTP.send(httpReq, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-                    mcpRes = parseJsonObject(httpRes.body());
+                    String respBody = MCPRouteHandler.handleMcpBody(MCPRouteHandler.serializeResult(req));
+                    mcpRes = parseJsonObject(respBody != null ? respBody : "{}");
                 } catch (Exception e) {
                     Map<String, Object> err = new LinkedHashMap<>();
                     err.put("jsonrpc", "2.0");

@@ -3505,7 +3505,6 @@ if (makePublic) {
 // tunnel remote requests to the local MCP handler.
 if (gatewayDomain) {
   const deviceId = assignedDeviceId ?? randomUUID();
-  const localMcpUrl = `http://127.0.0.1:${port}/mcp`;
   const BASE_DELAY_MS = 1000;
   const MAX_DELAY_MS = 60_000;
   let retries = 0;
@@ -3569,14 +3568,12 @@ if (gatewayDomain) {
         const msg = JSON.parse(e.data as string) as { id?: string; request?: Json; token?: string; type?: string };
         if (msg.type === "keepalive-ack") return;
         if (msg.id == null || !msg.request) return;
-        const tokenParam = msg.token ? `?token=${msg.token}` : "";
-        const res = await fetch(`${localMcpUrl}${tokenParam}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(msg.request),
-          signal: AbortSignal.timeout(60_000),
-        });
-        const resp = await res.json();
+        // In-process dispatch: handle() mirrors the /mcp HTTP handler exactly
+        // (initialize, ping, tools/list, tools/call, raw methods, aggregated
+        // tools). Bypassing the local HTTP round trip removes per-call TCP +
+        // HTTP overhead and keeps the relay responsive under heavy load.
+        const resp = await handle(msg.request as Json);
+        if (resp === null) return; // notification — no response body
         ws.send(JSON.stringify({ id: msg.id, response: resp }));
       } catch (err) {
         console.error(`[${deviceId}] handle error:`, err);
