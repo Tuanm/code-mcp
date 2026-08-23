@@ -106,6 +106,7 @@ public final class CodeMCP {
     private static int port = DEFAULT_PORT;
     private static String bindAddr = DEFAULT_BIND;
     private static String token = null;
+    private static String gatewayToken = null;  // device credential for the /ws upgrade (defaults to token)
     private static boolean memoryEnabled = false;
     private static boolean makePublic = false;
     private static String domain = null;
@@ -197,7 +198,7 @@ public final class CodeMCP {
         // Start gateway client if --gateway is set
         if (gatewayDomain != null) {
             try {
-                startGatewayClient(gatewayDomain, assignedDeviceId);
+                startGatewayClient(gatewayDomain, assignedDeviceId, gatewayToken != null ? gatewayToken : token);
             } catch (Exception e) {
                 System.err.println("[gateway] failed to start: " + e.getMessage());
             }
@@ -256,6 +257,10 @@ public final class CodeMCP {
                     if (++i >= args.length) usage();
                     assignedDeviceId = args[i];
                 }
+                case "--gateway-token" -> {
+                    if (++i >= args.length) usage();
+                    gatewayToken = args[i];
+                }
                 case "--disallowed-tools" -> {
                     if (++i >= args.length) usage();
                     for (String t : args[i].split(",")) {
@@ -299,6 +304,9 @@ public final class CodeMCP {
           --mcp <path>                Aggregate tools from external MCP servers (JSON config)
           --gateway <domain>          Connect to gateway server (wss://{domain}/ws)
           --id <uuid>                 Use specific device ID for gateway connection
+          --gateway-token <s>         Device credential sent to the gateway on connect
+                                      (defaults to --token; must match the token registered
+                                      for --id in the gateway device registry)
           --disallowed-tools <list>   Comma-separated tools to disable
           -h, --help                  Show this help and exit
         """;
@@ -357,6 +365,11 @@ public final class CodeMCP {
             throw new IOException("Expected directory, got file: " + userPath);
         }
         return p;
+    }
+
+    // Parity with Python/TS: a missing cwd defaults to the process working directory.
+    private static String effCwd(String cwd) {
+        return (cwd == null || cwd.isBlank()) ? System.getProperty("user.dir") : cwd;
     }
     
     // ===== SECURITY: SHELL ESCAPING =====
@@ -2583,7 +2596,8 @@ public final class CodeMCP {
                     String name = params != null ? (String) params.get("name") : null;
                     @SuppressWarnings("unchecked")
                     Map<String, Object> args = params != null ? (Map<String, Object>) params.get("arguments") : Map.of();
-                    
+                    String cwd = effCwd((String) args.get("cwd"));
+
                     if (name == null) {
                         yield "ERROR: tool name required";
                     }
@@ -2615,16 +2629,16 @@ public final class CodeMCP {
                     try {
                         result = switch (name) {
                             case "read" -> handleRead(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("path"),
                                 parseRange(args.get("range")),
                                 Boolean.TRUE.equals(args.get("no_truncate")));
                             case "write" -> handleWrite(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("path"),
                                 (String) args.get("content"));
                             case "edit" -> handleEdit(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("path"),
                                 (String) args.get("old_str"),
                                 (String) args.get("new_str"));
@@ -2634,39 +2648,39 @@ public final class CodeMCP {
                                 List<Edit> edits = editsRaw.stream()
                                     .map(e -> new Edit(e.get("path"), e.get("old_str"), e.get("new_str")))
                                     .collect(Collectors.toList());
-                                yield handleMultiEdit((String) args.get("cwd"), edits);
+                                yield handleMultiEdit(cwd, edits);
                             }
                             case "bash" -> handleBash(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("command"),
                                 parseNumber(args.get("timeout_ms")));
                             case "shell" -> handleShell(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("command"),
                                 parseNumber(args.get("timeout_ms")));
                             case "command" -> handleCommand(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("command"),
                                 parseNumber(args.get("timeout_ms")));
                             case "powershell" -> handlePowershell(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("command"),
                                 parseNumber(args.get("timeout_ms")));
                             case "grep" -> handleGrep(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("pattern"),
                                 (String) args.get("path"),
                                 (String) args.get("glob"));
                             case "find" -> handleFind(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("pattern"),
                                 (String) args.get("path"),
                                 Boolean.TRUE.equals(args.get("include_hidden")));
                             case "ls" -> handleLs(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("path"));
                             case "job" -> handleJob(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("mode"),
                                 (String) args.get("command"),
                                 parseNumber(args.get("timeout_ms")));
@@ -2674,30 +2688,30 @@ public final class CodeMCP {
                             case "remember" -> {
                                 @SuppressWarnings("unchecked")
                                 List<String> tags = (List<String>) args.get("tags");
-                                yield handleRemember((String) args.get("cwd"), (String) args.get("memo"), tags);
+                                yield handleRemember(cwd, (String) args.get("memo"), tags);
                             }
                             case "forget" -> handleForget(
-                                (String) args.get("cwd"),
+                                cwd,
                                 ((Number) args.get("memo_id")).intValue());
                             case "recall" -> {
                                 @SuppressWarnings("unchecked")
                                 List<String> tags = (List<String>) (Object) args.get("tags");
                                 yield handleRecall(
-                                    (String) args.get("cwd"),
+                                    cwd,
                                     (String) args.get("query"),
                                     tags,
                                     args.containsKey("limit") ? ((Number) args.get("limit")).intValue() : 20,
                                     args.containsKey("offset") ? ((Number) args.get("offset")).intValue() : 0);
                             }
                             case "mcp" -> handleMcp(
-                                (String) args.get("cwd"),
+                                cwd,
                                 (String) args.get("action"),
                                 (String) args.get("server"),
                                 (String) args.get("tool"),
                                 args.get("args") != null ? (Map<String, Object>) args.get("args") : Map.of(),
                                 (String) args.get("mcpConfigPath"));
                             case "get_upload_link" -> handleGetUploadLink();
-                            case "guide" -> renderGuide((String) args.get("cwd"));
+                            case "guide" -> renderGuide(cwd);
                             default -> "ERROR: unknown tool: " + name;
                         };
                     } catch (RuntimeException e) {
@@ -3173,7 +3187,7 @@ public final class CodeMCP {
         new ThreadPoolExecutor.CallerRunsPolicy());
 
     // ===== GATEWAY CLIENT =====
-    private static void startGatewayClient(String domain, String deviceIdParam) {
+    private static void startGatewayClient(String domain, String deviceIdParam, String gwToken) {
         final String deviceId = deviceIdParam != null ? deviceIdParam : UUID.randomUUID().toString();
 
         Thread t = new Thread(() -> {
@@ -3182,13 +3196,20 @@ public final class CodeMCP {
             while (!shuttingDown) {
                 Socket sock = null;
                 try {
+                    // Normalize the gateway domain: accept bare host, ws(s):// or http(s)://
+                    // prefixes (README examples use wss://). Bare hosts default to wss
+                    // for anything that is not a loopback/LAN address.
                     boolean isLocal = domain.startsWith("localhost") || domain.startsWith("127.") ||
                             domain.startsWith("192.168.") || domain.startsWith("10.") ||
                             domain.startsWith("172.16.") || domain.startsWith("ws://") || domain.startsWith("http://");
-                    String scheme = isLocal ? "ws" : "wss";
-                    String baseUrl = domain.startsWith("wss://") || domain.startsWith("https://")
-                            ? domain.replace("https://", "wss://")
-                            : scheme + "://" + domain;
+                    String baseUrl;
+                    if (domain.startsWith("wss://") || domain.startsWith("https://")) {
+                        baseUrl = domain.replace("https://", "wss://");
+                    } else if (domain.startsWith("ws://") || domain.startsWith("http://")) {
+                        baseUrl = domain.replace("http://", "ws://");
+                    } else {
+                        baseUrl = (isLocal ? "ws://" : "wss://") + domain;
+                    }
                     String url = deviceIdParam != null
                             ? baseUrl + "/ws/" + deviceIdParam
                             : baseUrl + "/ws";
@@ -3214,11 +3235,18 @@ public final class CodeMCP {
                     WS_RNG.nextBytes(keyBytes);
                     String wsKey = Base64.getEncoder().encodeToString(keyBytes);
                     String hostHeader = (gatewayPort == 80 || gatewayPort == 443) ? host : host + ":" + gatewayPort;
+                    // Device credential for the gateway: sent as X-Device-Token so the
+                    // registry-backed /ws auth accepts the upgrade. Without it the
+                    // hardened gateway answers 401 (legacy gateways ignore the header).
+                    // Defensive: never let a token inject headers into the handshake.
+                    String safeTok = gwToken == null ? "" : gwToken.replace("\r", "").replace("\n", "");
+                    String tokenHeader = safeTok.isEmpty() ? "" : "X-Device-Token: " + safeTok + "\r\n";
                     String request = "GET " + wsPath + " HTTP/1.1\r\n" +
                             "Host: " + hostHeader + "\r\n" +
                             "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
                             "Sec-WebSocket-Key: " + wsKey + "\r\nSec-WebSocket-Version: 13\r\n" +
-                            "User-Agent: code-mcp/0.1.0\r\n\r\n";
+                            "User-Agent: code-mcp/0.1.0\r\n" +
+                            tokenHeader + "\r\n";
                     out.write(request.getBytes(StandardCharsets.US_ASCII));
                     out.flush();
 
@@ -3239,7 +3267,11 @@ public final class CodeMCP {
                     String headersText = hdr.toString(StandardCharsets.ISO_8859_1);
                     String[] hdrLines = headersText.split("\r\n");
                     if (hdrLines.length == 0 || !hdrLines[0].contains(" 101 ")) {
-                        throw new IOException("WebSocket upgrade failed: " + (hdrLines.length > 0 ? hdrLines[0] : "<empty>"));
+                        String statusLine = hdrLines.length > 0 ? hdrLines[0] : "<empty>";
+                        String hint = statusLine.contains("401")
+                                ? " (device auth failed: pass --token or --gateway-token matching the token registered for --id in the gateway)"
+                                : "";
+                        throw new IOException("WebSocket upgrade failed: " + statusLine + hint);
                     }
                     String accept = null;
                     for (int i = 1; i < hdrLines.length; i++) {

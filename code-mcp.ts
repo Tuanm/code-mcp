@@ -127,6 +127,9 @@ Options:
   --mcp <path>           Aggregate tools from external MCP servers (JSON config)
   --gateway <domain>     Connect to gateway server (wss://{domain}/ws)
   --id <uuid>            Use specific device ID for gateway connection
+  --gateway-token <s>    Device credential sent to the gateway on connect
+                         (defaults to --token; must match the token registered
+                         for --id in the gateway device registry)
   -h, --help             Show this help and exit`;
 
 let args!: Record<string, any>;
@@ -144,6 +147,7 @@ try {
       mcp: { type: "string" },
       gateway: { type: "string" },
       id: { type: "string" },
+      "gateway-token": { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: true,
@@ -166,6 +170,10 @@ if (!Number.isFinite(port) || port < 1 || port > 65535 || !Number.isInteger(port
 }
 const bindAddr: string = typeof args.bind === "string" ? args.bind : "127.0.0.1";
 const token: string | undefined = args.token;
+// Device credential presented to the gateway on the /ws upgrade: explicit
+// --gateway-token wins, otherwise --token (the token registered for the
+// device id in the gateway is what authenticates the tunnel).
+const gatewayToken: string | undefined = args["gateway-token"] ?? token;
 const memoryEnabled = args["enable-memory"] === true;
 const disallowedTools: string[] = args["disallowed-tools"]
   ? args["disallowed-tools"].split(",").map((s: string) => s.trim()).filter(Boolean)
@@ -3283,13 +3291,26 @@ if (gatewayDomain) {
   const BASE_DELAY_MS = 1000;
   const MAX_DELAY_MS = 60_000;
   let retries = 0;
+  let everOpened = false;
 
   (function connect() {
+    // Normalize the gateway domain: accept bare host, ws(s):// or http(s)://
+    // prefixes (README examples use wss://). Bare hosts default to wss for
+    // anything that is not a loopback/LAN address.
     const isLocal = /^(localhost|127\.|192\.168\.|10\.|172\.16\.|ws:\/\/|http:\/\/)/.test(gatewayDomain);
-    const scheme = isLocal ? "ws" : "wss";
-    const url = assignedDeviceId ? `${scheme}://${gatewayDomain}/ws/${assignedDeviceId}` : `${scheme}://${gatewayDomain}/ws`;
+    let base: string;
+    if (/^wss:\/\//i.test(gatewayDomain)) base = gatewayDomain;
+    else if (/^https:\/\//i.test(gatewayDomain)) base = gatewayDomain.replace(/^https:\/\//i, "wss://");
+    else if (/^ws:\/\//i.test(gatewayDomain)) base = gatewayDomain;
+    else if (/^http:\/\//i.test(gatewayDomain)) base = gatewayDomain.replace(/^http:\/\//i, "ws://");
+    else base = (isLocal ? "ws://" : "wss://") + gatewayDomain;
+    const url = assignedDeviceId ? `${base}/ws/${assignedDeviceId}` : `${base}/ws`;
     console.error(`[${deviceId}] Connecting to gateway ${url} ...`);
-    const ws = new WebSocket(url);
+    // Device credential: the hardened gateway requires the token registered for
+    // this device id (X-Device-Token header); legacy gateways ignore it.
+    // Defensive: never let a token inject headers into the handshake.
+    const safeTok = gatewayToken?.replace(/[\r\n]/g, "");
+    const ws = new WebSocket(url, safeTok ? { headers: { "X-Device-Token": safeTok } } : undefined);
 
     // App-layer keepalive: HTTP/2 tunnels (cloudflared) can swallow WS control
     // frames, so a data-frame heartbeat is what actually proves liveness.
@@ -3311,6 +3332,7 @@ if (gatewayDomain) {
 
     ws.addEventListener("open", () => {
       console.error(`[${deviceId}] Connected to gateway`);
+      everOpened = true;
       retries = 0;
       ws.send(JSON.stringify({ type: "register", deviceId }));
       armWatchdog();
@@ -3345,6 +3367,11 @@ if (gatewayDomain) {
 
     ws.addEventListener("close", () => {
       cleanup();
+      // If the very first attempt never opened, the upgrade was rejected (e.g.
+      // 401): give an actionable hint once, then keep retrying.
+      if (!everOpened && retries === 0) {
+        console.error(`[${deviceId}] hint: gateway rejected the upgrade (likely 401) - check that --id and --token (or --gateway-token) match the device id and its registered token in the gateway`);
+      }
       // Exponential backoff with jitter — never kill the local server.
       const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** Math.min(retries, 6))
         + Math.floor(Math.random() * 500);

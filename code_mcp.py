@@ -117,6 +117,7 @@ port = DEFAULT_PORT
 bind_addr = DEFAULT_BIND
 token: Optional[str] = None
 gateway_domain: Optional[str] = None
+gateway_token: Optional[str] = None  # device credential sent on the /ws upgrade (defaults to --token)
 gateway_device_id: Optional[str] = None
 gateway_lock = threading.Lock()
 assigned_device_id: Optional[str] = None
@@ -232,6 +233,8 @@ def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None
     token = None
     gateway_domain = None
     device_id = None
+    global gateway_token
+    gateway_token = None
     memory_enabled = False
     has_cloudflared = check_cloudflared()
     mcp_config_path = None
@@ -254,6 +257,9 @@ def parse_args(args: list[str]) -> tuple[int, str | None, str | None, str | None
             i += 2
         elif arg == "--token" and i + 1 < len(args):
             token = args[i + 1]
+            i += 2
+        elif arg == "--gateway-token" and i + 1 < len(args):
+            gateway_token = args[i + 1]
             i += 2
         elif arg == "--gateway" and i + 1 < len(args):
             gateway_domain = args[i + 1]
@@ -300,6 +306,9 @@ Flags:
   --token <s>           Require ?token=<s> on every request
   --gateway <url>       Connect to gateway server (wss:// or https://)
   --id <uuid>           Use specific device ID for gateway connection
+  --gateway-token <s>   Device credential sent to the gateway on connect
+                        (defaults to --token; must match the token registered
+                        for --id in the gateway device registry)
   --enable-memory       Enable remember/forget/recall tools
   --mcp <path>          Aggregate tools from external MCP servers
   --public              Expose via Cloudflare quick tunnel (requires cloudflared)
@@ -1445,8 +1454,12 @@ class MCPRequestHandler(SimpleHTTPRequestHandler):
         self.send_json(payload, status)
 
 
-def start_gateway_client(domain: str, device_id: str | None) -> None:
-    """Connect to gateway and relay requests."""
+def start_gateway_client(domain: str, device_id: str | None, gw_token: str | None = None) -> None:
+    """Connect to gateway and relay requests.
+
+    gw_token is the device credential presented on the /ws upgrade
+    (X-Device-Token); the gateway rejects the connection with 401 without it.
+    """
     global gateway_device_id, assigned_device_id
 
     def build_url(d: str, dev_id: str | None) -> str:
@@ -1660,6 +1673,12 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
             # Host header uses the gateway host:port (not local port).
             host_header = host if gateway_port in (80, 443) else f"{host}:{gateway_port}"
+            # Device credential for the gateway: sent as X-Device-Token so the
+            # registry-backed /ws auth accepts the upgrade. Without it the
+            # hardened gateway answers 401 (legacy gateways ignore the header).
+            # Defensive: never let a token inject headers into the handshake.
+            safe_tok = (gw_token or "").replace("\r", "").replace("\n", "")
+            token_header = f"X-Device-Token: {safe_tok}\r\n" if safe_tok else ""
             request = (
                 f"GET {uri.path} HTTP/1.1\r\n"
                 f"Host: {host_header}\r\n"
@@ -1669,6 +1688,7 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
                 f"Sec-WebSocket-Version: 13\r\n"
                 f"User-Agent: code-mcp/0.1.0\r\n"
                 f"Accept: */*\r\n"
+                f"{token_header}"
                 f"\r\n"
             )
             ssock.sendall(request.encode())
@@ -1688,7 +1708,11 @@ def start_gateway_client(domain: str, device_id: str | None) -> None:
             headers_text = resp[:header_end].decode("iso-8859-1", errors="replace")
             status_line = headers_text.split("\r\n", 1)[0]
             if " 101 " not in (" " + status_line + " "):
-                print(f"[gateway] WebSocket upgrade failed: {status_line}", file=sys.stderr)
+                hint = ""
+                if "401" in status_line:
+                    hint = (" - device auth failed: pass --token (or --gateway-token) "
+                            "matching the token registered for --id in the gateway")
+                print(f"[gateway] WebSocket upgrade failed: {status_line}{hint}", file=sys.stderr)
                 ssock.close()
                 time.sleep(3)
                 continue
@@ -2619,7 +2643,8 @@ def main():
         load_aggregator(mcp_config_path)
 
     if gateway_domain:
-        t = threading.Thread(target=start_gateway_client, args=(gateway_domain, assigned_device_id), daemon=True)
+        gw_cred = gateway_token if gateway_token is not None else token
+        t = threading.Thread(target=start_gateway_client, args=(gateway_domain, assigned_device_id, gw_cred), daemon=True)
         t.start()
 
     server = ThreadingHTTPServer((bind_addr, port), MCPRequestHandler)
