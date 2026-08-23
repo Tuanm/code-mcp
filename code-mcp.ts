@@ -2015,9 +2015,11 @@ async function httpSend(state: HttpServerState, body: Json): Promise<any | null>
     signal: ctrl.signal,
   });
   try {
-    // Capture session ID assigned by server on initialize.
+    // Capture session ID assigned by server on initialize. It is echoed back
+    // as a header on later requests, so reject values that could smuggle
+    // headers (CR/LF, controls).
     const sid = resp.headers.get("Mcp-Session-Id");
-    if (sid && !state.sessionId) state.sessionId = sid;
+    if (sid && !/[\r\n\0]/.test(sid) && !state.sessionId) state.sessionId = sid;
 
     if (!resp.ok) {
       throw new Error(`http ${resp.status}: ${await readBodyCapped(resp, MCP_HTTP_RESP_MAX)}`);

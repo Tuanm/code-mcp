@@ -3526,7 +3526,15 @@ public final class CodeMCP {
                     Map<String, Object> err = new LinkedHashMap<>();
                     err.put("jsonrpc", "2.0");
                     err.put("id", req.get("id"));
-                    err.put("error", Map.of("code", -32603, "message", e.getMessage()));
+                    // Sanitize: an exception message may embed the localhost URL
+                    // including the relayed ?token= - never echo it back through
+                    // the tunnel (the token is the device credential).
+                    String msg = e.getMessage();
+                    if (msg != null) {
+                        int q = msg.indexOf("?token=");
+                        if (q >= 0) msg = msg.substring(0, q) + "?token=***";
+                    }
+                    err.put("error", Map.of("code", -32603, "message", msg));
                     mcpRes = err;
                 }
 
