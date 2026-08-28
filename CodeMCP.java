@@ -431,12 +431,6 @@ public final class CodeMCP {
                   .replace(">", "^>");
     }
     
-    // Escape string for PowerShell -Command
-    private static String escapePowerShell(String cmd) {
-        if (cmd == null) return "";
-        return "'" + cmd.replace("'", "''") + "'";
-    }
-    
     // ===== SHELL DETECTION =====
     private static volatile String powerShellBinary = null;
     private static volatile boolean powerShellChecked = false;
@@ -485,7 +479,10 @@ public final class CodeMCP {
         // useful "command not found" error instead of an NPE.
         String bin = detectPowerShellBinary();
         if (bin == null) bin = "pwsh";
-        return new String[]{bin, "-NoProfile", "-Command", escapePowerShell(command)};
+        // Pass the command RAW to -Command (parity with Python/TS): wrapping it
+        // in single quotes makes PowerShell parse the arg as a string literal,
+        // which echoes the command text and exits 0 instead of executing it.
+        return new String[]{bin, "-NoProfile", "-Command", command};
     }
     
     private static String[] shellCmd(String command) {
