@@ -369,7 +369,7 @@ public final class CodeMCP {
                     return finalPath;
                 }
             }
-            throw new IOException("Access denied: symlink escapes working directory");
+            throw new IOException("path escapes cwd: " + userPath);
         }
         return finalPath;
     }
@@ -417,20 +417,6 @@ public final class CodeMCP {
         return cmd;
     }
     
-    // Escape string for cmd.exe /c
-    private static String escapeCmd(String cmd) {
-        if (cmd == null) return "";
-        // cmd.exe escapes " by doubling ("") inside quoted strings, NOT with backslash.
-        // We escape shell metacharacters with caret; we wrap the command in /c so the entire
-        // string is interpreted by cmd.exe directly without our quoting.
-        return cmd.replace("^", "^^")
-                  .replace("%", "^%")
-                  .replace("&", "^&")
-                  .replace("|", "^|")
-                  .replace("<", "^<")
-                  .replace(">", "^>");
-    }
-    
     // ===== SHELL DETECTION =====
     private static volatile String powerShellBinary = null;
     private static volatile boolean powerShellChecked = false;
@@ -471,7 +457,10 @@ public final class CodeMCP {
     }
     
     private static String[] cmdCmd(String command) {
-        return new String[]{"cmd.exe", "/d", "/s", "/c", escapeCmd(command)};
+        // Pass the command RAW to cmd /c (parity with Python/TS): caret-escaping
+        // & | < > ^ % here would turn legitimate pipelines, redirects and command
+        // chaining into literal characters and silently break them.
+        return new String[]{"cmd.exe", "/d", "/s", "/c", command};
     }
     
     private static String[] pwshCmd(String command) {
@@ -2034,10 +2023,10 @@ public final class CodeMCP {
         if (glob != null) {
             String g = glob.replace("\\", "/");
             if (g.startsWith("/") || g.startsWith("~") || g.matches("^[A-Za-z]:.*")) {
-                throw new IOException("Access denied: glob must be relative");
+                throw new IOException("glob must be relative");
             }
             for (String seg : g.split("/")) {
-                if (seg.equals("..")) throw new IOException("Access denied: glob may not contain '..'");
+                if (seg.equals("..")) throw new IOException("glob may not contain '..'");
             }
         }
         String[] cmd;
@@ -2207,6 +2196,9 @@ public final class CodeMCP {
     
     // --- job tool ---
     private static String handleJob(String cwd, String mode, String command, Long timeoutMs) {
+        if (!mode.equals("list") && !mode.equals("start") && !mode.equals("view") && !mode.equals("stop")) {
+            throw new RuntimeException("unknown mode: " + mode);
+        }
         if (mode.equals("list")) {
             if (jobs.isEmpty()) return "(no jobs)";
             return jobs.values().stream()
@@ -3194,7 +3186,15 @@ public final class CodeMCP {
                         result = "ERROR: " + e.getMessage();
                     }
                     
-                    yield Map.of("content", List.of(Map.of("type", "text", "text", result)));
+                    // Response-layer spill (parity with Python/TS): any tool result
+                    // over RESULT_SPILL_THRESHOLD bytes is spilled to disk and the
+                    // response carries a head + marker, so huge bash/job/recall/etc.
+                    // output doesn't blow the client context window. read+no_truncate
+                    // is the one deliberate escape hatch (matching PY/TS skip_spill).
+                    boolean skipSpill = name.equals("read")
+                        && Boolean.TRUE.equals(args.get("no_truncate"));
+                    String finalText = skipSpill ? result : maybeSpillText(result, name);
+                    yield Map.of("content", List.of(Map.of("type", "text", "text", finalText)));
                 }
                 default -> "ERROR:-32601: unknown method: " + method;
             };

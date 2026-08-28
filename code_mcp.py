@@ -1007,6 +1007,12 @@ def grep_files(pattern: str, paths: list[str], cwd: str = ".", glob: str | None 
             if not ok:
                 return f"ERROR: {err}"
             valid_paths.append(str(full_path))
+        if glob:
+            norm_glob = glob.replace("\\", "/")
+            if norm_glob.startswith("/") or norm_glob.startswith("~") or re.match(r"^[A-Za-z]:", norm_glob):
+                return "ERROR: glob must be relative"
+            if any(seg == ".." for seg in norm_glob.split("/")):
+                return "ERROR: glob may not contain '..'"
         if has_rg():
             cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
             if glob:
@@ -1096,6 +1102,8 @@ def list_directory(path: str = ".", cwd: str = ".") -> str:
         ok, full_path, err = safe_resolve(cwd, path)
         if not ok:
             return f"ERROR: {err}"
+        if not full_path.is_dir():
+            return f"ERROR: Expected directory, got file: {path}"
         entries = []
         for entry in full_path.iterdir():
             try:

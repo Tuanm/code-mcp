@@ -2348,6 +2348,8 @@ const tools: Record<string, Tool> = {
       const r = safeResolve(cwd, path, true);
       if (!r.ok) throw new Error(r.reason);
       // Memory-DoS guard: never buffer a huge file (or device node) whole.
+      // Missing paths surface as "not a regular file" (parity with PY/JV),
+      // not a raw ENOENT.
       try {
         const st = statSync(r.path);
         if (!st.isFile()) throw new Error("not a regular file");
@@ -2356,6 +2358,7 @@ const tools: Record<string, Tool> = {
         }
       } catch (e: any) {
         if (e instanceof Error && (e.message.startsWith("file too large") || e.message === "not a regular file")) throw e;
+        if (e && (e as any).code === "ENOENT") throw new Error("not a regular file");
       }
       const text = await file(r.path).text();
       if (no_truncate) return text;
@@ -2568,6 +2571,15 @@ const tools: Record<string, Tool> = {
     handler: async ({ cwd, pattern, path = ".", glob }) => {
       const sr = safeResolve(cwd, path, true);
       if (!sr.ok) throw new Error(sr.reason);
+      if (glob) {
+        const normGlob = glob.replace(/\\/g, "/");
+        if (normGlob.startsWith("/") || normGlob.startsWith("~") || /^[A-Za-z]:/.test(normGlob)) {
+          throw new Error("glob must be relative");
+        }
+        if (normGlob.split("/").some((seg) => seg === "..")) {
+          throw new Error("glob may not contain '..'");
+        }
+      }
       let cmd: string[];
       if (hasRg) {
         // Insert `--` so a user-supplied pattern that starts with `-` isn't parsed as a flag.
@@ -2684,6 +2696,11 @@ const tools: Record<string, Tool> = {
     handler: ({ cwd, path = "." }) => {
       const sr = safeResolve(cwd, path);
       if (!sr.ok) throw new Error(sr.reason);
+      try {
+        if (!statSync(sr.path).isDirectory()) throw new Error(`Expected directory, got file: ${path}`);
+      } catch (e: any) {
+        if (e instanceof Error && e.message.startsWith("Expected directory")) throw e;
+      }
       return readdirSync(sr.path)
         .map((name) => {
           try {
@@ -2711,6 +2728,9 @@ const tools: Record<string, Tool> = {
       required: ["cwd", "mode"],
     },
     handler: async ({ cwd, mode, command, timeout_ms = 500 }) => {
+      if (mode !== "list" && mode !== "start" && mode !== "view" && mode !== "stop") {
+        throw new Error(`unknown mode: ${mode}`);
+      }
       if (mode === "list") {
         if (jobs.size === 0) return "(no jobs)";
         return [...jobs.values()]
