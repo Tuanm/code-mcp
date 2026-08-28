@@ -1606,7 +1606,11 @@ function validateServerConfig(ns: string, cfg: McpServerConfig): { ok: true } | 
   if (cfg.type === "http") {
     try {
       const url = new URL(cfg.url);
-      if (url.protocol !== "https:") {
+      // Plain http is fine for loopback (localhost/127.0.0.1) — the repo's own
+      // .mcp.json uses it — but remote hosts must be https so tokens/headers
+      // never cross the wire unencrypted.
+      const isLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1";
+      if (url.protocol !== "https:" && !isLoopback) {
         return { ok: false, reason: `server '${ns}': http transport requires https URL, got ${url.protocol}` };
       }
     } catch {
@@ -2663,7 +2667,7 @@ const tools: Record<string, Tool> = {
         results.push(f);
         if (results.length >= 10_000) break;
       }
-      return results.length ? results.join("\n") : "(none)";
+      return results.length ? results.join("\n") : "(no matches)";
     },
   },
 
@@ -2684,11 +2688,12 @@ const tools: Record<string, Tool> = {
         .map((name) => {
           try {
             const s = statSync(`${sr.path}/${name}`);
-            return `${s.isDirectory() ? "d" : "-"} ${String(s.size).padStart(10)} ${name}`;
+            return `${s.isDirectory() ? "d" : "-"}${String(s.size).padStart(10)} ${name}`;
           } catch {
             return `? ${name}`;
           }
         })
+        .sort()
         .join("\n");
     },
   },

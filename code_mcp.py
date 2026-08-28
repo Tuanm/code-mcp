@@ -190,11 +190,21 @@ def detect_shell() -> ShellType:
 
 def find_on_path(name: str) -> bool:
     try:
-        result = subprocess.run(
-            ["which", name] if sys.platform != "win32" else ["where", name],
-            capture_output=True, timeout=5,
-            env=build_child_env(),
-        )
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["where", name],
+                capture_output=True, timeout=5,
+                env=build_child_env(),
+            )
+        else:
+            # sh -c "command -v name" — sh has a built-in default PATH when
+            # PATH is unset, so detection works even under a stripped env
+            # (parity with the TS/Java hasOnPath which use the same probe).
+            result = subprocess.run(
+                ["sh", "-c", "command -v " + name],
+                capture_output=True, timeout=5,
+                env=build_child_env(),
+            )
         return result.returncode == 0
     except Exception:
         return False
@@ -443,10 +453,12 @@ def read_file(path: str, cwd: str = ".",
                 return "ERROR: range must be [start, end] integers (1-indexed, inclusive)"
             if start < 1 or end < start:
                 return f"ERROR: invalid range [{start}, {end}]"
-            lines = content.splitlines(keepends=True)
+            # Parity with Java/TS: split on "\n" and re-join with "\n" so a
+            # range ending on an empty line doesn't gain a trailing newline.
+            lines = content.split("\n")
             start_idx = min(start - 1, len(lines))
             end_idx = min(end, len(lines))
-            content = "".join(lines[start_idx:end_idx])
+            content = "\n".join(lines[start_idx:end_idx])
         if no_truncate:
             return content
         return maybe_spill_text(content, "read")
@@ -476,7 +488,7 @@ def edit_file(path: str, old_str: str, new_str: str, cwd: str = ".") -> str:
             return too_big
         content = full_path.read_text(encoding="utf-8", errors="replace")
         if old_str not in content:
-            return f"ERROR: String not found"
+            return f"ERROR: old_str not found"
         if content.count(old_str) > 1:
             return f"ERROR: old_str not unique"
         new_content = content.replace(old_str, new_str, 1)
@@ -1268,19 +1280,19 @@ def build_tools_list() -> list[dict]:
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["cwd", "path", "content"]}},
         {"name": "edit", "description": "Replace old_str with new_str in a file. old_str must occur exactly once.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["cwd", "path", "old_str", "new_str"]}},
-        {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files.",
+        {"name": "multi_edit", "description": "Apply multiple edits atomically across one or more files. Validates every edit first; if any fails, nothing is written. Edits to the same file are applied in order.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "edits": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}, "required": ["cwd", "edits"]}},
         {"name": _shell_tool_name(), "description": _shell_tool_description(),
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "command"]}},
         {"name": "grep", "description": "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}}, "required": ["cwd", "pattern"]}},
-        {"name": "find", "description": "Find files by glob pattern. Supports ** for recursive. Skips common noise dirs unless pattern explicitly references them.",
+        {"name": "find", "description": "Find files by glob pattern. Supports ** for recursive. Bare patterns like '*.ts' match at any depth. Skips common noise dirs (node_modules, .git, .next, dist, build, target, .venv, __pycache__) unless the pattern explicitly references them. Pass include_hidden=true to include dot-files.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}, "include_hidden": {"type": "boolean"}}, "required": ["cwd", "pattern"]}},
         {"name": "ls", "description": "List directory entries with type and size.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "path": {"type": "string"}}, "required": ["cwd"]}},
-        {"name": "job", "description": "Manage background jobs. mode: list|view|start|stop. command required for start; id (passed as command) required for view/stop.",
+        {"name": "job", "description": "Manage background jobs. mode: list|view|start|stop. command required for start; id (passed as command) required for view/stop. cwd used only for start.",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["list", "view", "start", "stop"]}, "command": {"type": "string"}, "timeout_ms": {"type": "number"}}, "required": ["cwd", "mode"]}},
-        {"name": "mcp", "description": "Manage MCP servers: list available, call a tool, or unload a server.",
+        {"name": "mcp", "description": "Manage MCP servers from local .mcp.json files. Actions:   list: List all servers defined in .mcp.json for cwd   list server=X: Load server X and return its tools   call server=X tool=Y args={}: Call tool Y on loaded server X   unload: Unload all servers for this cwd   unload server=X: Unload specific server X",
          "inputSchema": {"type": "object", "properties": {"cwd": {"type": "string"}, "action": {"type": "string", "enum": ["list", "call", "unload"]}, "server": {"type": "string"}, "tool": {"type": "string"}, "args": {"type": "object"}, "mcpConfigPath": {"type": "string"}}, "required": ["cwd", "action"]}},
     ]
     if memory_enabled:
@@ -1304,7 +1316,7 @@ def build_tools_list() -> list[dict]:
                 "inputSchema": info.get("inputSchema", {"type": "object"}),
             })
     if has_cloudflared:
-        tools.append({"name": "preview", "description": "Start a Cloudflare quick tunnel.",
+        tools.append({"name": "preview", "description": "Start a Cloudflare quick tunnel to the given local URL and return the public URL.",
                       "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}})
     if (public_domain or make_public) and token:
         tools.append({"name": "get_upload_link",
@@ -1395,7 +1407,7 @@ def dispatch_tool(tool_name: str, params: dict) -> Any:
                               params.get("server", ""),
                               params.get("tool", ""),
                               params.get("args") or {},
-                              params.get("mcpConfigPath") or (mcp_config_path or ".mcp.json"),
+                              params.get("mcpConfigPath") or ".mcp.json",
                               cwd)
         if tool_name == "guide":
             return render_guide(cwd)
@@ -2526,7 +2538,8 @@ def handle_preview(url: str) -> str:
 
 # MCP server state management
 mcp_servers: dict[str, dict] = {}  # key: "cwd:servername"
-mcp_processes: dict[str, subprocess.Popen] = {}  # key: "cwd:servername"
+mcp_processes: dict[str, subprocess.Popen] = {}  # key: "cwd:servername" (stdio)
+mcp_http: dict[str, dict] = {}  # key: "cwd:servername" -> {"url","headers","session_id"} (http)
 mcp_next_id = 0
 mcp_lock = threading.Lock()
 
@@ -2535,7 +2548,8 @@ mcp_lock = threading.Lock()
 # in parallel, and their tools surface in the main tools/list under
 # `<ns>__<tool>` so the agent can call them as if they were built-in.
 NAMESPACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
-aggregator_processes: dict[str, subprocess.Popen] = {}  # key: namespace
+aggregator_processes: dict[str, subprocess.Popen] = {}  # key: namespace (stdio)
+aggregator_http: dict[str, dict] = {}  # namespace -> {"url","headers","session_id"} (http transport)
 aggregator_tools: dict[str, dict] = {}  # prefixed name -> {"ns","tool","description","inputSchema"}
 aggregator_known: set[str] = set()  # all ns declared in --mcp config (probed or not)
 aggregator_lock = threading.Lock()  # protects aggregator_* maps and set
@@ -2549,7 +2563,29 @@ def _aggregator_validate(ns: str, cfg: dict) -> str | None:
     if not isinstance(cfg, dict):
         return "config must be an object"
     if cfg.get("type") == "http":
-        return "http transport not yet supported in Python aggregator"
+        url = cfg.get("url")
+        if not isinstance(url, str) or not url:
+            return "missing 'url'"
+        try:
+            u = urllib.parse.urlparse(url)
+        except Exception:
+            return f"invalid http url: {url}"
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return f"invalid http url: {url}"
+        # Plain http is fine for loopback (localhost/127.0.0.1) — the repo's own
+        # .mcp.json uses it — but remote hosts must be https so tokens/headers
+        # never cross the wire unencrypted (parity with the TS aggregator).
+        is_loopback = u.hostname in ("localhost", "127.0.0.1", "::1")
+        if u.scheme != "https" and not is_loopback:
+            return f"http transport requires https URL, got {u.scheme}://{u.hostname}"
+        headers = cfg.get("headers")
+        if headers is not None and not isinstance(headers, dict):
+            return "'headers' must be an object"
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    return "'headers' keys/values must be strings"
+        return None
     cmd = cfg.get("command")
     if not isinstance(cmd, str) or not cmd:
         return "missing 'command'"
@@ -2568,13 +2604,137 @@ def _aggregator_validate(ns: str, cfg: dict) -> str | None:
     return None
 
 
+_AGGREGATOR_HTTP_MAX_RESP = 16 * 1024 * 1024  # memory-DoS guard for http responses
+
+
+def _parse_sse_single(text: str):
+    """Parse an SSE stream and return the first JSON-RPC response it contains."""
+    buf = text
+    # MCP servers often return a single response then close the stream.
+    while "\n\n" in buf:
+        event, buf = buf.split("\n\n", 1)
+        data_lines = [ln for ln in event.split("\n") if ln.startswith("data:")]
+        if not data_lines:
+            continue
+        payload = "\n".join(ln[5:].strip() for ln in data_lines)
+        try:
+            msg = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and msg.get("id") is not None and ("result" in msg or "error" in msg):
+            return msg
+    return None
+
+
+def _aggregator_http_rpc(ns: str, method: str, params: dict, timeout_s: float = 30.0) -> dict:
+    """JSON-RPC over HTTP (Streamable HTTP transport) to an aggregator server."""
+    global _aggregator_next_id
+    with aggregator_lock:
+        info = aggregator_http.get(ns)
+    if info is None:
+        raise IOError(f"aggregator server '{ns}' not running")
+    with aggregator_lock:
+        _aggregator_next_id += 1
+        req_id = _aggregator_next_id
+    body = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if info.get("headers"):
+        headers.update(info["headers"])
+    sid = info.get("session_id")
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+    data = json.dumps(body).encode("utf-8")
+    try:
+        req = urllib.request.Request(info["url"], data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            new_sid = resp.headers.get("Mcp-Session-Id")
+            if new_sid and not re.search(r"[\r\n\x00]", new_sid) and not info.get("session_id"):
+                with aggregator_lock:
+                    aggregator_http[ns]["session_id"] = new_sid
+            ct = resp.headers.get("Content-Type", "")
+            # Notifications return 202/204 or empty 200 — no body to parse.
+            if resp.status in (202, 204) or resp.headers.get("Content-Length") == "0":
+                return {}
+            raw = resp.read(_AGGREGATOR_HTTP_MAX_RESP + 1)
+            if len(raw) > _AGGREGATOR_HTTP_MAX_RESP:
+                raise IOError(f"aggregator '{ns}' response too large")
+            text = raw.decode("utf-8", errors="replace")
+            if "text/event-stream" in ct:
+                msg = _parse_sse_single(text)
+            else:
+                if not text.strip():
+                    return {}
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError as e:
+                    raise IOError(f"aggregator '{ns}' invalid JSON response: {e}")
+            if not isinstance(msg, dict) or msg.get("id") != req_id:
+                raise IOError(f"aggregator '{ns}' mismatched response id")
+            if "error" in msg:
+                raise IOError(f"aggregator '{ns}' rpc error: {msg['error']}")
+            result = msg.get("result")
+            return result if isinstance(result, dict) else {"result": result}
+    except urllib.error.HTTPError as e:
+        detail = e.read(512).decode("utf-8", errors="replace")
+        raise IOError(f"aggregator '{ns}' http {e.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise IOError(f"aggregator '{ns}' http rpc failed: {e}")
+
+
+def _aggregator_spawn_http(ns: str, cfg: dict) -> list[dict]:
+    """Probe one http-transport aggregator server. Returns prefixed tool dicts."""
+    with aggregator_lock:
+        aggregator_http[ns] = {
+            "url": cfg["url"],
+            "headers": cfg.get("headers") or {},
+            "session_id": None,
+        }
+    try:
+        _aggregator_http_rpc(ns, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "code-mcp-aggregator", "version": "0.1.0"},
+        })
+        try:
+            _aggregator_http_rpc(ns, "notifications/initialized", {})
+        except Exception:
+            pass
+        result = _aggregator_http_rpc(ns, "tools/list", {})
+        raw_tools = result.get("tools", []) if isinstance(result, dict) else []
+        prefixed = []
+        for t in raw_tools:
+            if not isinstance(t, dict) or not isinstance(t.get("name"), str):
+                continue
+            prefixed.append({
+                "ns": ns,
+                "tool": t["name"],
+                "description": t.get("description", ""),
+                "inputSchema": t.get("inputSchema", {"type": "object"}),
+            })
+        return prefixed
+    except Exception:
+        with aggregator_lock:
+            aggregator_http.pop(ns, None)
+        raise
+
+
 def _aggregator_rpc(ns: str, method: str, params: dict, timeout_s: float = 30.0) -> dict:
-    """JSON-RPC over stdio to an aggregator subprocess.
+    """JSON-RPC to an aggregator server over stdio or HTTP (Streamable HTTP).
 
     Hold the per-ns io lock for the full write+read cycle so concurrent callers
     don't steal each other's response lines.
     """
     global _aggregator_next_id
+    # http transport never touches the stdio maps, so dispatch OUTSIDE the lock:
+    # aggregator_lock is a plain (non-reentrant) Lock and _aggregator_http_rpc
+    # re-acquires it to bump the id / store the session id.
+    with aggregator_lock:
+        is_http = ns in aggregator_http
+    if is_http:
+        return _aggregator_http_rpc(ns, method, params, timeout_s)
     with aggregator_lock:
         proc = aggregator_processes.get(ns)
         io_lock = aggregator_io_locks.get(ns)
@@ -2617,6 +2777,8 @@ def _aggregator_rpc(ns: str, method: str, params: dict, timeout_s: float = 30.0)
 
 def _aggregator_spawn(ns: str, cfg: dict) -> list[dict]:
     """Spawn one aggregator server and probe its tools. Returns prefixed tool dicts."""
+    if cfg.get("type") == "http":
+        return _aggregator_spawn_http(ns, cfg)
     cmd = cfg["command"]
     args = cfg.get("args", []) or []
     extra_env = cfg.get("env") or {}
@@ -2714,7 +2876,8 @@ def load_aggregator(config_path: str) -> None:
                     prefixed_name = f"{ns}__{entry['tool']}"
                     aggregator_tools[prefixed_name] = entry
                     invalidate_tools_list()
-            print(f"[mcp] probed '{ns}' (stdio): {len(entries)} tool(s) cached", file=sys.stderr)
+            transport = "http" if scfg.get("type") == "http" else "stdio"
+            print(f"[mcp] probed '{ns}' ({transport}): {len(entries)} tool(s) cached", file=sys.stderr)
 
 
 def shutdown_aggregator() -> None:
@@ -2722,6 +2885,7 @@ def shutdown_aggregator() -> None:
         procs = list(aggregator_processes.items())
         aggregator_processes.clear()
         aggregator_io_locks.clear()
+        aggregator_http.clear()
     for ns, p in procs:
         try: p.terminate()
         except Exception: pass
@@ -2740,9 +2904,18 @@ def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path:
     """Handle mcp tool actions: list, call, unload."""
     config_path = mcp_config_path or ".mcp.json"
 
+    # The agent-supplied config path must stay inside the cwd sandbox (parity
+    # with TS): an absolute path or ../ escape is refused, not silently read.
+    try:
+        cwd_resolved = Path(cwd).resolve()
+        config_full_path = (Path(cwd) / config_path).resolve()
+        if not str(config_full_path).startswith(str(cwd_resolved) + os.sep):
+            return json.dumps({"error": f"config path escapes cwd: {config_path}"}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"invalid config path: {e}"}, ensure_ascii=False)
+
     if action == "list":
         try:
-            config_full_path = Path(cwd) / config_path
             if not config_full_path.exists():
                 return json.dumps({"servers": [], "mcpConfigPath": config_path}, ensure_ascii=False)
             with open(config_full_path, "r", encoding="utf-8") as f:
@@ -2779,6 +2952,45 @@ def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path:
             server_config = servers[server]
 
             key = f"{cwd}:{server}"
+
+            # HTTP transport: stateless-ish Streamable HTTP — probe once, then call.
+            if server_config.get("type") == "http":
+                try:
+                    with mcp_lock:
+                        existing = mcp_http.get(key)
+                        needs_init = existing is None
+                        if needs_init:
+                            mcp_http[key] = {
+                                "url": server_config["url"],
+                                "headers": server_config.get("headers") or {},
+                                "session_id": None,
+                            }
+                    if needs_init:
+                        try:
+                            mcp_http_call(key, "initialize", {
+                                "protocolVersion": "2024-11-05",
+                                "capabilities": {},
+                                "clientInfo": {"name": "code-mcp-aggregator", "version": "0.1.0"},
+                            })
+                            try:
+                                mcp_http_call(key, "notifications/initialized", {})
+                            except Exception:
+                                pass
+                            tools_result = mcp_http_call(key, "tools/list", {})
+                            with mcp_lock:
+                                mcp_servers[key] = {
+                                    "tools": [t["name"] for t in tools_result.get("tools", [])]
+                                }
+                        except Exception as probe_err:
+                            with mcp_lock:
+                                mcp_http.pop(key, None)
+                                mcp_servers.pop(key, None)
+                            return json.dumps({"error": f"failed to probe server '{server}': {probe_err}"}, ensure_ascii=False)
+                    result = mcp_http_call(key, "tools/call", {"name": tool, "arguments": args or {}})
+                    return json.dumps(result, ensure_ascii=False)
+                except Exception as e:
+                    return json.dumps({"error": str(e)}, ensure_ascii=False)
+
             # Spawn under lock; clean up if probe fails.
             with mcp_lock:
                 existing = mcp_processes.get(key)
@@ -2830,6 +3042,7 @@ def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path:
             if server:
                 key = f"{cwd}:{server}"
                 proc = mcp_processes.pop(key, None)
+                mcp_http.pop(key, None)
                 mcp_servers.pop(key, None)
                 to_terminate = [proc] if proc else []
             else:
@@ -2837,12 +3050,71 @@ def handle_mcp(action: str, server: str, tool: str, args: dict, mcp_config_path:
                 to_terminate = [mcp_processes.pop(k) for k in keys]
                 for k in keys:
                     mcp_servers.pop(k, None)
+                for k in [k for k in list(mcp_http.keys()) if k.startswith(f"{cwd}:")]:
+                    mcp_http.pop(k, None)
         for p in to_terminate:
             try: p.terminate()
             except Exception: pass
         return json.dumps({"success": True}, ensure_ascii=False)
 
     return json.dumps({"error": f"unknown action: {action}"}, ensure_ascii=False)
+
+
+def mcp_http_call(key: str, method: str, params: dict) -> dict:
+    """Make a JSON-RPC call to an MCP server over HTTP (Streamable HTTP)."""
+    global mcp_next_id
+    with mcp_lock:
+        info = mcp_http.get(key)
+    if info is None:
+        raise IOError(f"MCP server '{key}' not running")
+    with mcp_lock:
+        mcp_next_id += 1
+        req_id = mcp_next_id
+    body = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if info.get("headers"):
+        headers.update(info["headers"])
+    sid = info.get("session_id")
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+    data = json.dumps(body).encode("utf-8")
+    try:
+        req = urllib.request.Request(info["url"], data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new_sid = resp.headers.get("Mcp-Session-Id")
+            if new_sid and not re.search(r"[\r\n\x00]", new_sid) and not info.get("session_id"):
+                with mcp_lock:
+                    mcp_http[key]["session_id"] = new_sid
+            ct = resp.headers.get("Content-Type", "")
+            if resp.status in (202, 204) or resp.headers.get("Content-Length") == "0":
+                return {}
+            raw = resp.read(_AGGREGATOR_HTTP_MAX_RESP + 1)
+            if len(raw) > _AGGREGATOR_HTTP_MAX_RESP:
+                raise IOError("MCP server response too large")
+            text = raw.decode("utf-8", errors="replace")
+            if "text/event-stream" in ct:
+                msg = _parse_sse_single(text)
+            else:
+                if not text.strip():
+                    return {}
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError as e:
+                    raise IOError(f"invalid JSON response: {e}")
+            if not isinstance(msg, dict) or msg.get("id") != req_id:
+                raise IOError("mismatched response id")
+            if "error" in msg:
+                raise IOError(f"rpc error: {msg['error']}")
+            result = msg.get("result")
+            return result if isinstance(result, dict) else {"result": result}
+    except urllib.error.HTTPError as e:
+        detail = e.read(512).decode("utf-8", errors="replace")
+        raise IOError(f"http {e.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise IOError(f"http rpc failed: {e}")
 
 
 def mcp_call(key: str, method: str, params: dict) -> dict:

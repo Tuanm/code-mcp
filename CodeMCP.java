@@ -13,6 +13,7 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -89,19 +90,22 @@ public final class CodeMCP {
     private static volatile boolean shuttingDown = false;
 
     // ===== MCP SERVER STATE =====
-    private static final Map<String, Process> mcpProcesses = new ConcurrentHashMap<>(); // key: "cwd:serverName"
+    private static final Map<String, Process> mcpProcesses = new ConcurrentHashMap<>(); // key: "cwd:serverName" (stdio)
+    private static final Map<String, Map<String, Object>> mcpHttp = new ConcurrentHashMap<>(); // key: "cwd:serverName" -> {url,headers,session_id}
     private static final Map<String, List<String>> mcpServerTools = new ConcurrentHashMap<>(); // key: "cwd:serverName"
     private static int mcpNextId = 0;
     private static final Object mcpIdLock = new Object();
 
     // ===== AGGREGATOR STATE (boot-time --mcp probe, parity with TS) =====
     private record AggregatedTool(String ns, String tool, String description, Map<String, Object> inputSchema) {}
-    private static final Map<String, Process> aggregatorProcesses = new ConcurrentHashMap<>(); // key: namespace
+    private static final Map<String, Process> aggregatorProcesses = new ConcurrentHashMap<>(); // key: namespace (stdio)
+    private static final Map<String, Map<String, Object>> aggregatorHttp = new ConcurrentHashMap<>(); // ns -> {url, headers, session_id}
     private static final Map<String, BufferedReader> aggregatorReaders = new ConcurrentHashMap<>();
     private static final Map<String, Object> aggregatorLocks = new ConcurrentHashMap<>();
     private static final Map<String, AggregatedTool> aggregatorTools = new ConcurrentHashMap<>(); // prefixed name -> info
     private static final Set<String> aggregatorKnown = ConcurrentHashMap.newKeySet(); // all ns declared in --mcp
     private static final AtomicInteger aggregatorNextId = new AtomicInteger(0);
+    private static final long AGGREGATOR_HTTP_MAX_RESP = 16L * 1024 * 1024; // memory-DoS guard
     private static final Pattern AGGREGATOR_NS_RE = Pattern.compile("^[A-Za-z][A-Za-z0-9_-]{0,63}$");
     
     // ===== CONFIGURATION =====
@@ -1077,7 +1081,38 @@ public final class CodeMCP {
     private static String validateAggregatorServer(String ns, Map<String, Object> cfg) {
         if (!AGGREGATOR_NS_RE.matcher(ns).matches()) return "invalid namespace '" + ns + "'";
         if (cfg == null) return "config must be an object";
-        if ("http".equals(cfg.get("type"))) return "http transport not yet supported in Java aggregator";
+        if ("http".equals(cfg.get("type"))) {
+            Object urlObj = cfg.get("url");
+            if (!(urlObj instanceof String url) || url.isBlank()) return "missing 'url'";
+            try {
+                URI u = URI.create(url);
+                String scheme = u.getScheme();
+                String host = u.getHost();
+                if (scheme == null || host == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                    return "invalid http url: " + url;
+                }
+                // Plain http is fine for loopback (localhost/127.0.0.1) — the repo's
+                // own .mcp.json uses it — but remote hosts must be https so tokens/
+                // headers never cross the wire unencrypted (parity with TS).
+                String h = host.toLowerCase();
+                boolean loopback = h.equals("localhost") || h.equals("127.0.0.1") || h.equals("::1");
+                if (!scheme.equalsIgnoreCase("https") && !loopback) {
+                    return "http transport requires https URL, got " + scheme + "://" + host;
+                }
+            } catch (IllegalArgumentException e) {
+                return "invalid http url: " + url;
+            }
+            Object headers = cfg.get("headers");
+            if (headers != null && !(headers instanceof Map<?, ?>)) return "'headers' must be an object";
+            if (headers instanceof Map<?, ?> hm) {
+                for (Map.Entry<?, ?> e : hm.entrySet()) {
+                    if (!(e.getKey() instanceof String) || !(e.getValue() instanceof String)) {
+                        return "'headers' keys/values must be strings";
+                    }
+                }
+            }
+            return null;
+        }
         Object cmd = cfg.get("command");
         if (!(cmd instanceof String) || ((String) cmd).isEmpty()) return "missing 'command'";
         if (((String) cmd).matches(".*[;|<>&\\x00].*")) return "command contains shell operators or NUL";
@@ -1086,12 +1121,160 @@ public final class CodeMCP {
         if (!(args instanceof List<?>)) return "'args' must be an array of strings";
         for (Object a : (List<?>) args) {
             if (!(a instanceof String)) return "all args must be strings";
-            if (((String) a).contains(" ")) return "args contain NUL";
+            if (((String) a).contains("\u0000")) return "args contain NUL";
         }
         return null;
     }
 
+    // Parse an SSE stream and return the first JSON-RPC response it contains.
+    private static Map<String, Object> parseSseSingleResponse(String text) {
+        String buf = text;
+        while (true) {
+            int idx = buf.indexOf("\n\n");
+            if (idx < 0) return null;
+            String event = buf.substring(0, idx);
+            buf = buf.substring(idx + 2);
+            List<String> dataLines = new ArrayList<>();
+            for (String ln : event.split("\n")) {
+                if (ln.startsWith("data:")) dataLines.add(ln);
+            }
+            if (dataLines.isEmpty()) continue;
+            String payload = dataLines.stream()
+                .map(l -> l.substring(5).trim())
+                .collect(Collectors.joining("\n"));
+            try {
+                Map<String, Object> msg = parseJsonObject(payload);
+                if (msg.get("id") != null && (msg.containsKey("result") || msg.containsKey("error"))) {
+                    return msg;
+                }
+            } catch (RuntimeException ignored) { /* non-JSON event */ }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<?, ?> aggregatorHttpRpc(String ns, String method, Map<String, Object> params, long timeoutMs) throws IOException {
+        Map<String, Object> info = aggregatorHttp.get(ns);
+        if (info == null) throw new IOException("aggregator '" + ns + "' not running");
+        String url = (String) info.get("url");
+        int reqId = aggregatorNextId.incrementAndGet();
+        String body = "{\"jsonrpc\":\"2.0\",\"id\":" + reqId
+            + ",\"method\":\"" + method + "\",\"params\":" + toJson(params) + "}";
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(timeoutMs))
+                .build();
+            HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofMillis(timeoutMs))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(body));
+            Object headersRaw = info.get("headers");
+            if (headersRaw instanceof Map<?, ?> hm) {
+                for (Map.Entry<?, ?> e : hm.entrySet()) {
+                    if (e.getKey() instanceof String k && e.getValue() instanceof String v) {
+                        rb.header(k, v);
+                    }
+                }
+            }
+            Object sid = info.get("session_id");
+            if (sid instanceof String s && !s.isEmpty()) rb.header("Mcp-Session-Id", s);
+            HttpResponse<String> resp = client.send(rb.build(), HttpResponse.BodyHandlers.ofString());
+            // Capture session ID assigned by server on initialize; reject values
+            // that could smuggle headers (CR/LF, controls).
+            String newSid = resp.headers().firstValue("Mcp-Session-Id").orElse(null);
+            if (newSid != null && !newSid.matches(".*[\r\n\u0000].*") && info.get("session_id") == null) {
+                Map<String, Object> updated = new LinkedHashMap<>(info);
+                updated.put("session_id", newSid);
+                aggregatorHttp.put(ns, updated);
+            }
+            int status = resp.statusCode();
+            if (status == 202 || status == 204 || resp.headers().firstValue("Content-Length").orElse("").equals("0")) {
+                return Map.of();
+            }
+            String text = resp.body();
+            if (text == null || text.isBlank()) return Map.of();
+            if (text.length() > AGGREGATOR_HTTP_MAX_RESP) throw new IOException("aggregator '" + ns + "' response too large");
+            String ct = resp.headers().firstValue("Content-Type").orElse("");
+            Map<String, Object> msg;
+            if (ct.contains("text/event-stream")) {
+                msg = parseSseSingleResponse(text);
+            } else {
+                try {
+                    msg = parseJsonObject(text);
+                } catch (RuntimeException e) {
+                    throw new IOException("aggregator '" + ns + "' invalid JSON response: " + e.getMessage());
+                }
+            }
+            if (msg == null) throw new IOException("aggregator '" + ns + "' no JSON-RPC response");
+            Object respId = msg.get("id");
+            if (!(respId instanceof Number) || ((Number) respId).intValue() != reqId) {
+                throw new IOException("aggregator '" + ns + "' mismatched response id");
+            }
+            if (msg.containsKey("error")) throw new IOException("aggregator '" + ns + "' rpc error: " + msg.get("error"));
+            Object result = msg.get("result");
+            return result instanceof Map ? (Map<?, ?>) result : Map.of("result", result);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("aggregator '" + ns + "' http rpc interrupted", e);
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("aggregator '" + ns + "' http rpc failed: " + e.getMessage(), e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<AggregatedTool> aggregatorSpawnHttp(String ns, Map<String, Object> cfg) throws Exception {
+        Map<String, Object> info = new LinkedHashMap<>();
+        info.put("url", cfg.get("url"));
+        Object headersRaw = cfg.get("headers");
+        if (headersRaw instanceof Map<?, ?> hm) {
+            Map<String, Object> headers = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> e : hm.entrySet()) {
+                if (e.getKey() instanceof String k && e.getValue() instanceof String v) headers.put(k, v);
+            }
+            info.put("headers", headers);
+        } else {
+            info.put("headers", Map.of());
+        }
+        info.put("session_id", null);
+        aggregatorHttp.put(ns, info);
+        try {
+            aggregatorHttpRpc(ns, "initialize", Map.of(
+                "protocolVersion", "2024-11-05",
+                "capabilities", Map.of(),
+                "clientInfo", Map.of("name", "code-mcp-aggregator", "version", "0.1.0")
+            ), 30_000);
+            try {
+                aggregatorHttpRpc(ns, "notifications/initialized", Map.of(), 10_000);
+            } catch (Exception ignored) {}
+            Map<?, ?> result = aggregatorHttpRpc(ns, "tools/list", Map.of(), 30_000);
+            Object toolsRaw = result.get("tools");
+            if (!(toolsRaw instanceof List<?>)) return List.of();
+            List<AggregatedTool> out = new ArrayList<>();
+            for (Object t : (List<?>) toolsRaw) {
+                if (!(t instanceof Map<?, ?> tm)) continue;
+                Object name = tm.get("name");
+                if (!(name instanceof String)) continue;
+                Object desc = tm.get("description");
+                Object schemaRaw = tm.get("inputSchema");
+                Map<String, Object> schema = schemaRaw instanceof Map
+                    ? new LinkedHashMap<>((Map<String, Object>) schemaRaw)
+                    : Map.of("type", "object");
+                out.add(new AggregatedTool(ns, (String) name,
+                    desc instanceof String s ? s : "", schema));
+            }
+            return out;
+        } catch (Exception e) {
+            aggregatorHttp.remove(ns);
+            throw e;
+        }
+    }
+
     private static Map<?, ?> aggregatorRpc(String ns, String method, Map<String, Object> params, long timeoutMs) throws IOException {
+        if (aggregatorHttp.containsKey(ns)) {
+            return aggregatorHttpRpc(ns, method, params, timeoutMs);
+        }
         Process proc = aggregatorProcesses.get(ns);
         if (proc == null || !proc.isAlive()) throw new IOException("aggregator '" + ns + "' not running");
         Object lock = aggregatorLocks.get(ns);
@@ -1135,6 +1318,9 @@ public final class CodeMCP {
 
     @SuppressWarnings("unchecked")
     private static List<AggregatedTool> aggregatorSpawn(String ns, Map<String, Object> cfg) throws Exception {
+        if ("http".equals(cfg.get("type"))) {
+            return aggregatorSpawnHttp(ns, cfg);
+        }
         String cmd = (String) cfg.get("command");
         Object argsRaw = cfg.getOrDefault("args", List.of());
         List<?> argsList = argsRaw instanceof List<?> ? (List<?>) argsRaw : List.of();
@@ -1244,7 +1430,8 @@ public final class CodeMCP {
                         for (AggregatedTool t : entries) {
                             aggregatorTools.put(ns + "__" + t.tool(), t);
                         }
-                        System.err.println("[mcp] probed '" + ns + "' (stdio): " + entries.size() + " tool(s) cached");
+                        String transport = "http".equals(scfg.get("type")) ? "http" : "stdio";
+                        System.err.println("[mcp] probed '" + ns + "' (" + transport + "): " + entries.size() + " tool(s) cached");
                     } catch (Exception ex) {
                         System.err.println("[mcp] probe '" + ns + "' failed: " + ex.getMessage());
                     }
@@ -1265,6 +1452,7 @@ public final class CodeMCP {
         aggregatorProcesses.clear();
         aggregatorReaders.clear();
         aggregatorLocks.clear();
+        aggregatorHttp.clear();
     }
 
     @SuppressWarnings("unchecked")
@@ -1837,11 +2025,14 @@ public final class CodeMCP {
     private static String handleGrep(String cwd, String pattern, String path, String glob) throws Exception {
         // The search root must stay inside the cwd sandbox (like read/write):
         // pass the RESOLVED path to rg/grep, never the raw caller string.
+        // Parity with Python/TS: grep accepts a file OR a directory (and can
+        // reach spill files), and always passes the RESOLVED ABSOLUTE path to
+        // rg/grep so result lines carry absolute paths like the other impls.
         String searchPath;
         if (path == null || path.isBlank() || path.equals(".")) {
-            searchPath = ".";
+            searchPath = safeResolve(cwd, ".", true).toString();
         } else {
-            searchPath = safeResolveDir(cwd, path).toString();
+            searchPath = safeResolve(cwd, path, true).toString();
         }
         if (glob != null) {
             String g = glob.replace("\\", "/");
@@ -1910,7 +2101,17 @@ public final class CodeMCP {
     private static String handleFind(String cwd, String pattern, String path, boolean includeHidden) throws IOException {
         path = path != null ? path : ".";
         Path base = safeResolveDir(cwd, path);
-        
+
+        // The glob must stay inside the cwd sandbox: reject absolute roots,
+        // drive letters and ".." components (parity with Python/TS find).
+        String normPattern = pattern.replace("\\", "/");
+        if (normPattern.startsWith("/") || normPattern.startsWith("~") || normPattern.matches("^[A-Za-z]:.*")) {
+            throw new IOException("pattern must be relative to the working directory");
+        }
+        for (String seg : normPattern.split("/")) {
+            if (seg.equals("..")) throw new IOException("pattern may not contain '..'");
+        }
+
         Set<String> noiseDirs = Set.of(
             "node_modules", ".git", ".next", ".nuxt", ".turbo", ".cache",
             "dist", "build", "out", "target", "coverage",
@@ -1984,6 +2185,7 @@ public final class CodeMCP {
             exec.shutdownNow();
         }
         
+        if (results.isEmpty()) return "(no matches)";
         return results.stream()
             .map(p -> base.relativize(p).toString().replace('\\', '/'))
             .collect(Collectors.joining("\n"));
@@ -2063,7 +2265,16 @@ public final class CodeMCP {
 
     private static String handleMcp(String cwd, String action, String server, String tool, Map<String, Object> args, String mcpCfgPath) {
         String cfgPath = mcpCfgPath != null ? mcpCfgPath : ".mcp.json";
-        Path configFullPath = Path.of(cwd, cfgPath);
+        // The agent-supplied config path must stay inside the cwd sandbox
+        // (parity with TS): an absolute path or ../ escape is refused, not
+        // silently read. Path.of(cwd, abs) would join it as a CHILD of cwd.
+        Path cwdResolved = Path.of(cwd).toAbsolutePath().normalize();
+        Path configFullPath = Path.of(cfgPath).isAbsolute()
+            ? Path.of(cfgPath).normalize()
+            : Path.of(cwd, cfgPath).normalize();
+        if (!configFullPath.startsWith(cwdResolved)) {
+            return "{\"error\":\"config path escapes cwd: " + escapeJson(cfgPath) + "\"}";
+        }
 
         if (action.equals("list")) {
             try {
@@ -2097,6 +2308,66 @@ public final class CodeMCP {
                 if (serverCfg == null) {
                     return "{\"error\":\"server '" + escapeJson(server) + "' not found in .mcp.json\"}";
                 }
+
+                // HTTP transport (Streamable HTTP): probe once, then call.
+                if ("http".equals(serverCfg.get("type"))) {
+                    String key = cwd + ":" + server;
+                    try {
+                        Map<String, Object> info = mcpHttp.get(key);
+                        boolean needsInit = (info == null);
+                        if (needsInit) {
+                            Map<String, Object> fresh = new LinkedHashMap<>();
+                            Object urlRaw = serverCfg.get("url");
+                            if (!(urlRaw instanceof String)) return "{\"error\":\"server '" + escapeJson(server) + "' missing 'url'\"}";
+                            fresh.put("url", urlRaw);
+                            Object hRaw = serverCfg.get("headers");
+                            if (hRaw instanceof Map<?, ?> hm) {
+                                Map<String, Object> headers = new LinkedHashMap<>();
+                                for (Map.Entry<?, ?> e : hm.entrySet()) {
+                                    if (e.getKey() instanceof String k && e.getValue() instanceof String v) headers.put(k, v);
+                                }
+                                fresh.put("headers", headers);
+                            } else {
+                                fresh.put("headers", Map.of());
+                            }
+                            fresh.put("session_id", null);
+                            mcpHttp.put(key, fresh);
+                        }
+                        try {
+                            if (needsInit) {
+                                mcpHttpRpc(key, "initialize", Map.of(
+                                    "protocolVersion", "2024-11-05",
+                                    "capabilities", Map.of(),
+                                    "clientInfo", Map.of("name", "code-mcp-aggregator", "version", "0.1.0")
+                                ));
+                                try {
+                                    mcpHttpRpc(key, "notifications/initialized", Map.of());
+                                } catch (Exception ignored) {}
+                                Map<?, ?> toolsResult = mcpHttpRpc(key, "tools/list", Map.of());
+                                Object tRaw = toolsResult.get("tools");
+                                if (tRaw instanceof List<?> tl) {
+                                    List<String> names = new ArrayList<>();
+                                    for (Object t : tl) {
+                                        if (t instanceof Map<?, ?> tm && tm.get("name") instanceof String n) names.add(n);
+                                    }
+                                    mcpServerTools.put(key, names);
+                                }
+                            }
+                            Map<String, Object> callArgs = new LinkedHashMap<>();
+                            callArgs.put("name", tool);
+                            callArgs.put("arguments", args != null ? args : Map.of());
+                            Map<?, ?> result = mcpHttpRpc(key, "tools/call", callArgs);
+                            return toJson(result);
+                        } catch (Exception probeErr) {
+                            mcpHttp.remove(key);
+                            mcpServerTools.remove(key);
+                            return "{\"error\":\"failed to probe server '" + escapeJson(server) + "': " + escapeJson(probeErr.getMessage()) + "\"}";
+                        }
+                    } catch (Exception e) {
+                        return "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}";
+                    }
+                }
+
                 String cmd = (String) serverCfg.get("command");
                 if (cmd == null) return "{\"error\":\"server '" + escapeJson(server) + "' missing 'command'\"}";
                 List<String> cmdArgs = new ArrayList<>();
@@ -2147,16 +2418,80 @@ public final class CodeMCP {
             if (key != null) {
                 Process proc = mcpProcesses.remove(key);
                 if (proc != null) proc.destroy();
+                mcpHttp.remove(key);
                 mcpServerTools.remove(key);
             } else {
                 mcpProcesses.keySet().stream().filter(k -> k.startsWith(cwd + ":")).toList()
                     .forEach(k -> { Process p = mcpProcesses.remove(k); if (p != null) p.destroy(); });
+                mcpHttp.keySet().removeIf(k -> k.startsWith(cwd + ":"));
                 mcpServerTools.keySet().removeIf(k -> k.startsWith(cwd + ":"));
             }
             return "{ \"success\": true }";
         }
 
         return "{ \"error\": \"unknown action: " + escapeJson(action) + "\" }";
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<?, ?> mcpHttpRpc(String key, String method, Map<String, Object> params) throws Exception {
+        Map<String, Object> info = mcpHttp.get(key);
+        if (info == null) throw new IOException("MCP server '" + key + "' not running");
+        int reqId;
+        synchronized (mcpIdLock) {
+            mcpNextId++;
+            reqId = mcpNextId;
+        }
+        String body = "{\"jsonrpc\":\"2.0\",\"id\":" + reqId
+            + ",\"method\":\"" + method + "\",\"params\":" + toJson(params) + "}";
+        try {
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(30_000)).build();
+            HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create((String) info.get("url")))
+                .timeout(Duration.ofMillis(30_000))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(body));
+            Object headersRaw = info.get("headers");
+            if (headersRaw instanceof Map<?, ?> hm) {
+                for (Map.Entry<?, ?> e : hm.entrySet()) {
+                    if (e.getKey() instanceof String k && e.getValue() instanceof String v) rb.header(k, v);
+                }
+            }
+            Object sid = info.get("session_id");
+            if (sid instanceof String s && !s.isEmpty()) rb.header("Mcp-Session-Id", s);
+            HttpResponse<String> resp = client.send(rb.build(), HttpResponse.BodyHandlers.ofString());
+            String newSid = resp.headers().firstValue("Mcp-Session-Id").orElse(null);
+            if (newSid != null && !newSid.matches(".*[\r\n\u0000].*") && info.get("session_id") == null) {
+                Map<String, Object> updated = new LinkedHashMap<>(info);
+                updated.put("session_id", newSid);
+                mcpHttp.put(key, updated);
+            }
+            int status = resp.statusCode();
+            if (status == 202 || status == 204 || resp.headers().firstValue("Content-Length").orElse("").equals("0")) {
+                return Map.of();
+            }
+            String text = resp.body();
+            if (text == null || text.isBlank()) return Map.of();
+            String ct = resp.headers().firstValue("Content-Type").orElse("");
+            Map<String, Object> msg;
+            if (ct.contains("text/event-stream")) {
+                msg = parseSseSingleResponse(text);
+            } else {
+                msg = parseJsonObject(text);
+            }
+            if (msg == null) throw new IOException("no JSON-RPC response");
+            Object respId = msg.get("id");
+            if (!(respId instanceof Number) || ((Number) respId).intValue() != reqId) {
+                throw new IOException("mismatched response id");
+            }
+            if (msg.containsKey("error")) throw new IOException("rpc error: " + msg.get("error"));
+            Object result = msg.get("result");
+            return result instanceof Map ? (Map<?, ?>) result : Map.of("result", result);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("http rpc interrupted", e);
+        } catch (Exception e) {
+            throw new IOException("http rpc failed: " + e.getMessage(), e);
+        }
     }
 
     private static Map<?, ?> mcpCall(String key, Process proc, String method, Map<String, Object> params) throws Exception {
@@ -2615,8 +2950,8 @@ public final class CodeMCP {
                 case "tools/list" -> {
                     List<Map<String, Object>> tools = new ArrayList<>();
                     tools.add(makeTool("read", "Read a file. Optional line range [start,end] (1-indexed, inclusive). Pass no_truncate=true to disable output truncation.",
-                        List.of(Map.of("name", "cwd", "type", "string"),
-                               Map.of("name", "path", "type", "string"),
+                        List.of(Map.of("name", "cwd", "type", "string", "required", true),
+                               Map.of("name", "path", "type", "string", "required", true),
                                Map.of("name", "range", "type", "array", "items", Map.of("type", "number")),
                                Map.of("name", "no_truncate", "type", "boolean"))));
 
@@ -2629,7 +2964,7 @@ public final class CodeMCP {
                                Map.of("name", "path", "type", "string", "required", true),
                                Map.of("name", "old_str", "type", "string", "required", true),
                                Map.of("name", "new_str", "type", "string", "required", true))));
-                    tools.add(makeTool("multi_edit", "Apply multiple edits atomically across one or more files.",
+                    tools.add(makeTool("multi_edit", "Apply multiple edits atomically across one or more files. Validates every edit first; if any fails, nothing is written. Edits to the same file are applied in order.",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "edits", "type", "array", "items", Map.of("type", "object"), "required", true))));
 
@@ -2652,13 +2987,13 @@ public final class CodeMCP {
                                    Map.of("name", "timeout_ms", "type", "number")));
                     });
 
-                    tools.add(makeTool("grep", "Search files by regex.",
+                    tools.add(makeTool("grep", "Search files by regex. Uses ripgrep if available, else findstr (Windows) or grep (POSIX).",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "pattern", "type", "string", "required", true),
                                Map.of("name", "path", "type", "string"),
                                Map.of("name", "glob", "type", "string"))));
 
-                    tools.add(makeTool("find", "Find files by glob pattern.",
+                    tools.add(makeTool("find", "Find files by glob pattern. Supports ** for recursive. Bare patterns like '*.ts' match at any depth. Skips common noise dirs (node_modules, .git, .next, dist, build, target, .venv, __pycache__) unless the pattern explicitly references them. Pass include_hidden=true to include dot-files.",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "pattern", "type", "string", "required", true),
                                Map.of("name", "path", "type", "string"),
@@ -2668,14 +3003,14 @@ public final class CodeMCP {
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "path", "type", "string"))));
 
-                    tools.add(makeTool("job", "Manage background jobs.",
+                    tools.add(makeTool("job", "Manage background jobs. mode: list|view|start|stop. command required for start; id (passed as command) required for view/stop. cwd used only for start.",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "mode", "type", "string", "enum", List.of("list", "view", "start", "stop"), "required", true),
                                Map.of("name", "command", "type", "string"),
                                Map.of("name", "timeout_ms", "type", "number"))));
 
                     
-                    tools.add(makeTool("mcp", "Manage MCP servers.",
+                    tools.add(makeTool("mcp", "Manage MCP servers from local .mcp.json files. Actions:   list: List all servers defined in .mcp.json for cwd   list server=X: Load server X and return its tools   call server=X tool=Y args={}: Call tool Y on loaded server X   unload: Unload all servers for this cwd   unload server=X: Unload specific server X",
                         List.of(Map.of("name", "cwd", "type", "string", "required", true),
                                Map.of("name", "action", "type", "string", "enum", List.of("list", "call", "unload"), "required", true),
                                Map.of("name", "server", "type", "string"),
@@ -2684,7 +3019,7 @@ public final class CodeMCP {
                                Map.of("name", "mcpConfigPath", "type", "string"))));
                     
                     if (hasCloudflared) {
-                        tools.add(makeTool("preview", "Start a Cloudflare quick tunnel.",
+                        tools.add(makeTool("preview", "Start a Cloudflare quick tunnel to the given local URL and return the public URL.",
                             List.of(Map.of("name", "url", "type", "string", "required", true))));
 
                     }
@@ -2869,19 +3204,32 @@ public final class CodeMCP {
         }
         
         private static Map<String, Object> makeTool(String name, String desc, List<Map<String, Object>> props) {
+            // Build a valid JSON Schema: "required" must be a top-level array of
+            // property names, never a boolean flag on each property. Codex and
+            // other strict clients reject per-property "required": true and drop
+            // the tool from their router (tools show up in tools/list but calls
+            // fail / the tool is silently skipped).
+            List<String> required = new ArrayList<>();
+            Map<String, Object> properties = new LinkedHashMap<>();
+            for (Map<String, Object> p : props) {
+                String propName = (String) p.get("name");
+                Map<String, Object> prop = new LinkedHashMap<>(p);
+                prop.remove("name");
+                if (Boolean.TRUE.equals(prop.remove("required"))) {
+                    required.add(propName);
+                }
+                properties.put(propName, prop);
+            }
+            Map<String, Object> schema = new LinkedHashMap<>();
+            schema.put("type", "object");
+            schema.put("properties", properties);
+            if (!required.isEmpty()) {
+                schema.put("required", required);
+            }
             return Map.of(
                 "name", name,
                 "description", desc,
-                "inputSchema", Map.of("type", "object", "properties", 
-                    props.stream().collect(Collectors.toMap(
-                        p -> (String) p.get("name"),
-                        p -> {
-                            Map<String, Object> prop = new LinkedHashMap<>(p);
-                            prop.remove("name");
-                            return prop;
-                        }
-                    ))
-                )
+                "inputSchema", schema
             );
         }
         
