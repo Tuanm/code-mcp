@@ -3281,6 +3281,11 @@ async function handle(msg: Json): Promise<Json | null> {
         }
         return ok(result);
       }
+      // Explicit disallowed check BEFORE lookup: PY/JV report a tool that was
+      // stripped by --disallowed-tools as "disabled", not as "unknown".
+      if (disallowedTools.includes(name)) {
+        return ok({ content: [{ type: "text", text: `ERROR: tool '${name}' disabled` }], isError: true });
+      }
       const t = tools[name];
       if (!t) return err(-32601, `unknown tool: ${name}`);
       const result = await t.handler(args ?? {});

@@ -155,10 +155,28 @@ public final class CodeMCP {
             uploadRoot = System.getProperty("java.io.tmpdir");
         }
         
-        // Prepare spill directory
+        // Prepare spill directory (parity with Python/TS):
+        // spill files hold tool output (potentially secrets), so keep the root
+        // private (0700) and sweep files older than 24h so a long session can't
+        // fill the disk or leave world-readable data behind.
         spillRoot = Path.of(System.getProperty("java.io.tmpdir"), "code-mcp").toString();
         try {
             Files.createDirectories(Path.of(spillRoot));
+            try {
+                Files.setPosixFilePermissions(Path.of(spillRoot),
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+            } catch (UnsupportedOperationException ignored) {}
+            long cutoff = System.currentTimeMillis() - 86_400_000L;
+            try (var stream = Files.list(Path.of(spillRoot))) {
+                stream.forEach(p -> {
+                    try {
+                        if (Files.isRegularFile(p)
+                                && Files.getLastModifiedTime(p).toMillis() < cutoff) {
+                            Files.deleteIfExists(p);
+                        }
+                    } catch (IOException ignored) {}
+                });
+            }
         } catch (IOException e) {
             System.err.println("[spill] warning: " + spillRoot + ": " + e.getMessage());
         }
@@ -589,6 +607,12 @@ public final class CodeMCP {
         
         try {
             Files.writeString(path, text, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            // Spill files hold tool output (potentially secrets): never leave
+            // them world-readable (parity with Python/TS 0600).
+            try {
+                Files.setPosixFilePermissions(path,
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+            } catch (UnsupportedOperationException ignored) {}
         } catch (IOException e) {
             System.err.println("[spill] failed to write " + path + ": " + e.getMessage());
             return head + "\n[TRUNCATED: full output is " + bytes.length + " bytes (" + totalLines + " lines); spill to disk FAILED (" + e.getMessage() + ")]\n";
