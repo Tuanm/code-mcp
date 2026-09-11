@@ -55,7 +55,11 @@ function pwshCmd(command: string): string[] {
   // Fall back to "pwsh" name if neither variant is on PATH so spawn surfaces a
   // clear "command not found" rather than throwing earlier.
   const bin = POWERSHELL_BIN ?? "pwsh";
-  return [bin, "-NoProfile", "-Command", command];
+  // -EncodedCommand (base64 UTF-16LE) instead of raw -Command: the Windows
+  // command line mangles embedded double quotes, so a quoted "|" separator
+  // became a real pipeline and PowerShell tried to run "PLAT=..." as a command.
+  // Base64 has no shell metacharacters, so the script arrives intact.
+  return [bin, "-NoProfile", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")];
 }
 
 // Detect running shell at startup.

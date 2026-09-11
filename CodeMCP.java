@@ -486,10 +486,14 @@ public final class CodeMCP {
         // useful "command not found" error instead of an NPE.
         String bin = detectPowerShellBinary();
         if (bin == null) bin = "pwsh";
-        // Pass the command RAW to -Command (parity with Python/TS): wrapping it
-        // in single quotes makes PowerShell parse the arg as a string literal,
-        // which echoes the command text and exits 0 instead of executing it.
-        return new String[]{bin, "-NoProfile", "-Command", command};
+        // Pass the script as base64(UTF-16LE) via -EncodedCommand (parity with
+        // Python/TS). Handing the raw string to -Command lets the Windows command
+        // line mangle embedded double quotes - a quoted "|" separator became a
+        // real pipeline, so PowerShell tried to run "PLAT=..." as a command.
+        // Base64 carries no shell metacharacters, so the script survives intact
+        // no matter how the caller built or quoted it.
+        String enc = Base64.getEncoder().encodeToString(command.getBytes(StandardCharsets.UTF_16LE));
+        return new String[]{bin, "-NoProfile", "-EncodedCommand", enc};
     }
     
     private static String[] shellCmd(String command) {

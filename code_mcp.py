@@ -988,7 +988,12 @@ def execute_powershell(command: str, cwd: str = ".", timeout_ms: int | None = No
     binary = get_powershell_binary()
     if not binary:
         return "exit=-1\nERROR: PowerShell (pwsh / powershell.exe) not found on PATH"
-    return _run_proc([binary, "-NoProfile", "-Command", command], cwd, timeout_ms, shell=False)
+    # -EncodedCommand (base64 UTF-16LE) instead of raw -Command: the Windows
+    # command line mangles embedded double quotes, so a quoted "|" separator
+    # became a real pipeline and PowerShell tried to run "PLAT=..." as a
+    # command. Base64 has no shell metacharacters, so the script arrives intact.
+    enc = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+    return _run_proc([binary, "-NoProfile", "-EncodedCommand", enc], cwd, timeout_ms, shell=False)
 
 
 def execute_command(command: str, cwd: str = ".", timeout_ms: int | None = None) -> str:
